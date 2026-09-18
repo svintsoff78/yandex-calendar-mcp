@@ -47,6 +47,24 @@ function toIcalTime(iso: string, tzid: string, allDay: boolean): ICAL.Time {
   return time;
 }
 
+// Правка по ревью (Important, круг 1): `zone.component` — это один и тот же
+// объект `ICAL.Component`, закешированный внутри `ICAL.TimezoneService`
+// (см. registerTimeZone в ./timezones.ts). `Component.addSubcomponent`
+// (node_modules/ical.js/lib/ical/component.js) при добавлении отцепляет
+// компонент от предыдущего родителя вызовом `parent.removeSubcomponent`.
+// Если положить этот общий объект в VCALENDAR напрямую, второй вызов
+// buildEvent с тем же часовым поясом молча вырвет VTIMEZONE из первого,
+// ещё не сериализованного календаря. Сейчас это не проявляется — каждый
+// вызов сериализуется в строку синхронно, до следующего, — но задача 12
+// вводит пакетную сборку в цикле поверх этого же кода, и хрупкость лучше
+// убрать заранее. `ICAL.helpers.clone(jCal, true)` — задокументированная
+// часть публичного API (dist/types/helpers.d.ts), выполняет глубокое
+// копирование jCal-массива, так что каждый календарь получает независимый
+// компонент, а объект в сервисе не трогается.
+function cloneComponent(component: ICAL.Component): ICAL.Component {
+  return new ICAL.Component(ICAL.helpers.clone(component.jCal, true));
+}
+
 function toRrule(recurrence: Recurrence): ICAL.Recur {
   const parts = [`FREQ=${recurrence.frequency.toUpperCase()}`, `INTERVAL=${recurrence.interval}`];
   if (recurrence.byWeekday?.length) parts.push(`BYDAY=${recurrence.byWeekday.join(",")}`);
@@ -64,12 +82,19 @@ export function buildEvent(event: NewEvent): { ics: string; uid: string } {
   calendar.addPropertyWithValue("prodid", "-//yandex-calendar-mcp//RU");
 
   if (!event.allDay) {
-    calendar.addSubcomponent(registerTimeZone(event.timeZone).component);
+    calendar.addSubcomponent(cloneComponent(registerTimeZone(event.timeZone).component));
   }
 
   const vevent = new ICAL.Component("vevent");
   vevent.addPropertyWithValue("uid", uid);
-  vevent.addPropertyWithValue("dtstamp", ICAL.Time.now());
+  // Правка по ревью (Important, круг 1): ICAL.Time.now() внутри вызывает
+  // Time.fromJSDate(new Date(), false) — тот же useUTC=false, что уже был
+  // признан багом в toIcalTime выше, только здесь для «текущего момента».
+  // DTSTAMP по RFC 5545 §3.8.7.2 обязан быть в UTC; с ICAL.Time.now() он
+  // сериализуется как floating-время хост-машины без суффикса Z и без
+  // TZID, то есть один и тот же момент даёт разные строки в зависимости от
+  // TZ процесса. fromJSDate(date, true) даёт zone=UTC и корректный `Z`.
+  vevent.addPropertyWithValue("dtstamp", ICAL.Time.fromJSDate(new Date(), true));
   vevent.addPropertyWithValue("summary", event.summary);
   if (event.description) vevent.addPropertyWithValue("description", event.description);
   if (event.location) vevent.addPropertyWithValue("location", event.location);
