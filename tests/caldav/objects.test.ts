@@ -283,4 +283,32 @@ END:VCALENDAR</c:calendar-data>
     expect(object).toBeDefined();
     expect(object!.href).toBe(realHref);
   });
+
+  // Развёртывание перенесённых строк (RFC 5545 §3.1) снимает РОВНО ОДИН
+  // служебный пробел продолжения — сам пробел или таб. Всё остальное в
+  // значении свойства значимо, включая краевые пробелы, и сравнение
+  // должно быть побайтовым: лишняя нормализация (например, trim())
+  // воссоздаёт то же ложное «точное совпадение», от которого защищает
+  // сверка UID, — только теперь через хвостовой/ведущий пробел вместо
+  // серверного text-match.
+  it("не считает совпадением UID, отличающийся только хвостовым пробелом", async () => {
+    const uidWithTrailingSpace = uid + " ";
+    const trailingSpaceMatch = `<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:response>
+    <d:href>/calendars/user/work/other.ics</d:href>
+    <d:propstat><d:prop>
+      <d:getetag>1</d:getetag>
+      <c:calendar-data>BEGIN:VCALENDAR
+UID:${uidWithTrailingSpace}
+END:VCALENDAR</c:calendar-data>
+    </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+  </d:response>
+</d:multistatus>`;
+    const { client: caldav } = client({ text: trailingSpaceMatch });
+
+    const object = await queryEventByUid(caldav, "/calendars/user/work/", uid);
+
+    expect(object).toBeUndefined();
+  });
 });

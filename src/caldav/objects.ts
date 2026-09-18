@@ -48,10 +48,12 @@ function unfoldIcs(ics: string): string {
 
 // Достаёт значение свойства UID из текста ICS без полного разбора
 // iCalendar: слой CalDAV не должен зависеть от слоя iCalendar (ical.js).
-// Имя свойства регистронезависимо (RFC 5545), значение — нет.
+// Имя свойства регистронезависимо (RFC 5545), значение — нет. unfoldIcs
+// уже снял ровно один служебный пробел продолжения (RFC 5545 §3.1) — сверх
+// этого значение не нормализуется: краевые пробелы в UID значимы, и
+// сравнение с запрошенным UID должно быть побайтовым.
 function extractUid(ics: string): string | undefined {
-  const match = /^UID(?:;[^:\n]*)?:(.*)$/im.exec(unfoldIcs(ics));
-  return match?.[1]?.trim();
+  return /^UID(?:;[^:\n]*)?:(.*)$/im.exec(unfoldIcs(ics))?.[1];
 }
 
 // Имя файла объекта не выводится из UID (docs/yandex-caldav-capabilities.md):
