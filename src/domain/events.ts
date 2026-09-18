@@ -63,7 +63,23 @@ export async function readEvents(context: Context, params: ReadParams): Promise<
   // календарей) это неощутимо; при явном требовании параллельности —
   // см. отчёт задачи, это осознанный компромисс, а не недосмотр.
   for (const calendar of selected) {
-    const objects = await query(calendar, from, to);
+    // Ошибка чтения одного календаря не должна тихо срезать часть выдачи:
+    // неполный список, отданный как полный, опаснее явного отказа —
+    // пользователь не заметит пропавшие встречи. Поэтому распространяем
+    // ошибку наружу, но оборачиваем её, чтобы в тексте было имя отказавшего
+    // календаря (иначе наружу ушло бы сообщение уровня CalDAV, из которого
+    // не видно, какой именно календарь виноват), сохраняя исходную ошибку
+    // как cause.
+    let objects: Array<{ href: string; etag: string; ics: string }>;
+    try {
+      objects = await query(calendar, from, to);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `Не удалось прочитать календарь «${calendar.displayName}»: ${reason}`,
+        { cause: error },
+      );
+    }
     for (const object of objects) {
       const events = expand
         ? expandOccurrences(object.ics, calendar.id, from, to, object.etag)
