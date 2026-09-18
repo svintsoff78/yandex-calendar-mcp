@@ -32,7 +32,7 @@ describe("createClient", () => {
     const client = createClient(config, fetchMock as unknown as typeof fetch);
 
     await expect(client.request({ method: "PROPFIND", path: "/" })).rejects.toThrow(
-      /пароль приложения/,
+      /[Пп]ароль приложения/,
     );
   });
 
@@ -65,5 +65,55 @@ describe("createClient", () => {
     await expect(client.request({ method: "PUT", path: "/x.ics" })).rejects.toThrow(
       /изменили/,
     );
+  });
+
+  it("на таймауте (AbortSignal.timeout) бросает CaldavError, а не сырой DOMException", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockRejectedValue(new DOMException("The operation was aborted due to timeout", "TimeoutError"));
+    const client = createClient(config, fetchMock as unknown as typeof fetch);
+
+    const failing = client.request({ method: "PROPFIND", path: "/" });
+
+    await expect(failing).rejects.toBeInstanceOf(CaldavError);
+    await expect(failing).rejects.toThrow(/сеть или сервер недоступны/i);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("на сетевом сбое (DNS/connection refused) бросает CaldavError, а не сырой TypeError", async () => {
+    const fetchMock = vi.fn().mockRejectedValue(new TypeError("fetch failed"));
+    const client = createClient(config, fetchMock as unknown as typeof fetch);
+
+    const failing = client.request({ method: "PROPFIND", path: "/" });
+
+    await expect(failing).rejects.toBeInstanceOf(CaldavError);
+    await expect(failing).rejects.toThrow(/сеть или сервер недоступны/i);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("бросает CaldavError про недоступность, когда все попытки исчерпаны на 503", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(reply(503));
+    const client = createClient(config, fetchMock as unknown as typeof fetch);
+
+    const failing = client.request({ method: "PROPFIND", path: "/" });
+
+    await expect(failing).rejects.toBeInstanceOf(CaldavError);
+    await expect(failing).rejects.toThrow(/сеть или сервер недоступны/i);
+    await expect(failing).rejects.toThrow(/3/);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("отменяет тело отброшенного ответа при повторе, не дожидаясь сборщика мусора", async () => {
+    const discarded = reply(503);
+    const cancelSpy = vi.spyOn(discarded.body as ReadableStream, "cancel");
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(discarded)
+      .mockResolvedValueOnce(reply(207, "<ok/>"));
+    const client = createClient(config, fetchMock as unknown as typeof fetch);
+
+    await client.request({ method: "PROPFIND", path: "/" });
+
+    expect(cancelSpy).toHaveBeenCalledTimes(1);
   });
 });
