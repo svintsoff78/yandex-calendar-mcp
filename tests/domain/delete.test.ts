@@ -343,4 +343,128 @@ END:VCALENDAR</c:calendar-data>
       expect(request.mock.calls.some((call) => call[0].method === "DELETE")).toBe(false);
     });
   });
+
+  describe("настоящие последовательности вызовов (мутируемый контекст)", () => {
+    // Находка ревью: contextWith выше подставляет ОДИН И ТОТ ЖЕ снимок ics на
+    // каждый вызов get() — второй deleteEvent в тесте видел бы состояние ДО
+    // первого, а не то, что первый реально записал. Это годится для проверки
+    // одного вызова, но не для проверки последовательности: тест на
+    // "this_and_following сохраняет уже существующие EXDATE" (выше) кладёт
+    // готовый EXDATE фикстурой, а не получает его настоящим предыдущим
+    // вызовом deleteEvent — это статическая имитация состояния, а не
+    // последовательность.
+    //
+    // Здесь put()/remove() ДЕЙСТВИТЕЛЬНО меняют то, что вернёт следующий
+    // get() — так же, как в реальности следующий REPORT/GET увидел бы то,
+    // что записал предыдущий PUT/DELETE на сервере. Это единственный способ
+    // честно проверить, что делает ВТОРОЙ вызов deleteEvent, а не то, что мы
+    // заранее решили, будто он должен увидеть.
+    function mutableContextWith(initialIcs: string) {
+      let store: { href: string; etag: string; ics: string } | undefined = {
+        href: "/c/work/x.ics",
+        etag: '"etag-0"',
+        ics: initialIcs,
+      };
+      let etagSeq = 0;
+
+      const get = vi.fn(async () => {
+        if (!store) {
+          throw new Error("Объект уже удалён — сервер больше не находит его по UID.");
+        }
+        return store;
+      });
+
+      const put = vi.fn(async (href: string, ics: string) => {
+        etagSeq += 1;
+        const etag = `"etag-${etagSeq}"`;
+        store = { href, etag, ics };
+        return etag;
+      });
+
+      const remove = vi.fn(async () => {
+        store = undefined;
+      });
+
+      return {
+        context: {
+          client: {} as never,
+          config: { defaultTimeZone: "Europe/Moscow" } as never,
+          calendars: async () => [calendar],
+          resolveCalendar: async () => calendar,
+          get,
+          put,
+          remove,
+        },
+        get,
+        put,
+        remove,
+      };
+    }
+
+    it("удаление одного и того же экземпляра дважды подряд: второй раз — понятная ошибка, а не дубликат исключения и не удаление объекта", async () => {
+      const { context, put, remove } = mutableContextWith(weekly);
+
+      await deleteEvent(context as never, {
+        id: "test-weekly-1",
+        scope: "this",
+        instanceStart: "2026-10-21T10:00:00+03:00",
+      });
+
+      // Первый вызов честно дошёл до PUT с EXDATE — читаем НЕ фикстуру, а то,
+      // что реально записал deleteEvent.
+      expect(put).toHaveBeenCalledTimes(1);
+      const afterFirstDelete = put.mock.calls[0][1];
+      expect(afterFirstDelete).toContain("EXDATE");
+      expect(put.mock.calls[0][2].ifMatch).toBe('"etag-0"');
+
+      // Второй вызов передаёт ТОТ ЖЕ instanceStart. Следующий get() отдаёт
+      // ics с уже стоящим EXDATE (записанный первым вызовом, а не исходную
+      // фикстуру weekly.ics) — assertInstanceExists честно раскрывает повтор
+      // с учётом EXDATE (ICAL.RecurExpansion сам его учитывает) и не находит
+      // экземпляр в 21 октября: он исключён.
+      await expect(
+        deleteEvent(context as never, {
+          id: "test-weekly-1",
+          scope: "this",
+          instanceStart: "2026-10-21T10:00:00+03:00",
+        }),
+      ).rejects.toThrow(/экземпляр/i);
+
+      // Ключевая проверка: второй вызов не должен был дойти ни до PUT
+      // (дубликат EXDATE), ни тем более до DELETE (удаление всего объекта
+      // вместо понятной ошибки) — он обязан остановиться на проверке.
+      expect(put).toHaveBeenCalledTimes(1);
+      expect(remove).not.toHaveBeenCalled();
+    });
+
+    it("удалить экземпляр, затем усечь серию: итоговый объект несёт и поставленное исключение, и границу окончания", async () => {
+      const { context, put, remove } = mutableContextWith(weekly);
+
+      await deleteEvent(context as never, {
+        id: "test-weekly-1",
+        scope: "this",
+        instanceStart: "2026-10-21T10:00:00+03:00",
+      });
+
+      await deleteEvent(context as never, {
+        id: "test-weekly-1",
+        scope: "this_and_following",
+        instanceStart: "2026-11-02T10:00:00+03:00",
+      });
+
+      expect(remove).not.toHaveBeenCalled();
+      expect(put).toHaveBeenCalledTimes(2);
+      // Второй вызов принял ifMatch со свежим ETag, оставленным первым —
+      // ещё одно подтверждение, что состояние действительно перетекает
+      // между вызовами, а не берётся из готового снимка.
+      expect(put.mock.calls[1][2].ifMatch).toBe('"etag-1"');
+
+      // Итоговый ics — тот, что читает ВТОРОЙ вызов put (после усечения),
+      // построенный поверх результата ПЕРВОГО вызова, а не поверх исходной
+      // фикстуры weekly.ics.
+      const finalIcs = put.mock.calls[1][1];
+      expect(finalIcs).toContain("EXDATE;TZID=Europe/Moscow:20261021T100000");
+      expect(finalIcs).toContain("UNTIL=");
+    });
+  });
 });
