@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildCalendarQuery,
   buildPropfind,
+  buildUidQuery,
   parseMultistatus,
   toIcalUtc,
 } from "../../src/caldav/xml.js";
@@ -33,6 +34,21 @@ describe("buildCalendarQuery", () => {
     expect(xml).toContain('name="VEVENT"');
     expect(xml).toContain('start="20260901T000000Z"');
     expect(xml).toContain('end="20261001T000000Z"');
+  });
+});
+
+describe("buildUidQuery", () => {
+  it("кладёт фильтр по свойству UID компонента VEVENT", () => {
+    const xml = buildUidQuery("aaaabbbbccccdddd11@yandex.ru");
+    expect(xml).toContain('name="VEVENT"');
+    expect(xml).toContain('<c:prop-filter name="UID">');
+    expect(xml).toContain('<c:text-match collation="i;octet">aaaabbbbccccdddd11@yandex.ru</c:text-match>');
+  });
+
+  it("экранирует спецсимволы XML в UID", () => {
+    const xml = buildUidQuery("a&b<c>d");
+    expect(xml).toContain("a&amp;b&lt;c&gt;d");
+    expect(xml).not.toContain("a&b<c>d");
   });
 });
 

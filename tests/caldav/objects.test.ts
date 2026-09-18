@@ -1,0 +1,209 @@
+import { describe, expect, it, vi } from "vitest";
+import {
+  deleteObject,
+  getObject,
+  putObject,
+  queryEventByUid,
+  queryEvents,
+} from "../../src/caldav/objects.js";
+import type { CaldavClient } from "../../src/caldav/request.js";
+
+function client(response: { status?: number; text?: string; headers?: Record<string, string> }) {
+  const request = vi.fn().mockResolvedValue({
+    status: response.status ?? 207,
+    headers: new Headers(response.headers ?? {}),
+    text: response.text ?? "",
+  });
+  return { client: { request } as unknown as CaldavClient, request };
+}
+
+const multistatus = `<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:response>
+    <d:href>/calendars/user/work/event-1.ics</d:href>
+    <d:propstat><d:prop>
+      <d:getetag>"etag-1"</d:getetag>
+      <c:calendar-data>BEGIN:VCALENDAR
+END:VCALENDAR</c:calendar-data>
+    </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+  </d:response>
+</d:multistatus>`;
+
+describe("queryEvents", () => {
+  it("шлёт REPORT с Depth 1 и разбирает ответ", async () => {
+    const { client: caldav, request } = client({ text: multistatus });
+
+    const objects = await queryEvents(
+      caldav,
+      "/calendars/user/work/",
+      new Date("2026-09-01T00:00:00Z"),
+      new Date("2026-10-01T00:00:00Z"),
+    );
+
+    expect(request.mock.calls[0][0].method).toBe("REPORT");
+    expect(request.mock.calls[0][0].depth).toBe("1");
+    expect(objects).toHaveLength(1);
+    expect(objects[0].etag).toBe('"etag-1"');
+    expect(objects[0].ics).toContain("BEGIN:VCALENDAR");
+  });
+});
+
+describe("getObject", () => {
+  it("шлёт GET и берёт ETag из заголовка ответа", async () => {
+    const { client: caldav, request } = client({
+      text: "BEGIN:VCALENDAR\nEND:VCALENDAR",
+      headers: { ETag: "1789383239000" },
+    });
+
+    const object = await getObject(caldav, "/calendars/user/work/event-1.ics");
+
+    expect(request.mock.calls[0][0].method).toBe("GET");
+    expect(request.mock.calls[0][0].path).toBe("/calendars/user/work/event-1.ics");
+    expect(object.href).toBe("/calendars/user/work/event-1.ics");
+    expect(object.etag).toBe("1789383239000");
+    expect(object.ics).toContain("BEGIN:VCALENDAR");
+  });
+
+  it("возвращает пустой ETag, если сервер его не прислал", async () => {
+    const { client: caldav } = client({ text: "BEGIN:VCALENDAR\nEND:VCALENDAR" });
+
+    const object = await getObject(caldav, "/x.ics");
+
+    expect(object.etag).toBe("");
+  });
+});
+
+describe("putObject", () => {
+  it("при создании ставит If-None-Match и возвращает новый ETag", async () => {
+    const { client: caldav, request } = client({
+      status: 201,
+      headers: { ETag: '"new-etag"' },
+    });
+
+    const etag = await putObject(caldav, "/calendars/user/work/x.ics", "BEGIN:VCALENDAR", {
+      ifNoneMatch: true,
+    });
+
+    expect(request.mock.calls[0][0].headers["If-None-Match"]).toBe("*");
+    expect(request.mock.calls[0][0].headers["Content-Type"]).toContain("text/calendar");
+    expect(etag).toBe('"new-etag"');
+  });
+
+  it("при обновлении ставит If-Match с переданным ETag", async () => {
+    const { client: caldav, request } = client({ status: 204 });
+
+    await putObject(caldav, "/calendars/user/work/x.ics", "BEGIN:VCALENDAR", {
+      ifMatch: '"etag-1"',
+    });
+
+    expect(request.mock.calls[0][0].headers["If-Match"]).toBe('"etag-1"');
+  });
+
+  it("возвращает пустую строку, если сервер не прислал ETag", async () => {
+    const { client: caldav } = client({ status: 204 });
+
+    const etag = await putObject(caldav, "/x.ics", "BEGIN:VCALENDAR", { ifNoneMatch: true });
+
+    expect(etag).toBe("");
+  });
+
+  it("ETag Яндекса — голое число без кавычек, передаётся как есть", async () => {
+    const { client: caldav, request } = client({
+      status: 204,
+      headers: { ETag: "1789383239000" },
+    });
+
+    const etag = await putObject(caldav, "/x.ics", "BEGIN:VCALENDAR", {
+      ifMatch: "1789383239000",
+    });
+
+    expect(request.mock.calls[0][0].headers["If-Match"]).toBe("1789383239000");
+    expect(etag).toBe("1789383239000");
+  });
+});
+
+describe("deleteObject", () => {
+  it("шлёт DELETE с If-Match", async () => {
+    const { client: caldav, request } = client({ status: 204 });
+
+    await deleteObject(caldav, "/calendars/user/work/x.ics", '"etag-1"');
+
+    expect(request.mock.calls[0][0].method).toBe("DELETE");
+    expect(request.mock.calls[0][0].headers["If-Match"]).toBe('"etag-1"');
+  });
+});
+
+describe("queryEventByUid", () => {
+  // UID вида "...@yandex.ru" на сервере Яндекса соответствует объекту
+  // "...yandex.ru.ics" — собака выброшена, а не закодирована (Задача 1).
+  // Если бы queryEventByUid собирал путь из UID сам, он получил бы
+  // "/calendars/user/work/aaaabbbbccccdddd11%40yandex.ru.ics" —
+  // адрес, которого на сервере не существует. Фикстура ниже намеренно
+  // возвращает от «сервера» другой, непохожий на UID href, чтобы отличить
+  // правильную реализацию (берёт href из ответа) от неправильной
+  // (реконструирует его из UID).
+  const uid = "aaaabbbbccccdddd11@yandex.ru";
+  const realHref = "/calendars/user/work/aaaabbbbccccdddd11yandex.ru.ics";
+  const foundByUid = `<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:response>
+    <d:href>${realHref}</d:href>
+    <d:propstat><d:prop>
+      <d:getetag>1789383239000</d:getetag>
+      <c:calendar-data>BEGIN:VCALENDAR
+UID:aaaabbbbccccdddd11@yandex.ru
+END:VCALENDAR</c:calendar-data>
+    </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+  </d:response>
+</d:multistatus>`;
+
+  it("шлёт REPORT calendar-query с фильтром по UID (экранированным)", async () => {
+    const { client: caldav, request } = client({ text: foundByUid });
+
+    await queryEventByUid(caldav, "/calendars/user/work/", uid);
+
+    const sent = request.mock.calls[0][0];
+    expect(sent.method).toBe("REPORT");
+    expect(sent.path).toBe("/calendars/user/work/");
+    expect(sent.body).toContain('<c:prop-filter name="UID">');
+    expect(sent.body).toContain("<c:text-match");
+    // "@" должен уйти в тело как есть, а вот "&", "<", ">" — экранироваться.
+    expect(sent.body).toContain("aaaabbbbccccdddd11@yandex.ru");
+  });
+
+  it("экранирует спецсимволы XML в UID", async () => {
+    const { client: caldav, request } = client({ text: "<d:multistatus/>" });
+
+    await queryEventByUid(caldav, "/calendars/user/work/", "a&b<c>d");
+
+    const sent = request.mock.calls[0][0];
+    expect(sent.body).toContain("a&amp;b&lt;c&gt;d");
+    expect(sent.body).not.toContain("a&b<c>d");
+  });
+
+  it("возвращает найденный объект с href из ответа сервера, а не собранным из UID", async () => {
+    const { client: caldav } = client({ text: foundByUid });
+
+    const object = await queryEventByUid(caldav, "/calendars/user/work/", uid);
+
+    expect(object).toBeDefined();
+    // Ключевая проверка: href — тот, что реально прислал сервер (без "@",
+    // со слитным доменом), а НЕ то, что получилось бы из
+    // encodeURIComponent(uid) + ".ics".
+    expect(object!.href).toBe(realHref);
+    expect(object!.href).not.toBe(
+      `/calendars/user/work/${encodeURIComponent(uid)}.ics`,
+    );
+    expect(object!.etag).toBe("1789383239000");
+    expect(object!.ics).toContain("BEGIN:VCALENDAR");
+  });
+
+  it("возвращает undefined, если событие с таким UID не найдено", async () => {
+    const empty = `<?xml version="1.0"?><d:multistatus xmlns:d="DAV:"></d:multistatus>`;
+    const { client: caldav } = client({ text: empty });
+
+    const object = await queryEventByUid(caldav, "/calendars/user/work/", uid);
+
+    expect(object).toBeUndefined();
+  });
+});

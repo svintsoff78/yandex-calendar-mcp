@@ -27,6 +27,32 @@ export function buildCalendarQuery(from: Date, to: Date): string {
 </c:calendar-query>`;
 }
 
+function escapeXmlText(value: string): string {
+  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// Яндекс не выводит имя файла объекта из UID (задача 1, docs/yandex-caldav-capabilities.md):
+// "aaaabbbbccccdddd11@yandex.ru" на сервере лежит как
+// "aaaabbbbccccdddd11yandex.ru.ics" — собака выброшена, а не закодирована.
+// Поэтому для события, созданного не нами, путь нельзя восстановить из UID —
+// его находят этим запросом (RFC 4791 §7.8) и берут href из ответа.
+// UID экранируется как текст XML: он может содержать "&", "<", ">".
+export function buildUidQuery(uid: string): string {
+  return `<?xml version="1.0" encoding="utf-8"?>
+<c:calendar-query ${NS}>
+  <d:prop><d:getetag/><c:calendar-data/></d:prop>
+  <c:filter>
+    <c:comp-filter name="VCALENDAR">
+      <c:comp-filter name="VEVENT">
+        <c:prop-filter name="UID">
+          <c:text-match collation="i;octet">${escapeXmlText(uid)}</c:text-match>
+        </c:prop-filter>
+      </c:comp-filter>
+    </c:comp-filter>
+  </c:filter>
+</c:calendar-query>`;
+}
+
 export interface MultistatusEntry {
   href: string;
   status: number;
