@@ -40,9 +40,31 @@ function isCalendar(resourcetype: unknown): boolean {
   return resourcetype != null && typeof resourcetype === "object" && "calendar" in resourcetype;
 }
 
+// Разбирает <d:privilege> в список имён привилегий. После снятия префиксов
+// пространств имён каждая привилегия — это объект с одним ключом-именем
+// (например { write: "" } или { "write-acl": "" }); одна привилегия придёт
+// объектом, несколько — массивом, как и comp в supportsVevent.
+function privilegeNames(privilegeSet: unknown): string[] {
+  if (privilegeSet == null || typeof privilegeSet !== "object") return [];
+  const record = privilegeSet as Record<string, unknown>;
+  const list = Array.isArray(record.privilege)
+    ? record.privilege
+    : record.privilege != null
+      ? [record.privilege]
+      : [];
+  return list.flatMap((item) =>
+    item != null && typeof item === "object" ? Object.keys(item as Record<string, unknown>) : [],
+  );
+}
+
+// RFC 3744 различает write-properties, write-content и write-acl. Только
+// write (целиком) и write-content дают право писать содержимое событий;
+// write-acl — это право менять список доступа, а не события, и текстовый
+// поиск подстроки "write" ошибочно принял бы его за право на запись.
 function isWritable(privileges: unknown): boolean {
   if (privileges == null) return true;
-  return JSON.stringify(privileges).includes("write");
+  const names = privilegeNames(privileges);
+  return names.includes("write") || names.includes("write-content");
 }
 
 // Яндекс держит в доме календарей не только коллекции событий: там же лежит
@@ -61,6 +83,15 @@ function supportsVevent(componentSet: unknown): boolean {
     }
     return false;
   });
+}
+
+// xml.ts больше не вычищает свойства с пустым значением (задача 4), поэтому
+// пустой <d:displayname></d:displayname> приходит как "", а не отсутствует.
+// "??" пропускает пустую строку, значит подстановку по умолчанию нужно
+// делать явно — в том числе для строки из одних пробелов.
+function displayNameOrFallback(value: unknown): string {
+  const text = value == null ? "" : String(value);
+  return text.trim().length > 0 ? text : "Без названия";
 }
 
 export async function discoverCalendars(client: CaldavClient): Promise<Calendar[]> {
@@ -85,7 +116,7 @@ export async function discoverCalendars(client: CaldavClient): Promise<Calendar[
     .map((entry) => ({
       id: decodeURIComponent(entry.href.replace(/\/$/, "").split("/").pop() ?? entry.href),
       href: entry.href,
-      displayName: String(entry.props.displayname ?? "Без названия"),
+      displayName: displayNameOrFallback(entry.props.displayname),
       color: entry.props["calendar-color"] ? String(entry.props["calendar-color"]) : undefined,
       timeZone: entry.props["calendar-timezone"]
         ? String(entry.props["calendar-timezone"])
