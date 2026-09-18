@@ -2,6 +2,7 @@ import ICAL from "ical.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { buildEvent } from "../../src/ical/build.js";
 import { parseEvent } from "../../src/ical/parse.js";
+import { registerTimeZone } from "../../src/ical/timezones.js";
 
 const base = {
   calendarId: "work",
@@ -127,5 +128,54 @@ describe("buildEvent", () => {
       zoneFromText,
     );
     expect(time.utcOffset()).toBe(3 * 3600);
+  });
+
+  // Находка ревью (Minor, включена в круг 1): registerTimeZone(...).component
+  // — общий объект ICAL.Component, закешированный в ICAL.TimezoneService.
+  // addSubcomponent() отцепляет добавляемый компонент от предыдущего
+  // родителя (component.parent.removeSubcomponent(component) в
+  // node_modules/ical.js/lib/ical/component.js). Собираем два события с
+  // одним и тем же поясом ПОДРЯД, ничего не сериализуя вручную между
+  // вызовами (сериализацию делает сам buildEvent), и проверяем обе
+  // получившиеся строки — по рецепту ревью.
+  //
+  // Уточнение по факту проверки (важно для честности теста): сама по себе
+  // пара «собрать → собрать» НЕ портит уже ВОЗВРАЩЁННУЮ строку первого
+  // события — buildEvent вызывает calendar.toString() синхронно и
+  // возвращает готовую неизменяемую строку ДО того, как начнётся второй
+  // вызов, так что более поздняя мутация общего объекта эту строку не
+  // затрагивает. Проверено прогоном: проверка «обе строки содержат
+  // VTIMEZONE» зелёная даже БЕЗ cloneComponent (то есть сама по себе не
+  // ловит баг из находки 3). Реальный разрыв — на уровне общего объекта из
+  // кеша TimezoneService: без cloneComponent его `.parent` после каждого
+  // вызова buildEvent переключается на календарь ПОСЛЕДНЕГО собранного
+  // события, а не остаётся стабильным. Это станет наблюдаемой порчей
+  // данных, если что-то (например, пакетная сборка в задаче 12) станет
+  // держать VCALENDAR как дерево компонентов до отложенной сериализации,
+  // а не как уже готовую строку. Поэтому ниже, вместе с проверкой обеих
+  // строк по рецепту, добавлена проверка самого инварианта — что
+  // buildEvent не трогает `.parent` общего объекта из сервиса.
+  it("не портит VTIMEZONE предыдущего события при повторной сборке с тем же поясом", () => {
+    const sharedComponent = registerTimeZone(base.timeZone).component;
+    const parentBeforeBuilds = sharedComponent.parent;
+
+    const first = buildEvent(base);
+    const second = buildEvent(base);
+
+    for (const [label, ics] of [
+      ["первое", first.ics],
+      ["второе", second.ics],
+    ] as const) {
+      expect(ics, `${label} событие должно содержать блок VTIMEZONE`).toContain(
+        "BEGIN:VTIMEZONE",
+      );
+      expect(ics, `${label} событие должно содержать TZID:Europe/Moscow`).toContain(
+        "TZID:Europe/Moscow",
+      );
+    }
+
+    // Настоящая точка разрыва находки 3: общий компонент из кеша сервиса
+    // не должен быть переприсвоен новому родителю ни одним из вызовов.
+    expect(sharedComponent.parent).toBe(parentBeforeBuilds);
   });
 });
