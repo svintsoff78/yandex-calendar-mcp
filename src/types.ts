@@ -12,15 +12,32 @@ export interface Calendar {
 
 export type RecurrenceFrequency = "daily" | "weekly" | "monthly" | "yearly";
 
+type Weekday = "MO" | "TU" | "WE" | "TH" | "FR" | "SA" | "SU";
+
 export interface Recurrence {
   frequency: RecurrenceFrequency;
   interval: number;
-  byWeekday?: Array<"MO" | "TU" | "WE" | "TH" | "FR" | "SA" | "SU">;
+  /**
+   * Дни недели BYDAY (RFC 5545 §3.3.10). Помимо дня без префикса ("MO")
+   * значение может нести порядковый префикс: "2MO" — второй понедельник
+   * месяца, "-1FR" — последняя пятница месяца. Префикс — часть значения
+   * BYDAY, а не мусор: срезать его при разборе значит молча превратить
+   * "второй понедельник" в "каждый понедельник". Парсер и сборщик правила
+   * сохраняют строку как есть.
+   */
+  byWeekday?: Array<Weekday | `${number}${Weekday}`>;
   until?: string;
   count?: number;
 }
 
 export interface Reminder {
+  /**
+   * Отступ напоминания от начала события в минутах.
+   * Положительное значение — раньше начала (обычный случай: TRIGGER:-PT15M
+   * даёт 15). Отрицательное — позже начала (TRIGGER:PT15M без минуса —
+   * валидный по RFC 5545 триггер "после", даёт -15). Имя поля сохранено
+   * ради совместимости, но ноль — не единственная граница: смысл несёт знак.
+   */
   minutesBefore: number;
   method: "display" | "email";
 }

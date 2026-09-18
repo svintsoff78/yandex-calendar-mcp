@@ -51,4 +51,35 @@ describe("parseEvent", () => {
   it("не выдумывает правило у события без повтора", () => {
     expect(parseEvent(fixture("simple.ics"), "work").recurrence).toBeUndefined();
   });
+
+  it("сохраняет порядковый префикс BYDAY (второй понедельник, последняя пятница)", () => {
+    const event = parseEvent(fixture("monthly-ordinal.ics"), "work");
+
+    expect(event.recurrence).toEqual({
+      frequency: "monthly",
+      interval: 1,
+      byWeekday: ["2MO", "-1FR"],
+    });
+  });
+
+  it("учитывает знак триггера-длительности: TRIGGER:-PT15M — до начала, TRIGGER:PT10M — после", () => {
+    const event = parseEvent(fixture("reminders.ics"), "work");
+
+    expect(event.reminders[0]).toEqual({ minutesBefore: 15, method: "display" });
+    expect(event.reminders[1]).toEqual({ minutesBefore: -10, method: "display" });
+  });
+
+  it("переводит абсолютный триггер (TRIGGER;VALUE=DATE-TIME) в минуты от начала события", () => {
+    const event = parseEvent(fixture("reminders.ics"), "work");
+
+    // DTSTART = 2026-09-21T10:00:00+03:00 = 07:00 UTC, триггер — 06:40 UTC,
+    // то есть за 20 минут до начала.
+    expect(event.reminders[2]).toEqual({ minutesBefore: 20, method: "email" });
+  });
+
+  it("для события на весь день timeZone равен UTC, а не внутреннему floating ical.js", () => {
+    const event = parseEvent(fixture("allday.ics"), "personal");
+
+    expect(event.timeZone).toBe("UTC");
+  });
 });
