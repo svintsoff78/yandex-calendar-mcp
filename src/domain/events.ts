@@ -1,9 +1,20 @@
+import ICAL from "ical.js";
+import { randomUUID } from "node:crypto";
 import { queryEventByUid, queryEvents, putObject } from "../caldav/objects.js";
 import { expandOccurrences } from "../ical/expand.js";
 import { buildEvent } from "../ical/build.js";
 import { parseEvent } from "../ical/parse.js";
+import { registerTimeZone } from "../ical/timezones.js";
 import { resolveCalendarIn } from "./calendars.js";
-import type { Attendee, Calendar, CalendarEvent, Context, Recurrence, Reminder } from "../types.js";
+import type {
+  Attendee,
+  Calendar,
+  CalendarEvent,
+  Context,
+  EditScope,
+  Recurrence,
+  Reminder,
+} from "../types.js";
 
 export interface ReadParams {
   from: string;
@@ -239,4 +250,252 @@ export async function createEvents(
     }
   }
   return results;
+}
+
+// ---------------------------------------------------------------------------
+// Правка событий (задача 13)
+// ---------------------------------------------------------------------------
+
+export interface UpdateParams {
+  calendarId?: string;
+  id: string;
+  scope?: EditScope;
+  instanceStart?: string;
+  patch: Partial<EventInput>;
+}
+
+type GetFn = (calendar: Calendar, uid: string) => Promise<{ href: string; etag: string; ics: string }>;
+
+// Тот же приём внедрения зависимости, что у queryFor/putFor выше: тесты
+// подставляют context.get вместо похода в сеть.
+//
+// ОБЯЗАТЕЛЬНОЕ ОТСТУПЛЕНИЕ ОТ БРИФА: там объект для правки находился по
+// `hrefFor(calendar, params.id)` + GET. Это неверно для чужих событий: задача 1
+// установила на живом сервере Яндекса, что имя файла объекта НЕ выводится из
+// UID (docs/yandex-caldav-capabilities.md) — собака выбрасывается, а не
+// кодируется, поэтому собранный путь не совпадёт с реальным почти для любого
+// события, заведённого не нами (веб, телефон). Задача 11 уже решила это для
+// чтения (readEvent выше, тот же аргумент подробно расписан там) — здесь тот
+// же приём: ищем объект REPORT'ом calendar-query по UID (queryEventByUid) и
+// берём href, etag и ics из ответа сервера. hrefFor остаётся пригоден только
+// там, где UID выдаём мы сами — ниже, для новой серии при this_and_following.
+function getFor(context: Context): GetFn {
+  const injected = (context as unknown as { get?: GetFn }).get;
+  if (injected) return injected;
+  return async (calendar, uid) => {
+    const object = await queryEventByUid(context.client, calendar.href, uid);
+    if (!object) {
+      throw new Error(
+        `Событие с идентификатором «${uid}» не найдено в календаре «${calendar.displayName}».`,
+      );
+    }
+    return object;
+  };
+}
+
+// Патч не трогает поля, которых в нём нет: там, где patch[поле] === undefined,
+// остаётся значение из переданного события.
+function merge(event: CalendarEvent, patch: Partial<EventInput>) {
+  return {
+    calendarId: event.calendarId,
+    summary: patch.summary ?? event.summary,
+    description: patch.description ?? event.description,
+    location: patch.location ?? event.location,
+    start: patch.start ?? event.start,
+    end: patch.end ?? event.end,
+    timeZone: patch.timeZone ?? event.timeZone,
+    allDay: patch.allDay ?? event.allDay,
+    recurrence: patch.recurrence ?? event.recurrence,
+    reminders: patch.reminders ?? event.reminders,
+    attendees: patch.attendees ?? event.attendees,
+  };
+}
+
+function veventOf(ics: string): { root: ICAL.Component; vevent: ICAL.Component } {
+  const root = new ICAL.Component(ICAL.parse(ics));
+  const vevent = root.getFirstSubcomponent("vevent");
+  if (!vevent) throw new Error("В календарной записи нет компонента VEVENT.");
+  return { root, vevent };
+}
+
+// Значение RECURRENCE-ID обязано быть в том же представлении, что и DTSTART
+// экземпляра, который оно опознаёт (RFC 5545 §3.8.4.4) — иначе сервер и
+// другие клиенты не смогут сопоставить переопределение с конкретным
+// вхождением серии.
+//
+// Отступление от брифа: там стояло `ICAL.Time.fromJSDate(date, false)` +
+// `ICAL.TimezoneService.get(tzid) ?? ICAL.Timezone.utcTimezone`. Это тот же
+// баг, что уже был найден и исправлен в toIcalTime (src/ical/build.ts,
+// см. комментарий там подробно): при useUTC=false ical.js берёт год/час/
+// минуту и т. д. из геттеров JS Date БЕЗ смещения — то есть в часовом поясе
+// ХОСТ-МАШИНЫ, а не из смещения, указанного в самой ISO-строке. На машине,
+// где локальный пояс случайно совпадает с TZID события, это не проявляется,
+// но ломается на сервере с другим TZ (например, UTC). Плюс `??
+// ICAL.Timezone.utcTimezone` тихо подменяет пояс на UTC, если он ещё не
+// зарегистрирован в TimezoneService, — RECURRENCE-ID тогда не совпадёт с
+// DTSTART опознаваемого экземпляра ни по времени, ни по TZID. Здесь —
+// fromJSDate(date, true) (момент уже учёл смещение при парсинге ISO-строки)
+// плюс registerTimeZone, которая при необходимости зарегистрирует пояс из
+// базы IANA, а не молча подставит UTC.
+function icalTimeOf(iso: string, tzid: string): ICAL.Time {
+  const zone = registerTimeZone(tzid);
+  return ICAL.Time.fromJSDate(new Date(iso), true).convertToZone(zone);
+}
+
+// Число экземпляров исходной серии СТРОГО раньше instanceStart. Используется
+// в двух местах ниже: чтобы проверить, что instanceStart вообще указывает на
+// реальный экземпляр (иначе RECURRENCE-ID/UNTIL ссылались бы в пустоту, и
+// правка молча создавала бы «сиротский» объект, который не покажет ни один
+// календарный клиент, — это хуже явного отказа), и чтобы пересчитать
+// оставшийся COUNT для новой серии при this_and_following (см. там).
+function occurrencesBefore(ics: string, calendarId: string, instanceStart: string): number {
+  return expandOccurrences(ics, calendarId, new Date(0), new Date(instanceStart)).length;
+}
+
+// Самопроверка задачи 13 (проверки, которых нет в брифе): без неё scope
+// "this"/"this_and_following" с опечаткой в instanceStart (например, времени,
+// которого в серии никогда не было) не давал бы никакой ошибки — сервер
+// молча принял бы RECURRENCE-ID или UNTIL, ссылающиеся на несуществующий
+// экземпляр, и правка выглядела бы успешной, ничего не изменив ни в одном
+// клиенте.
+function assertInstanceExists(ics: string, calendarId: string, instanceStart: string): void {
+  const target = new Date(instanceStart);
+  if (Number.isNaN(target.getTime())) {
+    throw new Error(`instanceStart «${instanceStart}» не является датой в формате ISO 8601.`);
+  }
+  // expandOccurrences берёт полуоткрытый интервал [from, to) — окно длиной в
+  // секунду, начинающееся ровно в target, ловит экземпляр с началом ровно в
+  // target и не задевает соседние.
+  const occurrences = expandOccurrences(ics, calendarId, target, new Date(target.getTime() + 1000));
+  const exists = occurrences.some(
+    (occurrence) => new Date(occurrence.start).getTime() === target.getTime(),
+  );
+  if (!exists) {
+    throw new Error(
+      `Момент instanceStart «${instanceStart}» не совпадает ни с одним экземпляром серии. ` +
+        "Проверьте время начала конкретного вхождения, например через list_events.",
+    );
+  }
+}
+
+export async function updateEvent(
+  context: Context,
+  params: UpdateParams,
+): Promise<CalendarEvent> {
+  const calendar = await context.resolveCalendar(params.calendarId);
+  if (calendar.readOnly) {
+    throw new Error(`Календарь «${calendar.displayName}» открыт только для чтения.`);
+  }
+
+  const object = await getFor(context)(calendar, params.id);
+  const current = parseEvent(object.ics, calendar.id, object.etag);
+  const scope: EditScope = params.scope ?? "this";
+  const put = putFor(context);
+  const merged = merge(current, params.patch);
+
+  // Одиночное событие или правка сразу всей серии: правится сам исходный
+  // компонент, без RECURRENCE-ID и без второй серии.
+  if (!current.recurrence || scope === "all_series") {
+    const { ics } = buildEvent({ ...merged, id: params.id });
+    const etag = await put(object.href, ics, { ifMatch: object.etag });
+    return { ...merged, id: params.id, href: object.href, etag };
+  }
+
+  // Дальше — правка повторяющегося события с прицелом на конкретный
+  // экземпляр ("this" или "this_and_following"): без instanceStart непонятно,
+  // какое вхождение серии имеется в виду.
+  if (!params.instanceStart) {
+    throw new Error(
+      "Для правки повторяющегося события укажите instanceStart — начало того экземпляра, который меняем. Либо передайте scope: \"all_series\", чтобы изменить всю серию.",
+    );
+  }
+
+  assertInstanceExists(object.ics, calendar.id, params.instanceStart);
+  // current.recurrence уже проверен выше (первый if вернул бы раньше, если
+  // бы его не было) — фиксируем это в локальной переменной, чтобы TypeScript
+  // не терял сужение типа после промежуточных вызовов функций.
+  const recurrence: Recurrence = current.recurrence;
+
+  if (scope === "this") {
+    // Экземпляр правим относительно ЕГО СОБСТВЕННОГО времени (instanceStart),
+    // а не относительно времени первого вхождения серии (current.start) —
+    // иначе правка одного только summary у второго и последующих экземпляров
+    // молча переносила бы их на время самого первого вхождения серии.
+    const duration = new Date(current.end).getTime() - new Date(current.start).getTime();
+    const instanceEnd = new Date(new Date(params.instanceStart).getTime() + duration).toISOString();
+    const instanceMerged = merge(
+      { ...current, start: params.instanceStart, end: instanceEnd },
+      params.patch,
+    );
+
+    const { root } = veventOf(object.ics);
+    const override = veventOf(
+      buildEvent({ ...instanceMerged, id: params.id, recurrence: undefined }).ics,
+    ).vevent;
+    const recurrenceId = override.addPropertyWithValue(
+      "recurrence-id",
+      icalTimeOf(params.instanceStart, current.timeZone),
+    );
+    if (!current.allDay) recurrenceId.setParameter("tzid", current.timeZone);
+    root.addSubcomponent(override);
+
+    const etag = await put(object.href, root.toString(), { ifMatch: object.etag });
+    return {
+      ...instanceMerged,
+      id: params.id,
+      href: object.href,
+      etag,
+      instanceStart: params.instanceStart,
+    };
+  }
+
+  // scope === "this_and_following": у исходной серии выставляется UNTIL на
+  // момент перед правимым экземпляром, и создаётся новая серия с новым UID и
+  // изменёнными полями — здесь UID выдаём мы сами, поэтому hrefFor уместен.
+  const boundary = new Date(new Date(params.instanceStart).getTime() - 1000).toISOString();
+  const truncated = buildEvent({
+    ...current,
+    id: params.id,
+    recurrence: { ...recurrence, count: undefined, until: boundary },
+  });
+  await put(object.href, truncated.ics, { ifMatch: object.etag });
+
+  // COUNT — предел ОТНОСИТЕЛЬНЫЙ (число повторов от DTSTART серии), в
+  // отличие от UNTIL (абсолютная дата, которая остаётся верной точкой
+  // отсечения без изменений и переносится в новую серию как есть через
+  // merged.recurrence). Если перенести recurrence.count в новую серию не
+  // тронув, общее число повторов превысит то, что было в исходной серии:
+  // часть уже прожита в усечённом «хвосте», а новая серия добавит ещё
+  // столько же. Пересчитываем остаток — если только пользователь не задал
+  // recurrence патчем явно, тогда это его осознанный выбор, и трогать его
+  // не нужно.
+  let continuationRecurrence = merged.recurrence;
+  if (!params.patch.recurrence && recurrence.count) {
+    const kept = occurrencesBefore(object.ics, calendar.id, params.instanceStart);
+    const remaining = recurrence.count - kept;
+    if (remaining > 0) continuationRecurrence = { ...recurrence, count: remaining };
+  }
+
+  const continuation = buildEvent({
+    ...merged,
+    recurrence: continuationRecurrence,
+    id: randomUUID(),
+    start: params.patch.start ?? params.instanceStart,
+    end:
+      params.patch.end ??
+      new Date(
+        new Date(params.instanceStart).getTime() +
+          (new Date(current.end).getTime() - new Date(current.start).getTime()),
+      ).toISOString(),
+  });
+  const continuationHref = hrefFor(calendar, continuation.uid);
+  const etag = await put(continuationHref, continuation.ics, { ifNoneMatch: true });
+
+  return {
+    ...merged,
+    recurrence: continuationRecurrence,
+    id: continuation.uid,
+    href: continuationHref,
+    etag,
+  };
 }
