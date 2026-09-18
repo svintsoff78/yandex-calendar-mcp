@@ -206,4 +206,81 @@ END:VCALENDAR</c:calendar-data>
 
     expect(object).toBeUndefined();
   });
+
+  // <c:text-match> в CalDAV — подстроковое сравнение (RFC 4791 §9.7.5:
+  // "substring match"), collation="i;octet" управляет только регистром,
+  // а не гранулярностью. Сервер может честно вернуть событие, чей UID лишь
+  // содержит искомый как часть, — такие ответы нужно отбрасывать самим,
+  // сверяя настоящий UID из calendar-data.
+  it("отбрасывает объект, чей UID лишь содержит искомый как подстроку", async () => {
+    const substringMatch = `<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:response>
+    <d:href>/calendars/user/work/other.ics</d:href>
+    <d:propstat><d:prop>
+      <d:getetag>1</d:getetag>
+      <c:calendar-data>BEGIN:VCALENDAR
+UID:aaaabbbbccccdddd11@yandex.ru-extra
+END:VCALENDAR</c:calendar-data>
+    </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+  </d:response>
+</d:multistatus>`;
+    const { client: caldav } = client({ text: substringMatch });
+
+    const object = await queryEventByUid(caldav, "/calendars/user/work/", uid);
+
+    expect(object).toBeUndefined();
+  });
+
+  it("бросает понятную ошибку, если найдено больше одного объекта с точным совпадением UID", async () => {
+    const duplicateMatch = `<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:response>
+    <d:href>/calendars/user/work/dup-1.ics</d:href>
+    <d:propstat><d:prop>
+      <d:getetag>1</d:getetag>
+      <c:calendar-data>BEGIN:VCALENDAR
+UID:aaaabbbbccccdddd11@yandex.ru
+END:VCALENDAR</c:calendar-data>
+    </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/calendars/user/work/dup-2.ics</d:href>
+    <d:propstat><d:prop>
+      <d:getetag>2</d:getetag>
+      <c:calendar-data>BEGIN:VCALENDAR
+UID:aaaabbbbccccdddd11@yandex.ru
+END:VCALENDAR</c:calendar-data>
+    </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+  </d:response>
+</d:multistatus>`;
+    const { client: caldav } = client({ text: duplicateMatch });
+
+    await expect(queryEventByUid(caldav, "/calendars/user/work/", uid)).rejects.toThrow(/2/);
+  });
+
+  it("находит объект, если строка UID перенесена по правилам iCalendar", async () => {
+    // Правило переноса строк RFC 5545 §3.1: продолжение начинается с
+    // одного пробела или таба, который при разборе убирается, а хвост
+    // склеивается с предыдущей строкой.
+    const foldedMatch = `<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:response>
+    <d:href>${realHref}</d:href>
+    <d:propstat><d:prop>
+      <d:getetag>1789383239000</d:getetag>
+      <c:calendar-data>BEGIN:VCALENDAR
+UID:aaaabbbbccccdddd11@yandex.r
+ u
+END:VCALENDAR</c:calendar-data>
+    </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+  </d:response>
+</d:multistatus>`;
+    const { client: caldav } = client({ text: foldedMatch });
+
+    const object = await queryEventByUid(caldav, "/calendars/user/work/", uid);
+
+    expect(object).toBeDefined();
+    expect(object!.href).toBe(realHref);
+  });
 });
