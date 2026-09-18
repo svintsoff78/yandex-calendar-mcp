@@ -378,6 +378,54 @@ function assertInstanceExists(ics: string, calendarId: string, instanceStart: st
   }
 }
 
+// Находка ревью (Critical, круг 1): buildEvent всегда собирает СВЕЖИЙ
+// VCALENDAR с единственным VEVENT (плюс VTIMEZONE). Если подменить им весь
+// объект целиком (как было раньше в all_series), теряются любые прочие
+// подкомпоненты, уже лежавшие в объекте, — в первую очередь переопределения
+// экземпляров с RECURRENCE-ID, добавленные более ранней правкой со
+// scope "this". Вместо пересборки всего объекта заменяем в ИСХОДНОМ
+// разобранном компоненте только master VEVENT (и его VTIMEZONE) на
+// свежесобранные из buildEvent — остальные подкомпоненты остаются как есть.
+// Тот же принцип «править на месте, не пересобирать», что deleteEvent
+// (задача 14) применил для scope this_and_following (см. там).
+//
+// Предполагается, что master — первый субкомпонент VEVENT объекта (так
+// veventOf его и находит): это тот же порядок, в котором его кладёт сюда
+// этот же модуль (master создаётся первым, переопределения добавляются
+// после через addSubcomponent), поэтому не нарушается собственными
+// операциями. Тот же порядок предполагает и deleteEvent.
+function replaceMaster(originalIcs: string, patchedIcs: string): string {
+  const { root, vevent: master } = veventOf(originalIcs);
+  const built = veventOf(patchedIcs);
+
+  for (const vtimezone of root.getAllSubcomponents("vtimezone")) {
+    root.removeSubcomponent(vtimezone);
+  }
+  root.removeSubcomponent(master);
+  for (const vtimezone of built.root.getAllSubcomponents("vtimezone")) {
+    root.addSubcomponent(vtimezone);
+  }
+  root.addSubcomponent(built.vevent);
+  return root.toString();
+}
+
+// Находка ревью (Critical, круг 1): без поиска и удаления уже существующего
+// переопределения с той же парой UID+RECURRENCE-ID повторная правка одного
+// и того же экземпляра копит дубликаты — по RFC 5545 §3.8.4.4 два
+// компонента с одинаковой парой UID/RECURRENCE-ID делают объект невалидным,
+// а поведение серверов и клиентов на таких данных не определено.
+function removeExistingOverride(root: ICAL.Component, uid: string, instant: Date): void {
+  for (const candidate of root.getAllSubcomponents("vevent")) {
+    const recurrenceIdProperty = candidate.getFirstProperty("recurrence-id");
+    if (!recurrenceIdProperty) continue; // master — не переопределение
+    if (String(candidate.getFirstPropertyValue("uid") ?? "") !== uid) continue;
+    const value = recurrenceIdProperty.getFirstValue() as ICAL.Time;
+    if (value.toJSDate().getTime() === instant.getTime()) {
+      root.removeSubcomponent(candidate);
+    }
+  }
+}
+
 export async function updateEvent(
   context: Context,
   params: UpdateParams,
@@ -397,7 +445,11 @@ export async function updateEvent(
   // компонент, без RECURRENCE-ID и без второй серии.
   if (!current.recurrence || scope === "all_series") {
     const { ics } = buildEvent({ ...merged, id: params.id });
-    const etag = await put(object.href, ics, { ifMatch: object.etag });
+    // replaceMaster (не голый ics из buildEvent) — иначе переопределения
+    // экземпляров, уже лежащие в объекте, пропадут молча (находка ревью,
+    // Critical, круг 1). Для одиночного события без переопределений это
+    // эквивалентно прежнему поведению.
+    const etag = await put(object.href, replaceMaster(object.ics, ics), { ifMatch: object.etag });
     return { ...merged, id: params.id, href: object.href, etag };
   }
 
@@ -429,6 +481,12 @@ export async function updateEvent(
     );
 
     const { root } = veventOf(object.ics);
+    // Находка ревью (Critical, круг 1): без этого повторная правка того же
+    // экземпляра копит дубликаты переопределений с одинаковой парой
+    // UID+RECURRENCE-ID — по RFC 5545 такой объект невалиден. Убираем
+    // прежнее переопределение ЭТОГО экземпляра (если оно уже было), прежде
+    // чем добавлять новое.
+    removeExistingOverride(root, params.id, new Date(params.instanceStart));
     const override = veventOf(
       buildEvent({ ...instanceMerged, id: params.id, recurrence: undefined }).ics,
     ).vevent;
@@ -453,12 +511,25 @@ export async function updateEvent(
   // момент перед правимым экземпляром, и создаётся новая серия с новым UID и
   // изменёнными полями — здесь UID выдаём мы сами, поэтому hrefFor уместен.
   const boundary = new Date(new Date(params.instanceStart).getTime() - 1000).toISOString();
-  const truncated = buildEvent({
-    ...current,
-    id: params.id,
-    recurrence: { ...recurrence, count: undefined, until: boundary },
-  });
-  await put(object.href, truncated.ics, { ifMatch: object.etag });
+
+  // Находка ревью (Critical, круг 1): усечение раньше пересобирало весь
+  // объект через buildEvent(current...) — то же самое, что уже сломало
+  // all_series выше, теряло переопределения и прочие подкомпоненты (сама
+  // серия только что могла нести переопределение экземпляра, добавленное
+  // предыдущей правкой со scope "this"). Вместо пересборки мутируем RRULE
+  // ПРЯМО в исходном разобранном компоненте — тот же приём, что deleteEvent
+  // (задача 14) применяет для этого же scope: остальные подкомпоненты
+  // (переопределения, VALARM, ATTENDEE и т. д.) остаются как есть.
+  const { root: originalRoot, vevent: originalMaster } = veventOf(object.ics);
+  const rruleProperty = originalMaster.getFirstProperty("rrule");
+  if (!rruleProperty) throw new Error("В повторяющемся событии нет свойства RRULE.");
+  const recur = rruleProperty.getFirstValue() as ICAL.Recur;
+  // UNTIL обязан быть в UTC (RFC 5545 §3.3.10) — тот же приём, что и в
+  // toRrule (src/ical/build.ts): useUTC=true без convertToZone.
+  recur.until = ICAL.Time.fromJSDate(new Date(boundary), true);
+  recur.count = null;
+  rruleProperty.setValue(recur);
+  await put(object.href, originalRoot.toString(), { ifMatch: object.etag });
 
   // COUNT — предел ОТНОСИТЕЛЬНЫЙ (число повторов от DTSTART серии), в
   // отличие от UNTIL (абсолютная дата, которая остаётся верной точкой
@@ -489,7 +560,26 @@ export async function updateEvent(
       ).toISOString(),
   });
   const continuationHref = hrefFor(calendar, continuation.uid);
-  const etag = await put(continuationHref, continuation.ics, { ifNoneMatch: true });
+
+  // Находка ревью (Important): две записи здесь неатомарны — CalDAV не даёт
+  // транзакций, а исходная серия к этому моменту уже усечена (put выше
+  // прошёл успешно). Если эта, вторая запись отвалится, будущие встречи
+  // молча пропадут: они не попадут ни в старую серию (она обрезана), ни в
+  // новую (она не создалась). Отката нет (решение контроллера — транзакций
+  // всё равно не даёт CalDAV), но отказ обязан явно назвать, что произошло
+  // и что проверить, а не уйти наружу голым сообщением уровня CalDAV.
+  let etag: string;
+  try {
+    etag = await put(continuationHref, continuation.ics, { ifNoneMatch: true });
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `Серия усечена по ${params.instanceStart}, но новая часть серии не создана: ${reason}. ` +
+        `Проверьте календарь «${calendar.displayName}»: начиная с ${params.instanceStart} события ` +
+        "могут отсутствовать — досоздайте их вручную (create_event/create_events) или повторите update_event.",
+      { cause: error },
+    );
+  }
 
   return {
     ...merged,

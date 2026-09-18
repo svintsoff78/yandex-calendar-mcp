@@ -332,4 +332,135 @@ END:VCALENDAR`;
     expect(put.mock.calls[0][2].ifMatch).toBe('"etag-1"');
     expect(put.mock.calls[1][2].ifMatch).toBe('"etag-2"');
   });
+
+  // -----------------------------------------------------------------------
+  // Регрессионные тесты по ревью задачи 13 (круг 1): две находки Critical
+  // и одна Important.
+  // -----------------------------------------------------------------------
+
+  // Объект с master-компонентом (RRULE) и уже существующим переопределением
+  // экземпляра (RECURRENCE-ID) — например, ранее правленным через scope
+  // "this". Используется находками 1 и 2 ниже.
+  const weeklyWithOverride = `BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:test-weekly-override-1
+DTSTAMP:20261001T090000Z
+DTSTART;TZID=Europe/Moscow:20261019T100000
+DTEND;TZID=Europe/Moscow:20261019T140000
+RRULE:FREQ=WEEKLY;INTERVAL=1;BYDAY=MO,WE;COUNT=6
+SUMMARY:Проект «Заря»
+END:VEVENT
+BEGIN:VEVENT
+UID:test-weekly-override-1
+RECURRENCE-ID;TZID=Europe/Moscow:20261021T100000
+DTSTAMP:20261001T090000Z
+DTSTART;TZID=Europe/Moscow:20261021T113000
+DTEND;TZID=Europe/Moscow:20261021T150000
+SUMMARY:Перенесённая среда
+END:VEVENT
+END:VCALENDAR`;
+
+  it("НАХОДКА 1: all_series сохраняет уже существующее переопределение экземпляра", async () => {
+    const { context, put } = contextWith(weeklyWithOverride);
+
+    await updateEvent(context as never, {
+      id: "test-weekly-override-1",
+      scope: "all_series",
+      patch: { summary: "Новое общее название" },
+    });
+
+    const ics = put.mock.calls[0][1];
+    // Переопределение не пропало (было потеряно при пересборке через
+    // buildEvent, у которой в календаре всегда ровно один VEVENT).
+    expect(ics).toContain("RECURRENCE-ID");
+    expect(ics).toContain("Перенесённая среда");
+    // При этом master действительно поправлен.
+    expect(ics).toContain("Новое общее название");
+    expect(ics).toContain("RRULE");
+  });
+
+  it("НАХОДКА 1: this_and_following сохраняет переопределение при усечении исходной серии", async () => {
+    // Переопределение стоит на 21 октября — раньше instanceStart (2 ноября),
+    // то есть попадает в «хвост», который остаётся у исходной серии после
+    // усечения. Усечение не должно его терять.
+    const { context, put } = contextWith(weeklyWithOverride);
+
+    await updateEvent(context as never, {
+      id: "test-weekly-override-1",
+      scope: "this_and_following",
+      instanceStart: "2026-11-02T10:00:00+03:00",
+      patch: { summary: "Хвост серии" },
+    });
+
+    const truncatedIcs = put.mock.calls[0][1];
+    expect(truncatedIcs).toContain("UNTIL=");
+    expect(truncatedIcs).toContain("RECURRENCE-ID");
+    expect(truncatedIcs).toContain("Перенесённая среда");
+  });
+
+  it("НАХОДКА 2: scope this идемпотентен — повторная правка того же экземпляра не копит дубликаты RECURRENCE-ID", async () => {
+    const put = vi.fn().mockResolvedValue('"etag-new"');
+    const get = vi.fn();
+    get.mockResolvedValueOnce({ href: "/c/work/x.ics", etag: '"etag-1"', ics: weekly });
+    const context = {
+      client: {} as never,
+      config: { defaultTimeZone: "Europe/Moscow" } as never,
+      calendars: async () => [calendar],
+      resolveCalendar: async () => calendar,
+      get,
+      put,
+    };
+
+    await updateEvent(context as never, {
+      id: "test-weekly-1",
+      scope: "this",
+      instanceStart: "2026-10-21T10:00:00+03:00",
+      patch: { summary: "Первая правка экземпляра" },
+    });
+
+    // Второй вызов get() отдаёт РЕЗУЛЬТАТ первой записи — именно то, что
+    // реально вернул бы сервер при повторном чтении после первой правки.
+    const firstResultIcs = put.mock.calls[0][1];
+    get.mockResolvedValueOnce({ href: "/c/work/x.ics", etag: '"etag-2"', ics: firstResultIcs });
+
+    await updateEvent(context as never, {
+      id: "test-weekly-1",
+      scope: "this",
+      instanceStart: "2026-10-21T10:00:00+03:00",
+      patch: { summary: "Вторая правка того же экземпляра" },
+    });
+
+    const secondResultIcs = put.mock.calls[1][1];
+    const overrideCount = (secondResultIcs.match(/RECURRENCE-ID/g) ?? []).length;
+    expect(overrideCount).toBe(1);
+    expect(secondResultIcs).toContain("Вторая правка того же экземпляра");
+    expect(secondResultIcs).not.toContain("Первая правка экземпляра");
+  });
+
+  it("НАХОДКА 3: this_and_following называет усечение серии и не созданную новую часть при отказе второй записи", async () => {
+    const { context, put } = contextWith(weekly);
+    put.mockResolvedValueOnce('"etag-truncated"'); // первая запись (усечение) — успех
+    const serverError = new Error("Сервер календаря ответил кодом 500.");
+    put.mockRejectedValueOnce(serverError); // вторая (новая серия) — отказ
+
+    expect.assertions(5);
+    try {
+      await updateEvent(context as never, {
+        id: "test-weekly-1",
+        scope: "this_and_following",
+        instanceStart: "2026-11-02T10:00:00+03:00",
+        patch: { summary: "Хвост серии" },
+      });
+    } catch (error) {
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toMatch(/усечен/i);
+      expect((error as Error).message).toMatch(/не создан/i);
+      // Исходная ошибка сохранена как причина, а не потеряна.
+      expect((error as Error).cause).toBe(serverError);
+    }
+    // Обе записи реально были предприняты (первая прошла, вторая отказала) —
+    // отказ во второй не должен помешать первой попытке случиться.
+    expect(put).toHaveBeenCalledTimes(2);
+  });
 });
