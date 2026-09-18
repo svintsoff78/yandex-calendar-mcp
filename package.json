@@ -16,6 +16,7 @@
   "type": "module",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
+    "@touch4it/ical-timezones": "^1.9.0",
     "fast-xml-parser": "^5.11.1",
     "ical.js": "^2.2.1",
     "zod": "^4.6.5"
