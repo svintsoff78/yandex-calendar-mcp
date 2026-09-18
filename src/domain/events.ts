@@ -1,6 +1,6 @@
 import ICAL from "ical.js";
 import { randomUUID } from "node:crypto";
-import { queryEventByUid, queryEvents, putObject } from "../caldav/objects.js";
+import { deleteObject, queryEventByUid, queryEvents, putObject } from "../caldav/objects.js";
 import { expandOccurrences } from "../ical/expand.js";
 import { buildEvent } from "../ical/build.js";
 import { parseEvent } from "../ical/parse.js";
@@ -498,4 +498,155 @@ export async function updateEvent(
     href: continuationHref,
     etag,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Удаление событий (задача 14) — единственная необратимая операция сервера.
+// ---------------------------------------------------------------------------
+
+export interface DeleteParams {
+  calendarId?: string;
+  id: string;
+  scope?: EditScope;
+  instanceStart?: string;
+}
+
+type RemoveFn = (href: string, etag?: string) => Promise<void>;
+
+// Тот же приём внедрения зависимости, что у get/putFor выше: тесты
+// подставляют context.remove вместо похода в сеть. По умолчанию — настоящий
+// DELETE с If-Match на etag, снятым с ответа сервера (см. getFor): для
+// необратимой операции недопустимо ни угадывать путь, ни отправлять запрос
+// без условного заголовка, если etag известен.
+function removeFor(context: Context): RemoveFn {
+  const injected = (context as unknown as { remove?: RemoveFn }).remove;
+  if (injected) return injected;
+  return (href, etag) => deleteObject(context.client, href, etag);
+}
+
+export async function deleteEvent(
+  context: Context,
+  params: DeleteParams,
+): Promise<{ deleted: string; scope: EditScope }> {
+  const calendar = await context.resolveCalendar(params.calendarId);
+  if (calendar.readOnly) {
+    throw new Error(`Календарь «${calendar.displayName}» открыт только для чтения.`);
+  }
+
+  // ОБЯЗАТЕЛЬНОЕ ОТСТУПЛЕНИЕ ОТ БРИФА: там объект для удаления находился по
+  // `hrefFor(calendar, params.id)`. По тем же причинам, что уже разобраны у
+  // getFor выше (используется updateEvent'ом, задача 13, тот же аргумент —
+  // задача 11): имя файла объекта на сервере Яндекса НЕ выводится из UID
+  // (docs/yandex-caldav-capabilities.md) — собака выбрасывается, а не
+  // кодируется, поэтому собранный путь не совпадёт с реальным почти для
+  // любого события, заведённого не нами (веб, телефон). Для удаления — самой
+  // необратимой операции сервиса — цена ошибки здесь хуже, чем для чтения
+  // или правки: операция либо молча ничего не найдёт, либо (что куда хуже)
+  // попадёт не в тот объект. getFor уже решает это через queryEventByUid и
+  // отдаёт href/etag/ics из ответа сервера — используем ту же функцию, а не
+  // переписываем поиск заново.
+  const object = await getFor(context)(calendar, params.id);
+  const current = parseEvent(object.ics, calendar.id, object.etag);
+  // Умолчание зависит от типа события: у одиночного удалять «экземпляр»
+  // нечего (у него нет отдельного понятия «экземпляр» помимо самого
+  // объекта), поэтому оно сразу трактуется как all_series; у серии по
+  // умолчанию исчезает только названный экземпляр — неточная формулировка
+  // не должна стирать всю серию.
+  const scope: EditScope = params.scope ?? (current.recurrence ? "this" : "all_series");
+  const remove = removeFor(context);
+
+  // Одиночное событие или явная просьба удалить всю серию — удаляется сам
+  // объект, найденный getFor. Ветка одна и та же для обоих случаев: для
+  // одиночного события "экземпляр" и "серия" — один и тот же объект, поэтому
+  // сужать поведение по scope там не на чем.
+  if (!current.recurrence || scope === "all_series") {
+    await remove(object.href, object.etag);
+    return { deleted: params.id, scope: "all_series" };
+  }
+
+  // Дальше — частичное удаление серии ("this" или "this_and_following"):
+  // без instanceStart непонятно, какой именно экземпляр (или начиная с
+  // какого момента) нужно убрать, а гадать в необратимой операции
+  // недопустимо — лучше понятная ошибка, чем удаление наугад.
+  if (!params.instanceStart) {
+    throw new Error(
+      "Для удаления части серии укажите instanceStart — начало удаляемого экземпляра. " +
+        'Либо передайте scope: "all_series", чтобы удалить всю серию целиком.',
+    );
+  }
+
+  // Самопроверка (тот же приём, что и assertInstanceExists в updateEvent
+  // выше): без неё instanceStart, не совпадающий ни с одним настоящим
+  // экземпляром серии (опечатка во времени, чужой часовой пояс), тихо
+  // добавил бы бесполезный EXDATE или UNTIL «в пустоту» — операция выглядела
+  // бы успешной, ничего не удалив, а пользователь решил бы, что экземпляр
+  // убран, хотя он остался на месте в календаре.
+  assertInstanceExists(object.ics, calendar.id, params.instanceStart);
+
+  const { root, vevent } = veventOf(object.ics);
+
+  if (scope === "this") {
+    // EXDATE, а не удаление объекта: серия остаётся, пропадает только
+    // названный экземпляр. Правим СЫРОЙ компонент (root/vevent из
+    // veventOf), а не пересобираем событие через buildEvent из
+    // распарсенного CalendarEvent, — потому что тип CalendarEvent/Recurrence
+    // не несёт уже существующие EXDATE (parseRecurrence их не читает):
+    // пересборка потеряла бы прежде поставленные исключения серии.
+    const exdate = vevent.addPropertyWithValue(
+      "exdate",
+      icalTimeOf(params.instanceStart, current.timeZone),
+    );
+    // RFC 5545 §3.8.5.1: параметр TZID у EXDATE обязан совпадать с DTSTART
+    // того же VEVENT. Проверено отдельно на живом ical.js: без явного
+    // setParameter("tzid", ...) addPropertyWithValue сериализует EXDATE как
+    // floating-время без зоны ("EXDATE:20261021T100000" вместо
+    // "EXDATE;TZID=...:20261021T100000") — клиенты не смогут надёжно
+    // сопоставить исключение с экземпляром в его настоящем часовом поясе.
+    // allDay-события используют VALUE=DATE без TZID, поэтому параметр
+    // ставится только при явном времени — тот же приём, что у
+    // RECURRENCE-ID в updateEvent выше.
+    if (!current.allDay) exdate.setParameter("tzid", current.timeZone);
+
+    await putFor(context)(object.href, root.toString(), { ifMatch: object.etag });
+    return { deleted: params.instanceStart, scope };
+  }
+
+  // scope === "this_and_following": у серии выставляется UNTIL перед
+  // удаляемым экземпляром — сам объект остаётся, просто перестаёт порождать
+  // экземпляры начиная с этого момента. Новая серия (в отличие от
+  // updateEvent) не создаётся: удаление хвоста не переносит вперёд
+  // изменённые поля, продолжать нечему.
+  //
+  // Отступление от брифа: там UNTIL выставлялся через buildEvent(current...)
+  // — пересборку всего VEVENT из распарсенного CalendarEvent (тот же приём,
+  // что updateEvent использует для этого scope). Для удаления это опаснее,
+  // чем для правки: CalendarEvent не несёт уже существующие EXDATE серии
+  // (см. комментарий у scope "this" выше), поэтому пересборка потеряла бы
+  // экземпляры, удалённые РАНЕЕ через scope "this", если они попадают до
+  // новой границы UNTIL, — прежде удалённый экземпляр «воскрес» бы. Здесь
+  // вместо пересборки правится только сам RRULE внутри исходного сырого
+  // компонента (root/vevent из veventOf, тот же объект, что и у "this"
+  // выше) — EXDATE, ATTENDEE, VALARM и всё остальное остаются как есть.
+  // Проверено отдельно на живом ical.js: mutating recur.until/recur.count и
+  // rruleProperty.setValue(recur) корректно переписывают RRULE, не трогая
+  // соседние свойства VEVENT.
+  //
+  // current.recurrence уже проверен веткой выше (иначе мы бы не дошли
+  // сюда), а сам rrule получен именно из него — parseRecurrence в
+  // src/ical/parse.ts читает свойство "rrule" и ничего больше, поэтому оно
+  // гарантированно есть в сыром компоненте.
+  const rruleProperty = vevent.getFirstProperty("rrule");
+  if (!rruleProperty) throw new Error("В повторяющемся событии нет свойства RRULE.");
+  const recur = rruleProperty.getFirstValue() as ICAL.Recur;
+  const boundary = new Date(new Date(params.instanceStart).getTime() - 1000).toISOString();
+  // UNTIL обязан быть в UTC (RFC 5545 §3.3.10) — в отличие от RECURRENCE-ID
+  // и EXDATE, которые обязаны совпадать по представлению с DTSTART. Тот же
+  // приём, что и в toRrule (src/ical/build.ts): useUTC=true без
+  // convertToZone.
+  recur.until = ICAL.Time.fromJSDate(new Date(boundary), true);
+  recur.count = null;
+  rruleProperty.setValue(recur);
+
+  await putFor(context)(object.href, root.toString(), { ifMatch: object.etag });
+  return { deleted: `${params.instanceStart} и далее`, scope };
 }
