@@ -146,6 +146,72 @@ END:VCALENDAR`;
     expect(occurrences).toEqual([]);
   });
 
+  // Правка по ревью задачи 8 (Important): счётчик MAX_OCCURRENCES считал
+  // КАЖДУЮ итерацию курсора, включая те, что отброшены как лежащие до
+  // `from`. У серии, начавшейся задолго до окна (обычная старая еженедельная
+  // встреча без UNTIL/COUNT — совершенно рядовой случай), весь бюджет уходил
+  // на прокрутку мимо прошлого, и до окна цикл не доходил вовсе. Ревьюер
+  // воспроизвёл это на ежедневной бессрочной серии с DTSTART=1990-01-01 и
+  // окном "сегодня плюс месяц": функция возвращала ноль экземпляров, хотя
+  // событие повторяется каждый день внутри окна.
+  it("раскрывает старую бессрочную серию, даже если DTSTART на десятилетия раньше окна", () => {
+    const veryOld = `BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:very-old-daily-1
+DTSTAMP:19900101T090000Z
+DTSTART;TZID=Europe/Moscow:19900101T100000
+DTEND;TZID=Europe/Moscow:19900101T110000
+RRULE:FREQ=DAILY
+SUMMARY:Ежедневная встреча с 1990 года
+END:VEVENT
+END:VCALENDAR`;
+
+    // Окно — 30 дней, "сегодня плюс месяц", как в воспроизведении ревьюера.
+    const occurrences = expandOccurrences(
+      veryOld,
+      "work",
+      new Date("2026-09-18T00:00:00Z"),
+      new Date("2026-10-18T00:00:00Z"),
+    );
+
+    expect(occurrences).toHaveLength(30);
+    expect(occurrences[0].instanceStart).toBe("2026-09-18T10:00:00+03:00");
+    expect(occurrences.at(-1)?.instanceStart).toBe("2026-10-17T10:00:00+03:00");
+  });
+
+  // Правка по ревью задачи 8: экземпляр, начавшийся до начала окна, но
+  // закончившийся внутри него, обязан попадать в выдачу — эта проверка
+  // (`endTime <= from` → continue) должна остаться верной и после починки
+  // счётчика итераций выше. DTSTART события — 2015 год (одиннадцать лет до
+  // окна), чтобы заодно пройти через тот же длинный путь "прокрутки" вперёд.
+  it("отдаёт экземпляр, начавшийся до окна, но закончившийся внутри него", () => {
+    const overnightWeekly = `BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:overnight-weekly-1
+DTSTAMP:20150101T090000Z
+DTSTART;TZID=Europe/Moscow:20150105T220000
+DTEND;TZID=Europe/Moscow:20150106T010000
+RRULE:FREQ=WEEKLY;BYDAY=MO
+SUMMARY:Ночной созвон по понедельникам
+END:VEVENT
+END:VCALENDAR`;
+
+    // Экземпляр за 2026-09-14 (понедельник) занимает [19:00Z, 22:00Z).
+    // Окно начинается в 20:00Z — уже после старта экземпляра, но до его
+    // конца — и заканчивается до следующего понедельника.
+    const occurrences = expandOccurrences(
+      overnightWeekly,
+      "work",
+      new Date("2026-09-14T20:00:00Z"),
+      new Date("2026-09-15T00:00:00Z"),
+    );
+
+    expect(occurrences).toHaveLength(1);
+    expect(occurrences[0].instanceStart).toBe("2026-09-14T22:00:00+03:00");
+  });
+
   // Дополнительный тест сверх брифа (см. дисклеймер задачи 8): доказывает, что
   // запасной путь регистрации пояса из вложенного VTIMEZONE действительно
   // срабатывает. TZID "X-Custom/Zone" заведомо отсутствует в базе IANA
