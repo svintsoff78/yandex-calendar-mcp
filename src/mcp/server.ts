@@ -3,6 +3,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { createContext } from "./context.js";
 import { registerListCalendars } from "./tools/listCalendars.js";
 import { registerReadTools } from "./tools/readEvents.js";
+import { registerCreateTools } from "./tools/createEvents.js";
 
 export async function main(): Promise<void> {
   const context = createContext(process.env);
@@ -10,6 +11,7 @@ export async function main(): Promise<void> {
 
   registerListCalendars(server, context);
   registerReadTools(server, context);
+  registerCreateTools(server, context);
 
   await server.connect(new StdioServerTransport());
 }
