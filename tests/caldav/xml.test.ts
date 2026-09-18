@@ -66,7 +66,23 @@ describe("parseMultistatus", () => {
       </d:multistatus>`;
     const entries = parseMultistatus(xml);
     expect(entries).toHaveLength(1);
+    expect(entries[0].status).toBe(200);
     expect(entries[0].props.displayname).toBe("Работа");
     expect(entries[0].props.getctag).toBeUndefined();
+  });
+
+  it("берёт статус из успешного propstat, а не подставляет 200 по умолчанию", () => {
+    const xml = `<?xml version="1.0"?>
+      <d:multistatus xmlns:d="DAV:">
+        <d:response>
+          <d:href>/calendars/y/</d:href>
+          <d:propstat>
+            <d:prop><d:displayname>Личное</d:displayname></d:prop>
+            <d:status>HTTP/1.1 201 Created</d:status>
+          </d:propstat>
+        </d:response>
+      </d:multistatus>`;
+    const entries = parseMultistatus(xml);
+    expect(entries[0].status).toBe(201);
   });
 });

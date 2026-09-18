@@ -65,10 +65,6 @@ export function parseMultistatus(xml: string): MultistatusEntry[] {
       Object.assign(props, propstat.prop ?? {});
     }
 
-    for (const [key, value] of Object.entries(props)) {
-      if (value === "" || value === null) delete props[key];
-    }
-
     return { href: String(response.href ?? ""), status: entryStatus, props };
   });
 }
