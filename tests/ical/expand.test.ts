@@ -253,4 +253,146 @@ END:VCALENDAR`;
     expect(occurrences[0].instanceStart).toBe("2026-01-05T10:00:00+05:00");
     expect(occurrences.every((item) => item.timeZone === "X-Custom/Zone")).toBe(true);
   });
+
+  // Правка по ревью задачи 8 (Critical, найдено ревью задачи 13):
+  // expandOccurrences игнорировал переопределения экземпляров — компоненты
+  // VEVENT с тем же UID и свойством RECURRENCE-ID, которыми задача 13
+  // записывает правку одного экземпляра серии ("this"). Раскрытие всегда
+  // показывало данные основного компонента, то есть старое время/название,
+  // даже когда экземпляр был перенесён или переименован на сервере.
+  //
+  // Сопоставление переопределений сделано через встроенный в ical.js
+  // механизм исключений (ICAL.Event сам находит VEVENT-соседей с
+  // RECURRENCE-ID через component.parent и связывает их — см.
+  // node_modules/ical.js/lib/ical/event.js, конструктор и
+  // getOccurrenceDetails()), а не через ручное сопоставление строк.
+  it("отдаёт перенесённый экземпляр с новым временем, не трогая остальные", () => {
+    const moved = `BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:series-moved-1
+DTSTAMP:20260101T090000Z
+DTSTART;TZID=Europe/Moscow:20260105T100000
+DTEND;TZID=Europe/Moscow:20260105T110000
+RRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=4
+SUMMARY:Еженедельная планёрка
+END:VEVENT
+BEGIN:VEVENT
+UID:series-moved-1
+DTSTAMP:20260101T090000Z
+RECURRENCE-ID;TZID=Europe/Moscow:20260112T100000
+DTSTART;TZID=Europe/Moscow:20260112T150000
+DTEND;TZID=Europe/Moscow:20260112T160000
+SUMMARY:Еженедельная планёрка
+END:VEVENT
+END:VCALENDAR`;
+
+    const occurrences = expandOccurrences(
+      moved,
+      "work",
+      new Date("2026-01-01T00:00:00Z"),
+      new Date("2026-02-01T00:00:00Z"),
+    );
+
+    expect(occurrences).toHaveLength(4);
+    expect(occurrences.every((item) => item.seriesId === "series-moved-1")).toBe(true);
+
+    // Обычные экземпляры: instanceStart и start совпадают.
+    expect(occurrences[0].instanceStart).toBe("2026-01-05T10:00:00+03:00");
+    expect(occurrences[0].start).toBe("2026-01-05T10:00:00+03:00");
+    expect(occurrences[2].instanceStart).toBe("2026-01-19T10:00:00+03:00");
+    expect(occurrences[3].instanceStart).toBe("2026-01-26T10:00:00+03:00");
+
+    // Перенесённый экземпляр: instanceStart остаётся исходным RECURRENCE-ID
+    // (по нему задачи 13/14 адресуют экземпляр), а start/end — новое время
+    // из переопределения.
+    expect(occurrences[1].instanceStart).toBe("2026-01-12T10:00:00+03:00");
+    expect(occurrences[1].start).toBe("2026-01-12T15:00:00+03:00");
+    expect(occurrences[1].end).toBe("2026-01-12T16:00:00+03:00");
+  });
+
+  it("отдаёт новый заголовок у переопределённого экземпляра и старый у прочих", () => {
+    const retitled = `BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:series-retitled-1
+DTSTAMP:20260101T090000Z
+DTSTART;TZID=Europe/Moscow:20260105T100000
+DTEND;TZID=Europe/Moscow:20260105T110000
+RRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=3
+SUMMARY:Обычное имя
+END:VEVENT
+BEGIN:VEVENT
+UID:series-retitled-1
+DTSTAMP:20260101T090000Z
+RECURRENCE-ID;TZID=Europe/Moscow:20260112T100000
+DTSTART;TZID=Europe/Moscow:20260112T100000
+DTEND;TZID=Europe/Moscow:20260112T110000
+SUMMARY:Особое имя для этого дня
+END:VEVENT
+END:VCALENDAR`;
+
+    const occurrences = expandOccurrences(
+      retitled,
+      "work",
+      new Date("2026-01-01T00:00:00Z"),
+      new Date("2026-02-01T00:00:00Z"),
+    );
+
+    expect(occurrences).toHaveLength(3);
+    expect(occurrences[0].summary).toBe("Обычное имя");
+    expect(occurrences[1].summary).toBe("Особое имя для этого дня");
+    // Время экземпляра не менялось — RECURRENCE-ID и DTSTART переопределения совпадают.
+    expect(occurrences[1].instanceStart).toBe("2026-01-12T10:00:00+03:00");
+    expect(occurrences[1].start).toBe("2026-01-12T10:00:00+03:00");
+    expect(occurrences[2].summary).toBe("Обычное имя");
+  });
+
+  // Требование 5 из ревью: переопределение, чей RECURRENCE-ID указывает на
+  // позицию ВНЕ запрошенного окна (поэтому основной проход по курсору до
+  // неё не доходит — либо она ещё впереди после точки `to`, либо основной
+  // цикл прерывается на ней же), но чей собственный DTSTART/DTEND
+  // пересекается с окном, обязано попасть в выдачу. Без отдельного прохода
+  // по всем известным переопределениям (см. src/ical/expand.ts) это
+  // невозможно в принципе: основной цикл прерывается, едва дойдя до
+  // ОРИГИНАЛЬНОЙ позиции 2026-01-19, ни разу не заглянув в её переопределение.
+  it("отдаёт экземпляр, перенесённый из-за пределов окна внутрь него", () => {
+    const movedIn = `BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:series-moved-in-1
+DTSTAMP:20260101T090000Z
+DTSTART;TZID=Europe/Moscow:20260105T100000
+DTEND;TZID=Europe/Moscow:20260105T110000
+RRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=3
+SUMMARY:Еженедельная встреча
+END:VEVENT
+BEGIN:VEVENT
+UID:series-moved-in-1
+DTSTAMP:20260101T090000Z
+RECURRENCE-ID;TZID=Europe/Moscow:20260119T100000
+DTSTART;TZID=Europe/Moscow:20260114T090000
+DTEND;TZID=Europe/Moscow:20260114T100000
+SUMMARY:Перенесли пораньше
+END:VEVENT
+END:VCALENDAR`;
+
+    // Узкое окно: без переопределения в него попал бы только экземпляр за
+    // 2026-01-12 (2026-01-05 раньше окна, 2026-01-19 позже окна). Но
+    // переопределение переносит "экземпляр за 2026-01-19" на 2026-01-14 —
+    // внутрь окна.
+    const occurrences = expandOccurrences(
+      movedIn,
+      "work",
+      new Date("2026-01-08T00:00:00Z"),
+      new Date("2026-01-16T00:00:00Z"),
+    );
+
+    expect(occurrences).toHaveLength(2);
+    expect(occurrences[0].instanceStart).toBe("2026-01-12T10:00:00+03:00");
+    expect(occurrences[0].start).toBe("2026-01-12T10:00:00+03:00");
+    expect(occurrences[1].instanceStart).toBe("2026-01-19T10:00:00+03:00");
+    expect(occurrences[1].start).toBe("2026-01-14T09:00:00+03:00");
+    expect(occurrences[1].summary).toBe("Перенесли пораньше");
+  });
 });
