@@ -5,6 +5,7 @@ import { registerListCalendars } from "./tools/listCalendars.js";
 import { registerReadTools } from "./tools/readEvents.js";
 import { registerCreateTools } from "./tools/createEvents.js";
 import { registerUpdateTool } from "./tools/updateEvent.js";
+import { registerFreeSlotsTool } from "./tools/findFreeSlots.js";
 
 export async function main(): Promise<void> {
   const context = createContext(process.env);
@@ -14,6 +15,7 @@ export async function main(): Promise<void> {
   registerReadTools(server, context);
   registerCreateTools(server, context);
   registerUpdateTool(server, context);
+  registerFreeSlotsTool(server, context);
 
   await server.connect(new StdioServerTransport());
 }
