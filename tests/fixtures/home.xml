@@ -1,0 +1,2 @@
+<?xml version='1.0' encoding='utf-8'?>
+<D:multistatus xmlns:D="DAV:"><D:response><href xmlns="DAV:">/principals/users/user%40yandex.ru/</href><D:propstat><D:prop><C:calendar-home-set xmlns:C="urn:ietf:params:xml:ns:caldav"><D:href>/calendars/user%40yandex.ru/</D:href></C:calendar-home-set></D:prop><status xmlns="DAV:">HTTP/1.1 200 OK</status></D:propstat></D:response></D:multistatus>

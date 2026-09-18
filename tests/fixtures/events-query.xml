@@ -1,0 +1,51 @@
+<?xml version='1.0' encoding='utf-8'?>
+<D:multistatus xmlns:D="DAV:"><D:response><href xmlns="DAV:">/calendars/user%40yandex.ru/events-11111111/aaaabbbbccccdddd11yandex.ru.ics</href><D:propstat><D:prop><D:getetag>1789383239000</D:getetag><C:calendar-data xmlns:C="urn:ietf:params:xml:ns:caldav">BEGIN:VCALENDAR
+PRODID:-//Yandex LLC//Yandex Calendar//EN
+VERSION:2.0
+CALSCALE:GREGORIAN
+METHOD:PUBLISH
+BEGIN:VTIMEZONE
+TZID:Europe/Moscow
+LAST-MODIFIED:20240422T053451Z
+TZURL:https://www.tzurl.org/zoneinfo-outlook/Europe/Moscow
+X-LIC-LOCATION:Europe/Moscow
+BEGIN:STANDARD
+TZNAME:MSK
+TZOFFSETFROM:+0300
+TZOFFSETTO:+0300
+DTSTART:19700101T000000
+END:STANDARD
+END:VTIMEZONE
+BEGIN:VEVENT
+DTSTART;TZID=Europe/Moscow:20260921T100000
+DTEND;TZID=Europe/Moscow:20260921T140000
+SUMMARY:Планёрка по проекту
+UID:aaaabbbbccccdddd11@yandex.ru
+SEQUENCE:0
+DTSTAMP:20260901T090000Z
+CREATED:20260901T090000Z
+DESCRIPTION:Обсудить смету\, сроки и риски
+RRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=8
+TRANSP:OPAQUE
+ORGANIZER;CN=Иван Иванов:mailto:user@yandex.ru
+ATTENDEE;CN=Пётр Петров;PARTSTAT=ACCEPTED;ROLE=REQ-PARTICIPANT:mailto:petrov@example.com
+ATTENDEE;CN=Анна Сидорова;PARTSTAT=NEEDS-ACTION;ROLE=REQ-PARTICIPANT:mailto:sidorova@example.com
+CONFERENCE;FEATURE=VIDEO;LABEL=Телемост:https://telemost.yandex.ru/j/00000000000000
+LAST-MODIFIED:20260901T090000Z
+CLASS:PUBLIC
+END:VEVENT
+END:VCALENDAR</C:calendar-data></D:prop><status xmlns="DAV:">HTTP/1.1 200 OK</status></D:propstat></D:response><D:response><href xmlns="DAV:">/calendars/user%40yandex.ru/events-11111111/eeeeffff0000111122yandex.ru.ics</href><D:propstat><D:prop><D:getetag>1789714073000</D:getetag><C:calendar-data xmlns:C="urn:ietf:params:xml:ns:caldav">BEGIN:VCALENDAR
+PRODID:-//Yandex LLC//Yandex Calendar//EN
+VERSION:2.0
+CALSCALE:GREGORIAN
+BEGIN:VEVENT
+DTSTART;VALUE=DATE:20260923
+DTEND;VALUE=DATE:20260924
+SUMMARY:Выходной
+UID:eeeeffff0000111122@yandex.ru
+SEQUENCE:0
+DTSTAMP:20260901T090000Z
+TRANSP:TRANSPARENT
+CLASS:PRIVATE
+END:VEVENT
+END:VCALENDAR</C:calendar-data></D:prop><status xmlns="DAV:">HTTP/1.1 200 OK</status></D:propstat></D:response></D:multistatus>

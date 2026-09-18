@@ -1,0 +1,2 @@
+<?xml version='1.0' encoding='utf-8'?>
+<D:multistatus xmlns:D="DAV:"><D:response><href xmlns="DAV:">/</href><D:propstat><D:prop><D:current-user-principal><D:href>/principals/users/user%40yandex.ru/</D:href></D:current-user-principal></D:prop><status xmlns="DAV:">HTTP/1.1 200 OK</status></D:propstat></D:response></D:multistatus>
