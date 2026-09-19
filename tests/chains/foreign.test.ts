@@ -1116,7 +1116,7 @@ describe("З05c: объекты других клиентов и следы пр
     done(s3, fake);
   });
 
-  it.fails("C35: дубль EXDATE 21.10 и EXDATE 26.10 — 26.10 исключён; delete this 28.10 без новых дублей", async () => {
+  it("C35: дубль EXDATE 21.10 и EXDATE 26.10 — 26.10 исключён; delete this 28.10 без новых дублей", async () => {
     const { fake, ctx } = makeStand();
     const path = plant(
       fake,
@@ -1154,7 +1154,7 @@ describe("З05c: объекты других клиентов и следы пр
     done(s, fake);
   });
 
-  it.fails("C35: EXDATE «в пустоту» 21.10 11:30 и EXDATE 26.10 — 26.10 исключён, 21.10 на месте", async () => {
+  it("C35: EXDATE «в пустоту» 21.10 11:30 и EXDATE 26.10 — 26.10 исключён, 21.10 на месте", async () => {
     const { fake, ctx } = makeStand();
     const path = plant(
       fake,
