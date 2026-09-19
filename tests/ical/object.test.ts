@@ -15,7 +15,7 @@ import {
   type OverrideRoleInfo,
   type Unparsable,
 } from "../../src/ical/object.js";
-import { iterateSlots } from "../../src/ical/slots.js";
+import { SERIES_CAP, SlotScanError, iterateSlots, type SlotBound } from "../../src/ical/slots.js";
 import { formatForModel, type IcalEnv, type SlotKey } from "../../src/ical/values.js";
 import { reorderOverridesFirst, yandexNormalize } from "../support/fakeCaldav.js";
 import * as seeds from "../support/seeds.js";
@@ -96,20 +96,27 @@ function named(summary: string, rid: string, start: string): string[] {
 }
 
 /**
- * Выдача конечной серии на уровне модели, по возрастанию фактического
- * начала: «адрес → начало заголовок». Незакрытый слот — встреча слота
- * (meetingAt) или основной компонент; detached — отдельная встреча по своему
+ * Выдача серии на уровне модели, по возрастанию фактического начала:
+ * «адрес → начало заголовок». Незакрытый слот — встреча слота (meetingAt)
+ * или основной компонент; detached — отдельная встреча по своему
  * RECURRENCE-ID (у дублей — shownOverride); hidden не показывается.
+ * `bound` ограничивает перебор слотов: у бесконечной серии без него перебор
+ * бесконечен. Если перебор обрывается сбоем итератора (SlotScanError),
+ * показываются пройденные слоты, а detached — в любом случае.
  */
-function visible(o: CalendarObject): string[] {
+function visible(o: CalendarObject, bound: SlotBound = {}): string[] {
   const rows: Array<[number, string]> = [];
   const show = (address: ICAL.Time, component: ICAL.Component, start: ICAL.Time) => rows.push([start.toUnixTime(),
     `${formatForModel(address, ENV, "instance")} → ${formatForModel(start, ENV, "time")} ${String(component.getFirstPropertyValue("summary"))}`]);
-  for (const slot of iterateSlots(o)) {
-    if (slot.excluded) continue;
-    const meeting = meetingAt(o, slot.key);
-    if (meeting) show(slot.time, meeting.shown, meeting.shown.getFirstPropertyValue("dtstart") as ICAL.Time);
-    else show(slot.time, o.master!, slot.time);
+  try {
+    for (const slot of iterateSlots(o, bound)) {
+      if (slot.excluded) continue;
+      const meeting = meetingAt(o, slot.key);
+      if (meeting) show(slot.time, meeting.shown, meeting.shown.getFirstPropertyValue("dtstart") as ICAL.Time);
+      else show(slot.time, o.master!, slot.time);
+    }
+  } catch (error) {
+    if (!(error instanceof SlotScanError)) throw error;
   }
   for (const refs of o.overrides.values()) {
     const detached = refs.filter((ref) => o.roles.get(ref.component)?.role === "detached");
@@ -318,6 +325,24 @@ describe("роли переопределений (Р5) — ровно три, �
     expect(o.anomalies).toEqual([]);
   });
 
+  it("затравки стенда с detached-переопределением читаются как описаны: без аномалий, встречи не пропадают", () => {
+    const movedStart = load(seeds.detachedAtMovedStart.ics);
+    const slotDate = load(seeds.detachedOnSlotDate.ics);
+
+    expect(overridesOf(movedStart).map((c) => roleOf(movedStart, c).role)).toEqual(["slot", "detached"]);
+    expect(movedStart.anomalies).toEqual([]);
+    expect(visible(movedStart).filter((row) => row.startsWith("2026-10-21"))).toEqual([
+      "2026-10-21T10:00:00+03:00 → 2026-10-21T15:00:00+03:00 Планёрка",
+      "2026-10-21T15:00:00+03:00 → 2026-10-21T15:00:00+03:00 Планёрка (перенесена)",
+    ]);
+    expect(overridesOf(slotDate).map((c) => roleOf(slotDate, c).role)).toEqual(["detached"]);
+    expect(slotDate.anomalies).toEqual([]);
+    expect(visible(slotDate).filter((row) => row.startsWith("2026-10-21"))).toEqual([
+      "2026-10-21T09:00:00+03:00 → 2026-10-21T09:00:00+03:00 Планёрка",
+      "2026-10-21T10:00:00+03:00 → 2026-10-21T11:30:00+03:00 Планёрка",
+    ]);
+  });
+
   it("RECURRENCE-ID в поясе Berlin, в UTC и в чужом TZID совпадает со слотом по моменту, и после перехода часов", () => {
     const berlinSeries = seeds.dailyBerlin.ics.replace("END:VCALENDAR", [
       ...vevent(["RECURRENCE-ID;TZID=Europe/Berlin:20261027T100000", "DTSTART;TZID=Europe/Berlin:20261027T120000",
@@ -377,23 +402,53 @@ describe("роли переопределений (Р5) — ровно три, �
     expect(meetingAt(other, at("2026-10-20T07:00:00Z"))).toBeUndefined();
   });
 
-  it("повторный осенний час: RECURRENCE-ID в UTC по RFC 5545 (первое вхождение) мимо ключа слота — detached, встреча не теряется", () => {
-    // ical.js читает стенное 02:30 25.10 в Берлине как второе вхождение (CET,
-    // 01:30Z), RFC 5545 §3.3.5 — как первое (CEST, 00:30Z); контракт — в
-    // tests/ical/icaljs-contract.test.ts. RECURRENCE-ID другого клиента в UTC
-    // (00:30Z) не совпадает с ключом слота: встреча показывается отдельно по
-    // своему RECURRENCE-ID, а слот 02:30 — как обычная встреча серии.
-    const text = calendar([], vevent(["DTSTART;TZID=Europe/Berlin:20261023T023000", "DURATION:PT30M",
+  describe("повторный осенний час — известный дефект ключей слотов", () => {
+    // Серия в Берлине, ежедневно в 02:30 с 23.10.2026, COUNT=5. 25.10 стенное
+    // 02:30 бывает дважды: в 00:30Z (CEST) и в 01:30Z (CET). RFC 5545 §3.3.5
+    // велит читать его как первое вхождение, ical.js читает как второе
+    // (контракт — в tests/ical/icaljs-contract.test.ts), и ключ слота 25.10 —
+    // 01:30Z. Другой клиент записал RECURRENCE-ID этой встречи в UTC по RFC —
+    // 00:30Z. Ключи не совпадают, переопределение получает роль detached, и
+    // встреча 25.10 видна дважды: слотом серии и отдельной встречей. Данные
+    // не теряются. Чинить — в ключах (values.ts, З03): RECURRENCE-ID и EXDATE
+    // в повторный час сверять по правилу RFC, а не эвристикой ролей. Дефект
+    // решено пока не чинить: у Europe/Moscow переводов часов нет с 2014 года,
+    // и в календаре пользователя он не проявляется.
+    // Первый тест держит нынешнее поведение, чтобы его изменение не прошло
+    // незамеченным, второй (it.fails) — желаемый итог. Когда ключи починят,
+    // первый тест удаляется, а со второго снимается .fails.
+    const fallBack = calendar([], vevent(["DTSTART;TZID=Europe/Berlin:20261023T023000", "DURATION:PT30M",
       "RRULE:FREQ=DAILY;COUNT=5", "SUMMARY:Ночная"]),
     vevent(["RECURRENCE-ID:20261025T003000Z", "DTSTART:20261025T013000Z", "DURATION:PT30M", "SUMMARY:Перенос"]),
     vevent(["RECURRENCE-ID;TZID=Europe/Berlin:20261026T023000", "DTSTART;TZID=Europe/Berlin:20261026T040000",
       "DURATION:PT30M"]));
-    const o = load(text);
-    const [fold, regular] = overridesOf(o);
+    const on25 = (rows: string[]) => rows.filter((row) => row.startsWith("2026-10-25"));
 
-    expect(roleOf(o, fold)).toEqual({ role: "detached", ref: expect.anything() });
-    expect(roleOf(o, regular)).toMatchObject({ role: "slot", slot: at("2026-10-26T01:30:00Z") });
-    expect(o.anomalies).toEqual([]);
+    it("дефект: RECURRENCE-ID первого вхождения в UTC мимо ключа слота — detached, встреча 25.10 видна дважды", () => {
+      const o = load(fallBack);
+      const [fold, regular] = overridesOf(o);
+
+      expect(roleOf(o, fold)).toEqual({ role: "detached", ref: expect.anything() });
+      expect(roleOf(o, regular)).toMatchObject({ role: "slot", slot: at("2026-10-26T01:30:00Z") });
+      expect(o.anomalies).toEqual([]);
+      // Двойной показ — дефект, а не норма: слот серии «Ночная» и та же встреча «Перенос».
+      expect(visible(o)).toHaveLength(6);
+      expect(on25(visible(o))).toEqual([
+        "2026-10-25T02:30:00+01:00 → 2026-10-25T02:30:00+01:00 Ночная",
+        "2026-10-25T00:30:00+00:00 → 2026-10-25T01:30:00+00:00 Перенос",
+      ]);
+    });
+
+    it.fails("желаемое: RECURRENCE-ID первого вхождения — slot, на слоте 25.10 одна встреча", () => {
+      const o = load(fallBack);
+      const [fold] = overridesOf(o);
+      const slot25 = [...iterateSlots(o)][2]; // слоты 23, 24, 25, 26 и 27.10
+
+      expect(roleOf(o, fold)).toMatchObject({ role: "slot", slot: slot25.key });
+      expect(meetingAt(o, slot25.key)).toEqual({ shown: fold, components: [fold] });
+      expect(visible(o)).toHaveLength(5);
+      expect(on25(visible(o))).toEqual([expect.stringMatching(/ Перенос$/)]);
+    });
   });
 
   it("у серии на весь день унаследованный RECURRENCE-ID в DATE-TIME попадает в слот своей даты", () => {
@@ -404,6 +459,53 @@ describe("роли переопределений (Р5) — ровно три, �
 
     expect(roleOf(o, overridesOf(o)[0])).toMatchObject({ role: "slot", slot: "D:2026-10-21" });
   });
+});
+
+describe("роли при оборванном проходе слотов: конец серии неизвестен — detached, а не hidden", () => {
+  // assignRoles проходит слоты до последнего RECURRENCE-ID. Если проход
+  // оборван сбоем итератора (SlotScanError) или пределом SERIES_CAP,
+  // последний пройденный слот — не конец серии. RECURRENCE-ID дальше него
+  // нельзя считать «после конца конечной серии» (hidden): так пропала бы
+  // законная встреча. Он получает detached и показывается. Оба теста —
+  // настоящие позиции правила, до которых проход не доходит.
+
+  it("правило застревает посреди серии (SlotScanError): RECURRENCE-ID после места застревания — detached, встреча показывается", () => {
+    // Позиции 29.02.2028 10:00:00 и 10:00:01 UTC, следующие — 29.02.2032:
+    // итератор ical.js ищет их посекундно и упирается в предохранитель
+    // STALL_STEPS (slots.ts, guardedIterator), перебор обрывается SlotScanError.
+    const o = load(calendar([], vevent(["DTSTART:20280229T100000Z", "DURATION:PT1S",
+      "RRULE:FREQ=SECONDLY;BYMONTH=2;BYMONTHDAY=29;BYHOUR=10;BYMINUTE=0;BYSECOND=0,1", "SUMMARY:Две секунды"]),
+    vevent(["RECURRENCE-ID:20320229T100000Z", "DTSTART:20320229T120000Z", "DURATION:PT1S", "SUMMARY:Перенос"])));
+
+    expect(o.anomalies).toEqual([]); // первые позиции есть — правило пригодно
+    expect(() => [...iterateSlots(o)]).toThrow(SlotScanError);
+    expect(roleOf(o, overridesOf(o)[0])).toEqual({ role: "detached", ref: expect.anything() });
+    expect(roleOf(o, overridesOf(o)[0]).ref.key).toBe(at("2032-02-29T10:00:00Z"));
+    expect(meetingAt(o, at("2032-02-29T10:00:00Z"))).toBeUndefined();
+    // Сколько слотов перебор успевает выдать до сбоя, здесь не проверяется.
+    expect(visible(o)).toContain("2032-02-29T10:00:00+00:00 → 2032-02-29T12:00:00+00:00 Перенос");
+  }, 60_000);
+
+  it("проход упирается в предел SERIES_CAP: RECURRENCE-ID дальше предела — detached, встреча показывается", () => {
+    // HOURLY с 01.01.2000: до 21.10.2026 больше 200 000 слотов, и проход до
+    // RECURRENCE-ID обрывается пределом. Проход до предела занимает около
+    // секунды.
+    const rid = at("2026-10-21T07:00:00Z");
+    const o = load(calendar(MOSCOW, vevent(["DTSTART;TZID=Europe/Moscow:20000101T100000", "DURATION:PT30M",
+      "RRULE:FREQ=HOURLY", "SUMMARY:Ежечасная с 2000 года"]),
+    moved("20261021T100000", "20261021T150000", "20261021T160000")));
+
+    expect((Date.parse("2026-10-21T07:00:00Z") - Date.parse("2000-01-01T07:00:00Z")) / 3_600_000).toBeGreaterThan(SERIES_CAP);
+    expect(o.anomalies).toEqual([]);
+    expect(roleOf(o, overridesOf(o)[0])).toEqual({ role: "detached", ref: expect.anything() });
+    expect(roleOf(o, overridesOf(o)[0]).ref.key).toBe(rid);
+    expect(meetingAt(o, rid)).toBeUndefined();
+    expect(visible(o, { limit: 2 })).toEqual([
+      "2000-01-01T10:00:00+03:00 → 2000-01-01T10:00:00+03:00 Ежечасная с 2000 года",
+      "2000-01-01T11:00:00+03:00 → 2000-01-01T11:00:00+03:00 Ежечасная с 2000 года",
+      "2026-10-21T10:00:00+03:00 → 2026-10-21T15:00:00+03:00 Перенос",
+    ]);
+  }, 60_000);
 });
 
 describe("законные переносы, которые эвристика следов прежнего кода путала: ни одна встреча не пропадает, фантомов нет", () => {

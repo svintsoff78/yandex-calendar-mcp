@@ -1,22 +1,21 @@
 // Затравки стенда — сырой текст объектов, как он лежит на сервере (§6 плана
 // переделки, docs/superpowers/plans/2026-09-19-recurring-events-rework.md).
 //
-// Затравками задаются только чужие объекты и следы прежнего кода. Всё, что
-// производит новый код, цепочки получают настоящими вызовами на стенде.
+// Затравками задаются только объекты, записанные не этим сервером: Яндексом
+// (веб, телефон) и другими клиентами. Всё, что производит новый код, цепочки
+// получают настоящими вызовами на стенде. Следов прежнего кода среди
+// затравок нет: по поправке плана «без ремонта следов прежнего кода»
+// (19.09.2026) прежний код в календари пользователей не писал, и такие
+// объекты не распознаются и не чинятся.
 //
 // Пояса: Europe/Moscow (без перехода времени), Europe/Berlin (переход
 // 25.10.2026), America/New_York (переход 01.11.2026), даты (весь день) и
 // плавающее время. В каждом из трёх прогонов test:tz хотя бы две затравки
 // живут в поясе, отличном от пояса процесса.
 //
-// C55 и C56 записаны ПРЕЖНИМ кодом (коммит dd99d80) на этом же стенде и
-// вставлены дословно, со всеми его особенностями (переопределение раньше
-// основного компонента, PRODID проекта, DTSTAMP момента записи, без
-// перевода строки в конце). Сценарий записи — в отчёте З01
-// (.superpowers/sdd/2026-09-18-yandex-calendar-mcp/rework-З01-report.md).
-// C62 и C63 прежний код записать не мог: DURATION он не пишет, а плохие
-// правила ронял при сборке (ICAL.Recur.fromString бросает на BYDAY=0MO), —
-// это объекты других клиентов.
+// Группы: cleanSeeds — без нарушений инвариантов стенда; detachedSeeds — с
+// переопределением мимо слотов (роль detached); unparsableSeeds — не
+// разбираются ical.js. C62, C63 и detachedSeeds — объекты других клиентов.
 
 export interface Seed {
   uid: string;
@@ -258,110 +257,94 @@ export const richMoscow: Seed = {
 };
 
 // ---------------------------------------------------------------------------
-// Следы прежнего кода (Р5)
-// ---------------------------------------------------------------------------
-
-/**
- * C55 (AE12, R8-O1) — как записал прежний код: серия weeklyMoscow по
- * createEvent → update this 21.10 {start 15:00, end 16:00} → update this c
- * instanceStart 21.10 15:00 {summary «Планёрка (перенесена)»}. Второе
- * переопределение — «эхо» с RECURRENCE-ID 15:00 мимо слотов; прежний код
- * показывал 21.10 дважды.
- */
-export const c55EchoOverride: Seed = {
-  uid: "a7ed31f3-0a95-49c7-945d-c0c3c213e1ad",
-  about: "C55: перенос 21.10 10:00 → 15:00 и эхо с RECURRENCE-ID 15:00, записано прежним кодом",
-  ics: [
-    "BEGIN:VCALENDAR",
-    "VERSION:2.0",
-    "PRODID:-//yandex-calendar-mcp//RU",
-    "BEGIN:VTIMEZONE",
-    "TZID:Europe/Moscow",
-    "TZURL:http://tzurl.org/zoneinfo-outlook/Europe/Moscow",
-    "X-LIC-LOCATION:Europe/Moscow",
-    "BEGIN:STANDARD",
-    "TZOFFSETFROM:+0300",
-    "TZOFFSETTO:+0300",
-    "TZNAME:MSK",
-    "DTSTART:19700101T000000",
-    "END:STANDARD",
-    "END:VTIMEZONE",
-    "BEGIN:VEVENT",
-    "UID:a7ed31f3-0a95-49c7-945d-c0c3c213e1ad",
-    "DTSTAMP:20260919T144801Z",
-    "SUMMARY:Планёрка",
-    "DTSTART;TZID=Europe/Moscow:20261019T100000",
-    "DTEND;TZID=Europe/Moscow:20261019T110000",
-    "RRULE:FREQ=WEEKLY;COUNT=6;BYDAY=MO,WE",
-    "END:VEVENT",
-    "BEGIN:VEVENT",
-    "UID:a7ed31f3-0a95-49c7-945d-c0c3c213e1ad",
-    "DTSTAMP:20260919T144801Z",
-    "SUMMARY:Планёрка",
-    "DTSTART;TZID=Europe/Moscow:20261021T150000",
-    "DTEND;TZID=Europe/Moscow:20261021T160000",
-    "RECURRENCE-ID;TZID=Europe/Moscow:20261021T100000",
-    "END:VEVENT",
-    "BEGIN:VEVENT",
-    "UID:a7ed31f3-0a95-49c7-945d-c0c3c213e1ad",
-    "DTSTAMP:20260919T144801Z",
-    "SUMMARY:Планёрка (перенесена)",
-    "DTSTART;TZID=Europe/Moscow:20261021T150000",
-    "DTEND;TZID=Europe/Moscow:20261021T160000",
-    "RECURRENCE-ID;TZID=Europe/Moscow:20261021T150000",
-    "END:VEVENT",
-    "END:VCALENDAR",
-  ].join(CRLF),
-};
-
-/**
- * C56 (R13-N6, AE11) — как записал прежний код: серия weeklyMoscow по
- * createEvent → update this 21.10 {start 11:30, end 12:30} → all_series
- * {start 19.10 09:00, end 10:00}. Серия сдвинута на 09:00, переопределение
- * осталось с RECURRENCE-ID 10:00 и стоит раньше основного компонента
- * (replaceMaster, R13-F1); прежний код показывал 21.10 дважды — в 09:00 и в 11:30.
- */
-export const c56StaleShift: Seed = {
-  uid: "ebf1c8d4-ab9d-4d4b-b591-d391db117aab",
-  about: "C56: серия сдвинута на 09:00, переопределение 21.10 осталось с RECURRENCE-ID 10:00, записано прежним кодом",
-  ics: [
-    "BEGIN:VCALENDAR",
-    "VERSION:2.0",
-    "PRODID:-//yandex-calendar-mcp//RU",
-    "BEGIN:VEVENT",
-    "UID:ebf1c8d4-ab9d-4d4b-b591-d391db117aab",
-    "DTSTAMP:20260919T144801Z",
-    "SUMMARY:Планёрка",
-    "DTSTART;TZID=Europe/Moscow:20261021T113000",
-    "DTEND;TZID=Europe/Moscow:20261021T123000",
-    "RECURRENCE-ID;TZID=Europe/Moscow:20261021T100000",
-    "END:VEVENT",
-    "BEGIN:VTIMEZONE",
-    "TZID:Europe/Moscow",
-    "TZURL:http://tzurl.org/zoneinfo-outlook/Europe/Moscow",
-    "X-LIC-LOCATION:Europe/Moscow",
-    "BEGIN:STANDARD",
-    "TZOFFSETFROM:+0300",
-    "TZOFFSETTO:+0300",
-    "TZNAME:MSK",
-    "DTSTART:19700101T000000",
-    "END:STANDARD",
-    "END:VTIMEZONE",
-    "BEGIN:VEVENT",
-    "UID:ebf1c8d4-ab9d-4d4b-b591-d391db117aab",
-    "DTSTAMP:20260919T144801Z",
-    "SUMMARY:Планёрка",
-    "DTSTART;TZID=Europe/Moscow:20261019T090000",
-    "DTEND;TZID=Europe/Moscow:20261019T100000",
-    "RRULE:FREQ=WEEKLY;COUNT=6;BYDAY=MO,WE",
-    "END:VEVENT",
-    "END:VCALENDAR",
-  ].join(CRLF),
-};
-
-// ---------------------------------------------------------------------------
 // Объекты других клиентов
 // ---------------------------------------------------------------------------
+
+const OTHER_CLIENT_HEAD = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Example Corp.//Other Client//EN"];
+
+// Переопределение, чей RECURRENCE-ID не попадает ни на один слот серии, не
+// закрыт EXDATE и лежит внутри серии, в модели получает роль detached (Р5 в
+// редакции поправки «без ремонта следов прежнего кода»): это отдельная
+// встреча с адресом `instanceStart` = RECURRENCE-ID, она занимает время,
+// правится и удаляется по этому адресу. Аномалией модели оно не считается.
+// Инварианты стенда (invariants.ts) видят в нём вид orphan-override —
+// переопределение мимо слотов. В затравке стенд его терпит, а записи клиента
+// не прощает новой сироты сверх прежних (О12а: аномалий не больше, чем было).
+
+/**
+ * Пн и Ср 10:00–11:00 МСК с 19.10.2026, COUNT=6. Встреча 21.10 перенесена на
+ * 15:00–16:00 — переопределение слота. Второе переопределение, «Планёрка
+ * (перенесена)», — с RECURRENCE-ID 21.10 15:00 мимо слотов: detached, тоже
+ * 15:00–16:00. В выдаче 21.10 две встречи в 15:00. То, что RECURRENCE-ID
+ * одного переопределения равен DTSTART другого, роли не меняет: так
+ * выглядят и законные переносы.
+ */
+export const detachedAtMovedStart: Seed = {
+  uid: "a7ed31f3-0a95-49c7-945d-c0c3c213e1ad",
+  about: "Пн и Ср 10:00 МСК с 19.10.2026, COUNT=6; перенос 21.10 на 15:00 и detached с RECURRENCE-ID 21.10 15:00",
+  ics: text(
+    ...OTHER_CLIENT_HEAD,
+    ...MOSCOW,
+    "BEGIN:VEVENT",
+    "UID:a7ed31f3-0a95-49c7-945d-c0c3c213e1ad",
+    "DTSTAMP:20261001T090000Z",
+    "DTSTART;TZID=Europe/Moscow:20261019T100000",
+    "DTEND;TZID=Europe/Moscow:20261019T110000",
+    "RRULE:FREQ=WEEKLY;BYDAY=MO,WE;COUNT=6",
+    "SUMMARY:Планёрка",
+    "END:VEVENT",
+    "BEGIN:VEVENT",
+    "UID:a7ed31f3-0a95-49c7-945d-c0c3c213e1ad",
+    "DTSTAMP:20261001T090000Z",
+    "RECURRENCE-ID;TZID=Europe/Moscow:20261021T100000",
+    "DTSTART;TZID=Europe/Moscow:20261021T150000",
+    "DTEND;TZID=Europe/Moscow:20261021T160000",
+    "SUMMARY:Планёрка",
+    "END:VEVENT",
+    "BEGIN:VEVENT",
+    "UID:a7ed31f3-0a95-49c7-945d-c0c3c213e1ad",
+    "DTSTAMP:20261001T090000Z",
+    "RECURRENCE-ID;TZID=Europe/Moscow:20261021T150000",
+    "DTSTART;TZID=Europe/Moscow:20261021T150000",
+    "DTEND;TZID=Europe/Moscow:20261021T160000",
+    "SUMMARY:Планёрка (перенесена)",
+    "END:VEVENT",
+    "END:VCALENDAR",
+  ),
+};
+
+/**
+ * Пн и Ср 09:00–10:00 МСК с 19.10.2026, COUNT=6, и переопределение с
+ * RECURRENCE-ID 21.10 10:00 → 11:30–12:30: в дату слота 21.10 09:00, но не в
+ * его время. Это detached, а не встреча слота: 21.10 видны две встречи, в
+ * 09:00 и в 11:30, и удаление одной не трогает другую. Цепочка — в
+ * tests/chains/foreign.test.ts.
+ */
+export const detachedOnSlotDate: Seed = {
+  uid: "ebf1c8d4-ab9d-4d4b-b591-d391db117aab",
+  about: "Пн и Ср 09:00 МСК с 19.10.2026, COUNT=6; detached с RECURRENCE-ID 21.10 10:00 → 11:30, в дату слота 09:00",
+  ics: text(
+    ...OTHER_CLIENT_HEAD,
+    ...MOSCOW,
+    "BEGIN:VEVENT",
+    "UID:ebf1c8d4-ab9d-4d4b-b591-d391db117aab",
+    "DTSTAMP:20261001T090000Z",
+    "DTSTART;TZID=Europe/Moscow:20261019T090000",
+    "DTEND;TZID=Europe/Moscow:20261019T100000",
+    "RRULE:FREQ=WEEKLY;BYDAY=MO,WE;COUNT=6",
+    "SUMMARY:Планёрка",
+    "END:VEVENT",
+    "BEGIN:VEVENT",
+    "UID:ebf1c8d4-ab9d-4d4b-b591-d391db117aab",
+    "DTSTAMP:20261001T090000Z",
+    "RECURRENCE-ID;TZID=Europe/Moscow:20261021T100000",
+    "DTSTART;TZID=Europe/Moscow:20261021T113000",
+    "DTEND;TZID=Europe/Moscow:20261021T123000",
+    "SUMMARY:Планёрка",
+    "END:VEVENT",
+    "END:VCALENDAR",
+  ),
+};
 
 /** C62: основной компонент с DURATION вместо DTEND (другой клиент, RFC 5545 §3.6.1). */
 export const c62DurationMaster: Seed = {
@@ -427,8 +410,27 @@ export const cleanSeeds: readonly Seed[] = [
   c62DurationMaster,
 ];
 
-/** Следы прежнего кода: у каждой одна аномалия orphan-override. */
-export const legacySeeds: readonly Seed[] = [c55EchoOverride, c56StaleShift];
+/**
+ * Чужие объекты с detached-переопределением. В модели нарушений нет, для
+ * инвариантов стенда у каждого одно — orphan-override (переопределение мимо
+ * слотов), которое стенд терпит в затравке.
+ */
+export const detachedSeeds: readonly Seed[] = [detachedAtMovedStart, detachedOnSlotDate];
 
 /** Не разбираются ical.js. */
 export const unparsableSeeds: readonly Seed[] = [c63BadFreq, c63BadByday];
+
+// ---------------------------------------------------------------------------
+// Прежние имена
+// ---------------------------------------------------------------------------
+//
+// Синонимы тех же объектов под именами, которые затравки носили, пока
+// считались следами прежнего кода. Оставлены на время волны 3, чтобы не
+// сломать код, написанный параллельно; новых ссылок на них не добавлять.
+
+/** @deprecated Прежнее имя затравки detachedAtMovedStart. */
+export const c55EchoOverride: Seed = detachedAtMovedStart;
+/** @deprecated Прежнее имя затравки detachedOnSlotDate. */
+export const c56StaleShift: Seed = detachedOnSlotDate;
+/** @deprecated Прежнее имя группы detachedSeeds. */
+export const legacySeeds: readonly Seed[] = detachedSeeds;

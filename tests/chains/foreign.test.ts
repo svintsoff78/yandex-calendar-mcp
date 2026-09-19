@@ -26,7 +26,9 @@
 // legacy-override исключены. Переопределение получает одну из трёх ролей —
 // slot, hidden, detached. Цепочки «наследие» (C34) остались: они проверяют
 // роль hidden, ключ О3 и аномалию multiple-masters, а такие объекты
-// оставляют и другие клиенты.
+// оставляют и другие клиенты. Цепочка C64 (сверх перечня плана) держит
+// случай, который путала удалённая эвристика: RECURRENCE-ID в дату слота, но
+// не в его время, — это detached, и в этот день видны две встречи.
 import ICAL from "ical.js";
 import { assert, describe, expect, it } from "vitest";
 import { deleteEvent, readEvent, readEvents, updateEvent } from "../../src/domain/events.js";
@@ -1019,6 +1021,99 @@ describe("З05c: объекты других клиентов и следы пр
     expect(writes(fake, mark)).toEqual(["DELETE"]);
     expect(fake.has(path)).toBe(false);
     done(s2, fake);
+  });
+
+  // C64 — сверх перечня плана (задача «уборка»): случай, который путала
+  // удалённая эвристика stale-shift. RECURRENCE-ID 21.10 10:00 приходится на
+  // дату слота 21.10 09:00, но не на его время. Эвристика показывала такое
+  // переопределение вместо встречи слота — 21.10 была видна одна встреча, а
+  // delete this слота снимал и её. По ролям поправки «без ремонта следов
+  // прежнего кода» это detached: отдельная встреча с адресом своего
+  // RECURRENCE-ID. 21.10 видны две встречи, обе занимают время, и запись
+  // одной не трогает другую.
+  // Прежний код: падает на шаге 2 — update this по адресу detached он
+  // отвергает (встречи с таким началом нет), и видимый список не меняется.
+  it.fails("C64: detached в дату слота, но не во время слота — две встречи 21.10; delete this слота; update и delete this detached по его адресу", async () => {
+    const { fake, ctx } = makeStand();
+    const uid = seeds.detachedOnSlotDate.uid;
+    const path = plant(fake, seeds.detachedOnSlotDate);
+    const series = (days: string[]) => lines(days, "09:00–10:00", "Планёрка");
+    const [d19, d21, ...rest] = SERIES_DAYS;
+
+    expect(await visible(ctx), describeStand(fake)).toEqual([
+      ...series([d19, d21]),
+      "2026-10-21 11:30–12:30 Планёрка [слот 2026-10-21 10:00]",
+      ...series(rest),
+    ]);
+    // Обе встречи 21.10 занимают время.
+    const free = await findFreeSlots(ctx, {
+      from: "2026-10-21T09:00:00+03:00",
+      to: "2026-10-21T13:00:00+03:00",
+      durationMinutes: 30,
+    });
+    expect(free.map((slot) => [Date.parse(slot.start), Date.parse(slot.end)])).toEqual([
+      [Date.parse("2026-10-21T10:00:00+03:00"), Date.parse("2026-10-21T11:30:00+03:00")],
+      [Date.parse("2026-10-21T12:30:00+03:00"), Date.parse("2026-10-21T13:00:00+03:00")],
+    ]);
+
+    // delete this 21.10 09:00: EXDATE на слот; detached — не встреча этого слота и остаётся.
+    let before = fake.ics(path);
+    let mark = fake.mark();
+    const slot = await instance(ctx, uid, "2026-10-21 09:00");
+    const s1 = await settle(remove(ctx, { id: uid, scope: "this", instanceStart: slot.instanceStart, etag: slot.etag }));
+    expect(await visible(ctx), describeStand(fake)).toEqual([
+      ...series([d19]),
+      "2026-10-21 11:30–12:30 Планёрка [слот 2026-10-21 10:00]",
+      ...series(rest),
+    ]);
+    expect(writes(fake, mark)).toEqual(["PUT"]);
+    expect(timeValues(masterOf(fake.ics(path)), "EXDATE")).toEqual(["TZID=Europe/Moscow:20261021T090000"]);
+    expect(overridesOf(fake.ics(path)).flatMap((c) => timeValues(c, "RECURRENCE-ID"))).toEqual([
+      "TZID=Europe/Moscow:20261021T100000",
+    ]);
+    assertStoredInvariants(fake);
+    assertPropsPreserved(before, fake.ics(path));
+    done(s1, fake);
+
+    // update this по адресу detached: правка его компонента на месте, RECURRENCE-ID неизменен.
+    before = fake.ics(path);
+    mark = fake.mark();
+    let target = await instance(ctx, uid, "2026-10-21 10:00");
+    const s2 = await settle(
+      update(ctx, { id: uid, scope: "this", instanceStart: target.instanceStart, patch: { summary: "Разбор с заказчиком" } }),
+    );
+    expect(await visible(ctx), describeStand(fake)).toEqual([
+      ...series([d19]),
+      "2026-10-21 11:30–12:30 Разбор с заказчиком [слот 2026-10-21 10:00]",
+      ...series(rest),
+    ]);
+    expect(writes(fake, mark)).toEqual(["PUT"]);
+    masterOf(fake.ics(path));
+    expect(overridesOf(fake.ics(path)).flatMap((c) => timeValues(c, "RECURRENCE-ID"))).toEqual([
+      "TZID=Europe/Moscow:20261021T100000",
+    ]);
+    assertStoredInvariants(fake);
+    assertPropsPreserved(before, fake.ics(path), { except: ["SUMMARY"] });
+    // Выдача помечает её как detached, get_event — среди отступлений серии.
+    expect(target.detached).toBe(true);
+    const main = await readEvent(ctx, calendarA.id, uid);
+    expect((main.exceptions ?? []).map((e) => `${wallTime(e.instanceStart, ZONE)} ${e.state}`)).toContain(
+      "2026-10-21 10:00 detached",
+    );
+    done(s2, fake);
+
+    // delete this по адресу detached: снимается только его компонент, объект жив.
+    before = fake.ics(path);
+    mark = fake.mark();
+    target = await instance(ctx, uid, "2026-10-21 10:00");
+    const s3 = await settle(remove(ctx, { id: uid, scope: "this", instanceStart: target.instanceStart, etag: target.etag }));
+    expect(await visible(ctx), describeStand(fake)).toEqual(series([d19, ...rest]));
+    expect(writes(fake, mark)).toEqual(["PUT"]);
+    expect(fake.has(path)).toBe(true);
+    expect(overridesOf(fake.ics(path))).toEqual([]);
+    assertStoredInvariants(fake);
+    assertPropsPreserved(before, fake.ics(path), { scope: exceptOverride("20261021T100000") });
+    done(s3, fake);
   });
 
   it.fails("C35: дубль EXDATE 21.10 и EXDATE 26.10 — 26.10 исключён; delete this 28.10 без новых дублей", async () => {

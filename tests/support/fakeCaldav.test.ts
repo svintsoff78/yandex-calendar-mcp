@@ -124,12 +124,17 @@ function duplicateRidAt(date: string): string {
   );
 }
 
-// C55: эхо — второе переопределение с RECURRENCE-ID 15:00 мимо слотов.
-const C55_ECHO = /BEGIN:VEVENT\r\n(?:(?!END:VEVENT)[\s\S])*?RECURRENCE-ID;TZID=Europe\/Moscow:20261021T150000\r\nEND:VEVENT\r\n/;
-/** C55 после верного ремонта (Р5): эхо снято, остался один компонент с RID слота 10:00. */
-const c55Repaired = seeds.c55EchoOverride.ics.replace(C55_ECHO, "");
-/** C55 после неверного ремонта: эхо снято, но RID оставшегося компонента поставлен на 10:30 мимо слота. */
-const c55RepairedOffSlot = c55Repaired.replace(
+// Затравка с detached-переопределением: перенос слота 21.10 10:00 на 15:00 и
+// переопределение с RECURRENCE-ID 21.10 15:00 мимо слотов — для инвариантов
+// стенда это сирота (orphan-override), которую затравке прощают.
+const D = seeds.detachedAtMovedStart;
+// Компонент detached-переопределения затравки D, где бы в нём ни стоял RECURRENCE-ID.
+const DETACHED_1500 =
+  /BEGIN:VEVENT\r\n(?:(?!END:VEVENT)[\s\S])*?RECURRENCE-ID;TZID=Europe\/Moscow:20261021T150000\r\n(?:(?!END:VEVENT)[\s\S])*?END:VEVENT\r\n/;
+/** Затравка D без detached-переопределения: остался перенос слота 21.10 10:00, нарушений нет. */
+const withoutDetached = D.ics.replace(DETACHED_1500, "");
+/** То же, но RECURRENCE-ID переноса переставлен на 10:30 мимо слота: сирота на новом ключе. */
+const offSlotRid = withoutDetached.replace(
   "RECURRENCE-ID;TZID=Europe/Moscow:20261021T100000",
   "RECURRENCE-ID;TZID=Europe/Moscow:20261021T103000",
 );
@@ -311,36 +316,36 @@ describe("FakeCaldav: хранилище, ETag, REPORT", () => {
 describe("FakeCaldav: история внешних версий", () => {
   it("externalDelete очищает историю: объект, созданный заново по тому же пути, сверяется с нуля", async () => {
     const { fake, ctx } = makeStand({ strict: false });
-    const path = plant(fake, seeds.c55EchoOverride);
+    const path = plant(fake, D);
     expect(fake.externalVersions(path)).toHaveLength(1);
-    // Сирота затравки — чужое наследство, его стенд терпит.
+    // Сирота затравки (detached-переопределение) — чужое наследство, его стенд терпит.
     expect(() => assertStoredInvariants(fake)).not.toThrow();
 
     fake.externalDelete(path);
     expect(fake.externalVersions(path)).toEqual([]);
     // Клиент создаёт по тому же пути объект с той же сиротой: это уже его порча.
-    await putObject(ctx.client, path, seeds.c55EchoOverride.ics, { ifNoneMatch: true });
+    await putObject(ctx.client, path, D.ics, { ifNoneMatch: true });
     expect(fake.externalVersions(path)).toEqual([]);
     expect(() => assertStoredInvariants(fake)).toThrow(/orphan-override/);
   });
 
   it("удаление клиентом тоже начинает историю заново", async () => {
     const { fake, ctx } = makeStand({ strict: false });
-    const path = plant(fake, seeds.c55EchoOverride);
+    const path = plant(fake, D);
     await deleteObject(ctx.client, path, fake.etag(path));
     expect(fake.externalVersions(path)).toEqual([]);
-    await putObject(ctx.client, path, seeds.c55EchoOverride.ics, { ifNoneMatch: true });
+    await putObject(ctx.client, path, D.ics, { ifNoneMatch: true });
     expect(() => assertStoredInvariants(fake)).toThrow(/orphan-override/);
   });
 
   it("запись клиентом по пустому пути начинает историю заново, как бы путь ни опустел", async () => {
     const { fake, ctx } = makeStand({ strict: false });
-    const path = plant(fake, seeds.c55EchoOverride);
+    const path = plant(fake, D);
     // Хранилище правится напрямую (так можно только в самопроверке): история
     // осталась, но объекта уже нет.
     fake.objects.delete(path);
     expect(fake.externalVersions(path)).toHaveLength(1);
-    await putObject(ctx.client, path, seeds.c55EchoOverride.ics, { ifNoneMatch: true });
+    await putObject(ctx.client, path, D.ics, { ifNoneMatch: true });
     expect(fake.externalVersions(path)).toEqual([]);
     expect(() => assertStoredInvariants(fake)).toThrow(/orphan-override/);
   });
@@ -723,21 +728,21 @@ describe("FakeCaldav: строгий режим (О12а)", () => {
     expect(fake.rejections.at(-1)?.reasons.join("\n")).toMatch(/duplicate-exdate/);
   });
 
-  it("ремонт C55, оставивший RID мимо слота, — 400, хотя сирот не стало больше; верный ремонт проходит", async () => {
+  it("запись, снявшая сироту, но переставившая RID переноса мимо слота, — 400, хотя сирот не стало больше; запись без сирот проходит", async () => {
     const { fake, ctx } = makeStand();
-    const path = plant(fake, seeds.c55EchoOverride);
+    const path = plant(fake, D);
     const etag0 = fake.etag(path);
-    await expect(putObject(ctx.client, path, c55RepairedOffSlot, { ifMatch: etag0 })).rejects.toMatchObject({ status: 400 });
+    await expect(putObject(ctx.client, path, offSlotRid, { ifMatch: etag0 })).rejects.toMatchObject({ status: 400 });
     expect(fake.rejections.at(-1)?.reasons.join("\n")).toMatch(/orphan-override/);
-    expect(fake.ics(path)).toBe(seeds.c55EchoOverride.ics);
-    await putObject(ctx.client, path, c55Repaired, { ifMatch: etag0 });
-    expect(fake.ics(path)).toBe(c55Repaired);
+    expect(fake.ics(path)).toBe(D.ics);
+    await putObject(ctx.client, path, withoutDetached, { ifMatch: etag0 });
+    expect(fake.ics(path)).toBe(withoutDetached);
     expect(() => assertStoredInvariants(fake)).not.toThrow();
   });
 
   it("assertStoredInvariants ловит ту же порчу, записанную на нестрогом стенде", async () => {
     const { fake, ctx } = makeStand({ strict: false });
-    const c55 = plant(fake, seeds.c55EchoOverride);
+    const detached = plant(fake, D);
     const dup = yandexPath(calendarA, W.uid);
     fake.seed(dup, duplicateRidAt("20261021"));
     const masters = yandexPath(calendarB, "two-masters@yandex.ru");
@@ -745,9 +750,9 @@ describe("FakeCaldav: строгий режим (О12а)", () => {
     // Затравки со своими нарушениями стенд терпит, пока их не переписал клиент.
     expect(() => assertStoredInvariants(fake)).not.toThrow();
 
-    await putObject(ctx.client, c55, c55RepairedOffSlot, { ifMatch: fake.etag(c55) });
+    await putObject(ctx.client, detached, offSlotRid, { ifMatch: fake.etag(detached) });
     expect(() => assertStoredInvariants(fake)).toThrow(/orphan-override/);
-    fake.seedRaw(c55, seeds.c55EchoOverride.ics);
+    fake.seedRaw(detached, D.ics);
 
     await putObject(ctx.client, dup, duplicateRidAt("20261026"), { ifMatch: fake.etag(dup) });
     expect(() => assertStoredInvariants(fake)).toThrow(/duplicate-rid/);
@@ -767,18 +772,19 @@ describe("FakeCaldav: строгий режим (О12а)", () => {
 describe("FakeCaldav: переупорядочивание и нормализация", () => {
   it("reorderComponents отдаёт переопределения раньше основного, хранимый текст не меняется", async () => {
     const { fake, ctx } = makeStand({ reorderComponents: true });
-    const path = plant(fake, seeds.c55EchoOverride);
+    const path = plant(fake, D);
     const roles = (ics: string) =>
       parseRawComponents(ics)[0].children.map((child) =>
         child.name === "VEVENT" ? (child.lines.some((line) => line.startsWith("RECURRENCE-ID")) ? "override" : "master") : child.name,
       );
     // В затравке основной компонент стоит раньше переопределений.
-    expect(roles(seeds.c55EchoOverride.ics)).toEqual(["VTIMEZONE", "master", "override", "override"]);
-    const found = await queryEventByUid(ctx.client, calendarA.href, seeds.c55EchoOverride.uid);
+    expect(roles(D.ics)).toEqual(["VTIMEZONE", "master", "override", "override"]);
+    const found = await queryEventByUid(ctx.client, calendarA.href, D.uid);
     expect(roles(found!.ics)).toEqual(["override", "override", "master", "VTIMEZONE"]);
-    expect(fake.ics(path)).toBe(seeds.c55EchoOverride.ics);
-    // Из XML перевод строки приходит нормализованным, из GET — как есть.
-    expect((await getObject(ctx.client, path)).ics.replace(/\r\n/g, "\n")).toBe(found!.ics.replace(/\r\n/g, "\n"));
+    expect(fake.ics(path)).toBe(D.ics);
+    // Из XML перевод строки приходит нормализованным и без последнего, из GET — как есть.
+    const lf = (ics: string) => ics.replace(/\r\n/g, "\n").trimEnd();
+    expect(lf((await getObject(ctx.client, path)).ics)).toBe(lf(found!.ics));
   });
 
   it("normalizeOnStore: true переписывает объект по фактам Ж2, Ж5–Ж10, не меняя смысла", () => {
@@ -835,8 +841,8 @@ describe("FakeCaldav: переупорядочивание и нормализа
     // Смысл не изменился: нарушений нет ни во входе, ни в сохранённом.
     expect(findViolations(input)).toEqual([]);
     expect(findViolations(stored)).toEqual([]);
-    // Эхо-сирота C55 остаётся сиротой и после нормализации.
-    expect(kinds(yandexNormalize(seeds.c55EchoOverride.ics, { stamp: "20261002T100000Z" }))).toEqual(["orphan-override"]);
+    // Переопределение мимо слотов (detached) остаётся сиротой и после нормализации.
+    expect(kinds(yandexNormalize(D.ics, { stamp: "20261002T100000Z" }))).toEqual(["orphan-override"]);
   });
 
   it("у WEEKLY без BYDAY нормализация дописывает день недели DTSTART (Ж5)", () => {
@@ -1118,14 +1124,16 @@ describe("инварианты: новые дубли и сироты — по �
     expect(newViolations(listed, ex21)).toEqual([]);
   });
 
-  it("сирота на новом ключе — новая, даже если число сирот не выросло (C55: ремонт мимо слота)", () => {
-    const c55 = seeds.c55EchoOverride.ics;
-    expect(c55Repaired).not.toContain("RECURRENCE-ID;TZID=Europe/Moscow:20261021T150000");
-    expect(findViolations(c55Repaired)).toEqual([]);
-    expect(kinds(c55RepairedOffSlot)).toEqual(["orphan-override"]);
-    expect(newKinds(c55RepairedOffSlot, c55)).toEqual(["orphan-override"]);
+  it("сирота на новом ключе — новая, даже если число сирот не выросло (снята одна, RID переноса ушёл мимо слота)", () => {
+    expect(withoutDetached).not.toContain("RECURRENCE-ID;TZID=Europe/Moscow:20261021T150000");
+    expect(withoutDetached).toContain("RECURRENCE-ID;TZID=Europe/Moscow:20261021T100000");
+    expect(findViolations(withoutDetached)).toEqual([]);
+    expect(kinds(offSlotRid)).toEqual(["orphan-override"]);
+    expect(newKinds(offSlotRid, D.ics)).toEqual(["orphan-override"]);
     // Сирота на прежнем ключе остаётся прежней, как бы её ни правили.
-    expect(newViolations(c55.replace("SUMMARY:Планёрка (перенесена)", "SUMMARY:Эхо"), c55)).toEqual([]);
+    const renamed = D.ics.replace("SUMMARY:Планёрка (перенесена)", "SUMMARY:Другое имя");
+    expect(renamed).not.toBe(D.ics);
+    expect(newViolations(renamed, D.ics)).toEqual([]);
   });
 
   it("сирота ↔ скрытое на том же ключе и сдвиг скрытого вместе с EXDATE — не новые («аномалий не больше»)", () => {
@@ -1169,9 +1177,9 @@ describe("инварианты: новые дубли и сироты — по �
       expect({ kind, found: writeViolations(sample.ics, sample.ics).map((v) => v.kind) }).toEqual({ kind, found: [kind] });
     }
     // Прочие виды writeViolations сверяет с прежней версией, как newViolations.
-    const orphan = seeds.c55EchoOverride.ics;
+    const orphan = D.ics;
     expect(writeViolations(orphan, orphan)).toEqual([]);
-    expect(writeViolations(c55RepairedOffSlot, orphan).map((v) => v.kind)).toEqual(["orphan-override"]);
+    expect(writeViolations(offSlotRid, orphan).map((v) => v.kind)).toEqual(["orphan-override"]);
     expect(writeViolations(W.ics).map((v) => v.kind)).toEqual([]);
   });
 });
@@ -1183,8 +1191,10 @@ describe("затравки", () => {
     expect(seeds.weeklyNewYork.ics).toContain("TZID=America/New_York");
     expect(seeds.allDayWeekly.ics).toContain("DTSTART;VALUE=DATE:");
     expect(seeds.floatingDaily.ics).toMatch(/DTSTART:\d{8}T\d{6}\r\n/);
-    const all = Object.values(seeds).filter(isSeed);
-    expect(all).toHaveLength(seeds.cleanSeeds.length + seeds.legacySeeds.length + seeds.unparsableSeeds.length);
+    // Прежние имена затравок — синонимы тех же объектов, их Set схлопывает.
+    const all = [...new Set(Object.values(seeds).filter(isSeed))];
+    expect(all).toHaveLength(seeds.cleanSeeds.length + seeds.detachedSeeds.length + seeds.unparsableSeeds.length);
+    expect(new Set([...seeds.cleanSeeds, ...seeds.detachedSeeds, ...seeds.unparsableSeeds])).toEqual(new Set(all));
     for (const seed of all) {
       // Концы строк — CRLF, как пишут ical.js и сервер; голых LF нет.
       expect(seed.ics).toContain("\r\n");
@@ -1194,17 +1204,35 @@ describe("затравки", () => {
     }
   });
 
-  it("C55 — как записал старый код: перенос 21.10 на 15:00 и эхо с RECURRENCE-ID 15:00", () => {
-    const events = parseRawComponents(seeds.c55EchoOverride.ics)[0].children.filter((child) => child.name === "VEVENT");
-    const rids = events.flatMap((event) => event.lines.filter((line) => line.startsWith("RECURRENCE-ID")));
-    expect(rids).toHaveLength(2);
-    expect(kinds(seeds.c55EchoOverride.ics)).toEqual(["orphan-override"]);
+  it("чужие объекты с detached-переопределением: у каждого одна сирота для инвариантов стенда, остальное чисто", () => {
+    expect(seeds.detachedSeeds).toEqual([seeds.detachedAtMovedStart, seeds.detachedOnSlotDate]);
+    for (const seed of seeds.detachedSeeds) {
+      expect({ uid: seed.uid, kinds: kinds(seed.ics) }).toEqual({ uid: seed.uid, kinds: ["orphan-override"] });
+      // Другой клиент, не этот сервер и не Яндекс.
+      expect(seed.ics).not.toContain("PRODID:-//yandex-calendar-mcp");
+      expect(seed.ics).toContain("PRODID:-//Example Corp.//Other Client//EN");
+    }
   });
 
-  it("C56 — как записал старый код: серия сдвинута на 09:00, переопределение осталось с RECURRENCE-ID 10:00", () => {
-    expect(seeds.c56StaleShift.ics).toMatch(/DTSTART;TZID=Europe\/Moscow:20261019T090000/);
-    expect(seeds.c56StaleShift.ics).toMatch(/RECURRENCE-ID;TZID=Europe\/Moscow:20261021T100000/);
-    expect(kinds(seeds.c56StaleShift.ics)).toEqual(["orphan-override"]);
+  it("detachedAtMovedStart: перенос 21.10 на 15:00 и переопределение с RECURRENCE-ID 15:00 мимо слотов", () => {
+    const events = parseRawComponents(D.ics)[0].children.filter((child) => child.name === "VEVENT");
+    const rids = events.flatMap((event) => event.lines.filter((line) => line.startsWith("RECURRENCE-ID")));
+    expect(rids).toEqual(["RECURRENCE-ID;TZID=Europe/Moscow:20261021T100000", "RECURRENCE-ID;TZID=Europe/Moscow:20261021T150000"]);
+    expect(D.ics.match(/DTSTART;TZID=Europe\/Moscow:20261021T150000/g)).toHaveLength(2);
+  });
+
+  it("detachedOnSlotDate: серия в 09:00, RECURRENCE-ID 21.10 10:00 — в дату слота, но не в его время", () => {
+    const seed = seeds.detachedOnSlotDate;
+    expect(seed.ics).toContain("DTSTART;TZID=Europe/Moscow:20261019T090000");
+    expect(seed.ics).toContain("RECURRENCE-ID;TZID=Europe/Moscow:20261021T100000");
+    expect(seed.ics).toContain("DTSTART;TZID=Europe/Moscow:20261021T113000");
+    expect(kinds(seed.ics)).toEqual(["orphan-override"]);
+  });
+
+  it("прежние имена затравок — синонимы новых, для кода, который ещё на них ссылается", () => {
+    expect(seeds.c55EchoOverride).toBe(seeds.detachedAtMovedStart);
+    expect(seeds.c56StaleShift).toBe(seeds.detachedOnSlotDate);
+    expect(seeds.legacySeeds).toBe(seeds.detachedSeeds);
   });
 
   it("C62 — основной компонент с DURATION и без DTEND", () => {
@@ -1365,17 +1393,18 @@ describe("наблюдение: assertPropsPreserved, assertStoredInvariants, de
   });
 
   it("scope выбирает компоненты: основной, переопределения; пропавший компонент — ошибка", () => {
-    const legacy = seeds.c56StaleShift.ics;
-    const withoutOverride = legacy.replace(/BEGIN:VEVENT(?:(?!END:VEVENT)[\s\S])*RECURRENCE-ID[\s\S]*?END:VEVENT\r\n/, "");
+    const withDetached = seeds.detachedOnSlotDate.ics;
+    const withoutOverride = withDetached.replace(/BEGIN:VEVENT(?:(?!END:VEVENT)[\s\S])*RECURRENCE-ID[\s\S]*?END:VEVENT\r\n/, "");
     expect(withoutOverride).not.toContain("RECURRENCE-ID");
-    expect(() => assertPropsPreserved(legacy, withoutOverride)).toThrow(/RECURRENCE-ID/);
-    expect(() => assertPropsPreserved(legacy, withoutOverride, { scope: "master" })).not.toThrow();
-    expect(() => assertPropsPreserved(legacy, withoutOverride, { scope: "overrides" })).toThrow();
+    expect(withoutOverride).toContain("RRULE:");
+    expect(() => assertPropsPreserved(withDetached, withoutOverride)).toThrow(/RECURRENCE-ID/);
+    expect(() => assertPropsPreserved(withDetached, withoutOverride, { scope: "master" })).not.toThrow();
+    expect(() => assertPropsPreserved(withDetached, withoutOverride, { scope: "overrides" })).toThrow();
   });
 
   it("assertStoredInvariants сверяет каждый объект стенда с его затравкой и внешними правками", () => {
     const { fake } = makeStand();
-    const path = plant(fake, seeds.c55EchoOverride);
+    const path = plant(fake, D);
     plant(fake, seeds.weeklyMoscow);
     expect(() => assertStoredInvariants(fake)).not.toThrow();
     fake.externalEdit(path, (ics) => ics.replace(/DTEND;TZID=Europe\/Moscow:20261019T110000/, "DTEND;TZID=Europe/Moscow:20261019T090000"));
@@ -1386,7 +1415,8 @@ describe("наблюдение: assertPropsPreserved, assertStoredInvariants, de
   });
 
   it("describeObject кратко перечисляет компоненты для сообщений об ошибках", () => {
-    const lines = describeObject(seeds.c56StaleShift.ics);
+    // Переопределение стоит в тексте раньше основного — описание всё равно начинается с основного.
+    const lines = describeObject(reorderOverridesFirst(seeds.detachedOnSlotDate.ics));
     expect(lines[0]).toMatch(/^VEVENT основной/);
     expect(lines.join("\n")).toContain("RECURRENCE-ID;TZID=Europe/Moscow:20261021T100000");
     expect(lines.join("\n")).toContain("RRULE:");
