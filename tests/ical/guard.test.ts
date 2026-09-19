@@ -1,7 +1,7 @@
 import ICAL from "ical.js";
 import { describe, expect, it } from "vitest";
 import { buildEvent } from "../../src/ical/build.js";
-import { GuardError, verifyPlan, type GuardCode } from "../../src/ical/guard.js";
+import { GuardError, verifyPlan, type GuardCode, type GuardOptions } from "../../src/ical/guard.js";
 import { parseAddress } from "../../src/ical/instances.js";
 import { isUnparsable, loadObject, serializeObject, type CalendarObject } from "../../src/ical/object.js";
 import {
@@ -14,12 +14,13 @@ import {
   setRuleEnd,
   touchMetadata,
 } from "../../src/ical/patch.js";
-import type { Expectation, PatchField, Touched, WritePlan } from "../../src/ical/plan.js";
+import type { Expectation, Loss, PatchField, Touched, WritePlan } from "../../src/ical/plan.js";
 import { findSlot, positionsBefore, seriesExtent } from "../../src/ical/slots.js";
 import {
   addListValue,
   compareSlotKeys,
   removeListValues,
+  setRuleDict,
   setTimeProperty,
   wallDateOf,
   type IcalEnv,
@@ -112,12 +113,18 @@ function expectation(input: ExpectInput): Expectation {
   return { removed: [], ruleChanged: false, datesFixed: false, touched: newTouched(), ...rest, fields: new Set(fields) };
 }
 
-function putPlan(o: CalendarObject, input: ExpectInput): WritePlan {
-  return { kind: "put", ics: serializeObject(o), expect: expectation(input), removed: [], notices: [] };
+/** План put; `losses` — убранные встречи в ответе (plan.removed). */
+function putPlan(o: CalendarObject, input: ExpectInput, losses: Loss[] = []): WritePlan {
+  return { kind: "put", ics: serializeObject(o), expect: expectation(input), removed: losses, notices: [] };
 }
 
-function deleteObjectPlan(input: ExpectInput): WritePlan {
-  return { kind: "delete-object", expect: expectation(input), removed: [], notices: [] };
+function deleteObjectPlan(input: ExpectInput, losses: Loss[] = []): WritePlan {
+  return { kind: "delete-object", expect: expectation(input), removed: losses, notices: [] };
+}
+
+/** Строка ответа об убранной встрече (plan.removed) с адресом по Р10. */
+function lossOf(instanceStart: string): Loss {
+  return { instanceStart, start: instanceStart, summary: "", reason: "убрана с подтверждением" };
 }
 
 /**
@@ -125,8 +132,12 @@ function deleteObjectPlan(input: ExpectInput): WritePlan {
  * порядке первого появления; пусто — план прошёл.
  */
 function guardCodes(beforeIcs: string, plan: WritePlan, now = NOW): GuardCode[] {
+  return guardCodesWith(beforeIcs, plan, { now });
+}
+
+function guardCodesWith(beforeIcs: string, plan: WritePlan, options: GuardOptions): GuardCode[] {
   try {
-    verifyPlan(beforeIcs, plan, ENV, { now });
+    verifyPlan(beforeIcs, plan, ENV, { now: NOW, ...options });
     return [];
   } catch (error) {
     if (!(error instanceof GuardError)) throw error;
@@ -652,8 +663,11 @@ describe("verifyPlan: порча останавливается", () => {
     applyFieldPatch(o.master!, { start: "2026-10-19T11:00:00", end: "2026-10-19T12:00:00" }, { env: ENV, touched: t });
     patchRule(o.master!.getFirstProperty("rrule")!, { interval: 4 }, { env: ENV, touched: t });
     touchMetadata(o.master!, NOW, true, ENV, t);
-    expect(guardCodes(ics, putPlan(o, { op: "update", scope: "all_series", fields: ["start", "end"], keyMap: later(3600),
-      ruleChanged: true, datesFixed: true, touched: t }))).toEqual(["meeting-lost"]);
+    const codes = guardCodes(ics, putPlan(o, { op: "update", scope: "all_series", fields: ["start", "end"], keyMap: later(3600),
+      ruleChanged: true, datesFixed: true, touched: t }));
+    expect(codes).toContain("meeting-lost");
+    // Правка без recurrence не меняет RRULE сверх конца правила — это видно и без прохода.
+    expect(codes).toContain("untouched-changed");
   });
 
   it("правка серии сняла скрытое переопределение (след прошлого удаления)", () => {
@@ -943,14 +957,21 @@ describe("verifyPlan: форма плана, пустой объект, усеч
     expect(guardCodes(ics, putPlan(o, { op: "update", scope: "all_series", fields: ["summary"], touched: t }))).toEqual(["untouched-changed"]);
   });
 
-  it("серия длиннее предела прохода — series-too-long", () => {
+  it("серия длиннее предела прохода: правка заголовка проходит (слоты те же), удаление встречи — series-too-long", () => {
     // Ежеминутная серия с 01.01.2026: до горизонта — больше 200 000 слотов.
     const ics = calendar(MOSCOW, vevent(["DTSTART;TZID=Europe/Moscow:20260101T000000", "DURATION:PT1M",
       "RRULE:FREQ=MINUTELY", "SUMMARY:Тик"]));
     const o = load(ics);
     const t = newTouched();
     applyFieldPatch(o.master!, { summary: "Так" }, { env: ENV, touched: t });
-    expect(guardCodes(ics, putPlan(o, { op: "update", scope: "all_series", fields: ["summary"], touched: t }))).toEqual(["series-too-long"]);
+    // Правка, не трогающая DTSTART, RRULE, RDATE и EXDATE, слотов не меняет:
+    // переопределения сверяются по ключу и без прохода (запасное окно).
+    expect(guardCodes(ics, putPlan(o, { op: "update", scope: "all_series", fields: ["summary"], touched: t }))).toEqual([]);
+    const p = load(ics);
+    const u = newTouched();
+    const k = key(p, "2026-01-01T00:05:00+03:00");
+    excludeSlot(p, u, k);
+    expect(guardCodes(ics, putPlan(p, { op: "delete", scope: "this", target: k, removed: [k], touched: u }))).toEqual(["series-too-long"]);
   }, 60_000);
 });
 
@@ -983,6 +1004,398 @@ describe("verifyPlan: бюджет", () => {
     // Проход линейный: квадратичный перебор 20 000 позиций занял бы минуты.
     expect(performance.now() - started).toBeLessThan(30_000);
   }, 120_000);
+});
+
+// ─────────────────────────────── правка по ревью ───────────────────────────────
+
+/** Видимые встречи PLANNING (адреса по Р10): 21.10 перенесена на 15:00, 28.10 закрыта. */
+const PLANNING_DATES = ["2026-10-19", "2026-10-21", "2026-10-26", "2026-11-02", "2026-11-04"];
+
+describe("verifyPlan: removed ограничен операцией, а не словом планировщика", () => {
+  it("delete this 2.11 удалением объекта со всеми живыми встречами в removed — plan-shape и not-empty", () => {
+    const o = load(PLANNING);
+    const all = PLANNING_DATES.map((date) => key(o, `${date}T10:00:00+03:00`));
+    const codes = guardCodes(PLANNING, deleteObjectPlan({ op: "delete", scope: "this", target: all[3], removed: all }));
+    expect(codes).toContain("plan-shape");
+    expect(codes).toContain("not-empty");
+  });
+
+  it("delete this 2.11 заодно закрыл 4.11 и назвал её в removed — plan-shape и meeting-lost", () => {
+    const o = load(PLANNING);
+    const t = newTouched();
+    const k2 = key(o, "2026-11-02T10:00:00+03:00");
+    const k4 = key(o, "2026-11-04T10:00:00+03:00");
+    excludeSlot(o, t, k2);
+    excludeSlot(o, t, k4);
+    const codes = guardCodes(PLANNING, putPlan(o, { op: "delete", scope: "this", target: k2, removed: [k2, k4], touched: t }));
+    expect(codes).toContain("plan-shape");
+    expect(codes).toContain("meeting-lost");
+  });
+
+  it("сдвиг all_series на 11:00 заодно закрыл 2.11 и назвал её в removed — plan-shape и meeting-lost", () => {
+    const o = load(PLANNING);
+    const t = allSeriesShift(o);
+    const extra = (o.master!.getFirstPropertyValue("dtstart") as ICAL.Time).clone();
+    extra.adjust(14, 0, 0, 0); // 2.11 11:00
+    t.properties.add(addListValue(o.master!, "exdate", extra));
+    const k2 = key(o, "2026-11-02T10:00:00+03:00");
+    const codes = guardCodes(PLANNING, putPlan(o, { op: "update", scope: "all_series", fields: ["start", "end"], keyMap: later(3600),
+      ruleChanged: true, datesFixed: true, removed: [k2], tail: { count: 6, lastDate: "2026-11-04" }, touched: t }));
+    expect(codes).toContain("plan-shape");
+    expect(codes).toContain("meeting-lost");
+  });
+
+  it("delete-object для t&f 26.10 с removed [19.10, 21.10] — plan-shape и not-empty", () => {
+    const o = load(PLANNING);
+    const b = key(o, "2026-10-26T10:00:00+03:00");
+    const removed = [key(o, "2026-10-19T10:00:00+03:00"), key(o, "2026-10-21T10:00:00+03:00")];
+    const codes = guardCodes(PLANNING, deleteObjectPlan({ op: "delete", scope: "this_and_following", target: b, removed }));
+    expect(codes).toContain("plan-shape");
+    expect(codes).toContain("not-empty");
+  });
+
+  it("delete this удалением объекта: цель и скрытые переопределения в removed допустимы", () => {
+    const ics = calendar(
+      MOSCOW,
+      vevent(["DTSTART;TZID=Europe/Moscow:20261019T100000", "DTEND;TZID=Europe/Moscow:20261019T110000",
+        "RRULE:FREQ=DAILY;COUNT=3", "EXDATE;TZID=Europe/Moscow:20261019T100000,20261020T100000", "SUMMARY:Три дня"]),
+      override("20261020T100000", "20261020T120000", "20261020T130000", "SUMMARY:След прошлого удаления"),
+    );
+    const o = load(ics);
+    const k = key(o, "2026-10-21T10:00:00+03:00");
+    const hidden = key(o, "2026-10-20T10:00:00+03:00");
+    expect(guardCodes(ics, deleteObjectPlan({ op: "delete", scope: "this", target: k, removed: [k, hidden] }))).toEqual([]);
+  });
+
+  it("fields у удаления не ослабляют проверку: delete this с fields [recurrence] и лишним EXDATE 4.11", () => {
+    const o = load(PLANNING);
+    const t = newTouched();
+    const k2 = key(o, "2026-11-02T10:00:00+03:00");
+    excludeSlot(o, t, k2);
+    excludeSlot(o, t, key(o, "2026-11-04T10:00:00+03:00"));
+    const codes = guardCodes(PLANNING, putPlan(o, { op: "delete", scope: "this", target: k2, removed: [k2], fields: ["recurrence"], touched: t }));
+    expect(codes).toContain("plan-shape");
+    expect(codes).toContain("meeting-lost");
+  });
+
+  it("delete this одиночного события записью put — plan-shape; удаление объекта проходит", () => {
+    const ics = seeds.singleMoscow.ics;
+    const o = load(ics);
+    const t = newTouched();
+    touchMetadata(o.master!, NOW, false, ENV, t);
+    const k = key(o, "2026-10-20T15:00:00+03:00");
+    expect(guardCodes(ics, putPlan(o, { op: "delete", scope: "this", target: k, removed: [k], touched: t }))).toEqual(["plan-shape"]);
+    expect(guardCodes(ics, deleteObjectPlan({ op: "delete", scope: "this", target: k, removed: [k] }))).toEqual([]);
+  });
+});
+
+describe("verifyPlan: delete this_and_following и встречи, перенесённые раньше границы", () => {
+  it("delete-object t&f с 19.10 при оторванной встрече RID 22.10, перенесённой на 16.10 — not-empty", () => {
+    const ics = calendar(MOSCOW, vevent([...SERIES]), override("20261022T100000", "20261016T100000", "20261016T110000", "SUMMARY:Отдельная"));
+    const o = load(ics);
+    const b = key(o, "2026-10-19T10:00:00+03:00");
+    const k22 = key(o, "2026-10-22T10:00:00+03:00");
+    expect(guardCodes(ics, deleteObjectPlan({ op: "delete", scope: "this_and_following", target: b }))).toEqual(["not-empty"]);
+    // С подтверждением: встреча названа в removed и в ответе.
+    expect(guardCodes(ics, deleteObjectPlan({ op: "delete", scope: "this_and_following", target: b, removed: [k22] },
+      [lossOf("2026-10-22T10:00:00+03:00")]))).toEqual([]);
+    // Названа в removed, но ответ о потере молчит.
+    expect(guardCodes(ics, deleteObjectPlan({ op: "delete", scope: "this_and_following", target: b, removed: [k22] })))
+      .toEqual(["plan-shape"]);
+  });
+
+  it("delete-object t&f с 19.10 при переопределении слота 4.11, перенесённом на 16.10 — not-empty", () => {
+    const ics = calendar(MOSCOW, vevent([...SERIES]), override("20261104T100000", "20261016T100000", "20261016T110000", "SUMMARY:Раньше"));
+    const o = load(ics);
+    const b = key(o, "2026-10-19T10:00:00+03:00");
+    expect(guardCodes(ics, deleteObjectPlan({ op: "delete", scope: "this_and_following", target: b }))).toEqual(["not-empty"]);
+  });
+
+  it("усечение с 26.10 снимает встречу 4.11, перенесённую на 20.10, не назвав её — meeting-lost", () => {
+    const ics = calendar(MOSCOW, vevent([...SERIES]), override("20261104T100000", "20261020T100000", "20261020T110000", "SUMMARY:Вперёд"));
+    const p = load(ics);
+    const b = key(p, "2026-10-26T10:00:00+03:00");
+    const k4 = key(p, "2026-11-04T10:00:00+03:00");
+    const t = truncate(p, b);
+    const input: ExpectInput = { op: "delete", scope: "this_and_following", target: b, ruleChanged: true,
+      tail: { count: 2, lastDate: "2026-10-21" }, touched: t };
+    expect(guardCodes(ics, putPlan(p, input))).toEqual(["meeting-lost"]);
+    expect(guardCodes(ics, putPlan(p, { ...input, removed: [k4] }, [lossOf("2026-11-04T10:00:00+03:00")]))).toEqual([]);
+    expect(guardCodes(ics, putPlan(p, { ...input, removed: [k4] }))).toEqual(["plan-shape"]);
+  });
+
+  it("усечение с 26.10 прячет оторванную 23.10 за конец серии: только названной и в ответе; 20.10 так не убрать", () => {
+    // 23.10 (пятница) — после последнего слота до B (21.10): усечённая серия
+    // кончается раньше, и встреча становится скрытой. 20.10 остаётся видимой.
+    const ics = calendar(MOSCOW, vevent([...SERIES]),
+      override("20261023T100000", "20261023T100000", "20261023T110000", "SUMMARY:Пятница"),
+      override("20261020T100000", "20261020T100000", "20261020T110000", "SUMMARY:Вторник"));
+    const p = load(ics);
+    const b = key(p, "2026-10-26T10:00:00+03:00");
+    const k23 = key(p, "2026-10-23T10:00:00+03:00");
+    const k20 = key(p, "2026-10-20T10:00:00+03:00");
+    const t = truncate(p, b);
+    const input: ExpectInput = { op: "delete", scope: "this_and_following", target: b, ruleChanged: true,
+      tail: { count: 2, lastDate: "2026-10-21" }, touched: t };
+    expect(guardCodes(ics, putPlan(p, input))).toEqual(["override-lost"]);
+    expect(guardCodes(ics, putPlan(p, { ...input, removed: [k23] }, [lossOf("2026-10-23T10:00:00+03:00")]))).toEqual([]);
+    expect(guardCodes(ics, putPlan(p, { ...input, removed: [k23] }))).toEqual(["plan-shape"]);
+    expect(guardCodes(ics, putPlan(p, { ...input, removed: [k23, k20] }, [lossOf("2026-10-23T10:00:00+03:00"),
+      lossOf("2026-10-20T10:00:00+03:00")]))).toEqual(["plan-shape"]);
+  });
+});
+
+describe("verifyPlan: время клона и продолжения, когда патч время не трогает (О6, О8)", () => {
+  /** update this на слоте 2.11: клон основного, патч `patch`, затем порча `mutate`. */
+  function cloneAt2Nov(patch: { summary?: string; start?: string }, mutate: (clone: ICAL.Component, o: CalendarObject) => void = () => {}) {
+    const o = load(PLANNING);
+    const t = newTouched();
+    const k = key(o, "2026-11-02T10:00:00+03:00");
+    const clone = overrideFromMaster(o, findSlot(o, k)!, t);
+    applyFieldPatch(clone, patch, { env: ENV, touched: t });
+    mutate(clone, o);
+    touchMetadata(clone, NOW, patch.start !== undefined, ENV, t);
+    return putPlan(o, { op: "update", scope: "this", target: k, fields: Object.keys(patch) as PatchField[], touched: t });
+  }
+
+  it("update this {summary}: клон 2.11 с началом и концом основного (19.10) — time-changed", () => {
+    const plan = cloneAt2Nov({ summary: "Особая" }, (clone, o) => {
+      setTimeProperty(clone, "dtstart", o.master!.getFirstPropertyValue("dtstart") as ICAL.Time);
+      setTimeProperty(clone, "dtend", o.master!.getFirstPropertyValue("dtend") as ICAL.Time);
+    });
+    expect(guardCodes(PLANNING, plan)).toContain("time-changed");
+  });
+
+  it("update this {summary}: клон с концом на 2 часа позже — time-changed", () => {
+    expect(guardCodes(PLANNING, cloneAt2Nov({ summary: "Особая" }))).toEqual([]);
+    const plan = cloneAt2Nov({ summary: "Особая" }, (clone) => setTimeProperty(clone, "dtend", shifted(clone, "dtend", 2)));
+    expect(guardCodes(PLANNING, plan)).toEqual(["time-changed"]);
+  });
+
+  it("update this {start} без end: длительность прежняя (О8), иначе — time-changed", () => {
+    expect(guardCodes(PLANNING, cloneAt2Nov({ start: "2026-11-02T12:00:00" }))).toEqual([]);
+    const plan = cloneAt2Nov({ start: "2026-11-02T12:00:00" }, (clone) => setTimeProperty(clone, "dtend", shifted(clone, "dtend", 2)));
+    expect(guardCodes(PLANNING, plan)).toEqual(["time-changed"]);
+  });
+
+  it("серия на весь день: клон на 21.10 — те же сутки; клон на двое суток — time-changed", () => {
+    const ics = seeds.allDayWeekly.ics;
+    const plan = (days: number) => {
+      const o = load(ics);
+      const t = newTouched();
+      const k = key(o, "2026-10-21");
+      const clone = overrideFromMaster(o, findSlot(o, k)!, t);
+      applyFieldPatch(clone, { summary: "Особый день" }, { env: ENV, touched: t });
+      if (days > 0) {
+        const end = (clone.getFirstPropertyValue("dtend") as ICAL.Time).clone();
+        end.adjust(days, 0, 0, 0);
+        setTimeProperty(clone, "dtend", end);
+      }
+      touchMetadata(clone, NOW, false, ENV, t);
+      return putPlan(o, { op: "update", scope: "this", target: k, fields: ["summary"], touched: t });
+    };
+    expect(guardCodes(ics, plan(0))).toEqual([]);
+    expect(guardCodes(ics, plan(1))).toEqual(["time-changed"]);
+  });
+
+  it("разрез {summary}: у основного продолжения конец 13:00 вместо 11:00 — time-changed", () => {
+    const plan = splitAt26({ summary: "Новый формат" }, {
+      mutate: (c) => setTimeProperty(c.master!, "dtend", shifted(c.master!, "dtend", 2)),
+    });
+    expect(guardCodes(PLANNING, plan)).toEqual(["time-changed"]);
+  });
+});
+
+describe("verifyPlan: поля переопределений по О7", () => {
+  it("all_series {summary} затёр свои заголовки перенесённой 21.10 и 26.10 — override-field-lost", () => {
+    const o = load(PLANNING);
+    const t = newTouched();
+    for (const c of o.root.getAllSubcomponents("vevent")) {
+      applyFieldPatch(c, { summary: "Синк" }, { env: ENV, touched: t });
+      touchMetadata(c, NOW, false, ENV, t);
+    }
+    const error = guardError(PLANNING, putPlan(o, { op: "update", scope: "all_series", fields: ["summary"], touched: t }));
+    expect([...new Set(error.problems.map((p) => p.code))]).toEqual(["override-field-lost"]);
+    expect(error.message).toContain("2026-10-21T10:00:00+03:00");
+    expect(error.message).toContain("2026-10-26T10:00:00+03:00");
+  });
+
+  it("all_series {attendees}: свой PARTSTAT=DECLINED переопределения 26.10 стал ACCEPTED — override-field-lost", () => {
+    const ics = calendar(MOSCOW, vevent([...SERIES, "ATTENDEE;PARTSTAT=ACCEPTED:mailto:petrov@example.com"]),
+      override("20261026T100000", "20261026T100000", "20261026T110000", "ATTENDEE;PARTSTAT=DECLINED:mailto:petrov@example.com"));
+    const patch = { attendees: [{ email: "petrov@example.com", status: "accepted" as const }, { email: "anna@example.com" }] };
+    const o = load(ics);
+    const t = newTouched();
+    for (const c of o.root.getAllSubcomponents("vevent")) {
+      applyFieldPatch(c, patch, { env: ENV, touched: t });
+      touchMetadata(c, NOW, false, ENV, t);
+    }
+    expect(guardCodes(ics, putPlan(o, { op: "update", scope: "all_series", fields: ["attendees"], touched: t }))).toEqual(["override-field-lost"]);
+
+    // Верно (inheritFields): переопределение со своим PARTSTAT не трогается.
+    const p = load(ics);
+    const u = newTouched();
+    const old = cloneComponent(p.master!);
+    applyFieldPatch(p.master!, patch, { env: ENV, touched: u });
+    touchMetadata(p.master!, NOW, false, ENV, u);
+    for (const own of overridesOf(p)) {
+      if (inheritFields(own, old, p.master!, ["attendees"], u).length > 0) touchMetadata(own, NOW, false, ENV, u);
+    }
+    expect(guardCodes(ics, putPlan(p, { op: "update", scope: "all_series", fields: ["attendees"], touched: u }))).toEqual([]);
+  });
+
+  it("разрез 26.10 {summary} затёр свой заголовок переопределения 2.11 в продолжении — override-field-lost", () => {
+    const base = PLANNING.replace("END:VCALENDAR", [...override("20261102T100000", "20261102T100000", "20261102T110000",
+      "SUMMARY:Своя тема 2.11"), "END:VCALENDAR"].join(CRLF));
+    expect(guardCodes(base, splitAt26({ summary: "Новый формат" }, { base }))).toEqual([]);
+    const plan = splitAt26({ summary: "Новый формат" }, {
+      base,
+      mutate: (c) => {
+        for (const own of overridesOf(c)) {
+          if (own.getFirstPropertyValue("summary") === "Своя тема 2.11") own.getFirstProperty("summary")!.setValue("Новый формат");
+        }
+      },
+    });
+    expect(guardCodes(base, plan)).toEqual(["override-field-lost"]);
+  });
+
+  it("all_series {summary}: переопределение с заголовком серии не получило новый — override-field-stale", () => {
+    const ics = calendar(MOSCOW, vevent([...SERIES]),
+      override("20261021T100000", "20261021T150000", "20261021T160000", "SUMMARY:Планёрка"));
+    const o = load(ics);
+    const t = newTouched();
+    applyFieldPatch(o.master!, { summary: "Синк" }, { env: ENV, touched: t });
+    touchMetadata(o.master!, NOW, false, ENV, t);
+    expect(guardCodes(ics, putPlan(o, { op: "update", scope: "all_series", fields: ["summary"], touched: t }))).toEqual(["override-field-stale"]);
+  });
+
+  it("all_series со сдвигом и target на перенесённой 21.10: исключения для цели нет — moved-shifted", () => {
+    const o = load(PLANNING);
+    const t = allSeriesShift(o, { moveMoved: true });
+    const plan = putPlan(o, { op: "update", scope: "all_series", target: key(o, "2026-10-21T10:00:00+03:00"), fields: ["start", "end"],
+      keyMap: later(3600), ruleChanged: true, datesFixed: true, tail: { count: 6, lastDate: "2026-11-04" }, touched: t });
+    expect(guardCodes(PLANNING, plan)).toEqual(["moved-shifted"]);
+  });
+});
+
+describe("verifyPlan: смена повтора не трогает RDATE и не закрывает встреч", () => {
+  const MONDAYS = calendar(MOSCOW, vevent(["DTSTART;TZID=Europe/Moscow:20261019T100000", "DTEND;TZID=Europe/Moscow:20261019T110000",
+    "RRULE:FREQ=WEEKLY;BYDAY=MO", "RDATE;TZID=Europe/Moscow:20261030T100000", "SUMMARY:Пн"]));
+
+  it("{interval:2} проходит; он же со снятым RDATE 30.10 — meeting-lost", () => {
+    const plan = (dropRdate: boolean) => {
+      const o = load(MONDAYS);
+      const t = newTouched();
+      patchRule(o.master!.getFirstProperty("rrule")!, { interval: 2 }, { env: ENV, touched: t });
+      if (dropRdate) {
+        removeListValues(o.master!, "rdate", () => true, o);
+        mark(t, o.master!, "rdate");
+      }
+      touchMetadata(o.master!, NOW, true, ENV, t);
+      return putPlan(o, { op: "update", scope: "all_series", fields: ["recurrence"], ruleChanged: true, touched: t });
+    };
+    expect(guardCodes(MONDAYS, plan(false))).toEqual([]);
+    expect(guardCodes(MONDAYS, plan(true))).toEqual(["meeting-lost"]);
+  });
+
+  it("{count:4} заодно закрыл 21.10, tail верен — meeting-lost", () => {
+    const ics = seeds.weeklyMoscow.ics;
+    const o = load(ics);
+    const t = newTouched();
+    patchRule(o.master!.getFirstProperty("rrule")!, { count: 4 }, { env: ENV, touched: t });
+    t.properties.add(addListValue(o.master!, "exdate", findSlot(o, key(o, "2026-10-21T10:00:00+03:00"))!.time));
+    mark(t, o.master!, "exdate");
+    touchMetadata(o.master!, NOW, true, ENV, t);
+    expect(guardCodes(ics, putPlan(o, { op: "update", scope: "all_series", fields: ["recurrence"], ruleChanged: true,
+      tail: { count: 4, lastDate: "2026-10-28" }, touched: t }))).toEqual(["meeting-lost"]);
+  });
+
+  it("лишний recurrence в fields не разрешает снять RDATE; с патчем из оркестрации — plan-shape", () => {
+    const o = load(MONDAYS);
+    const t = newTouched();
+    applyFieldPatch(o.master!, { summary: "Синк" }, { env: ENV, touched: t });
+    removeListValues(o.master!, "rdate", () => true, o);
+    mark(t, o.master!, "rdate");
+    touchMetadata(o.master!, NOW, true, ENV, t);
+    const plan = putPlan(o, { op: "update", scope: "all_series", fields: ["summary", "recurrence"], touched: t });
+    expect(guardCodes(MONDAYS, plan)).toContain("meeting-lost");
+    expect(guardCodesWith(MONDAYS, plan, { patch: { summary: "Синк" } })).toContain("plan-shape");
+  });
+
+  it("смена правила на одни понедельники снимает перенесённую 21.10: названа в ответе — проходит, нет — plan-shape", () => {
+    const o = load(PLANNING);
+    const t = newTouched();
+    patchRule(o.master!.getFirstProperty("rrule")!, { byWeekday: ["MO"] }, { env: ENV, touched: t });
+    removeListValues(o.master!, "exdate", () => true, o); // EXDATE 28.10 без пары в новом правиле
+    mark(t, o.master!, "exdate");
+    touchMetadata(o.master!, NOW, true, ENV, t);
+    const k21 = key(o, "2026-10-21T10:00:00+03:00");
+    dropComponent(t, o.root, o.overrides.get(k21)![0].component);
+    const input: ExpectInput = { op: "update", scope: "all_series", fields: ["recurrence"], ruleChanged: true, removed: [k21],
+      tail: { count: 6, lastDate: "2026-11-23" }, touched: t };
+    expect(guardCodes(PLANNING, putPlan(o, input, [lossOf("2026-10-21T10:00:00+03:00")]))).toEqual([]);
+    expect(guardCodes(PLANNING, putPlan(o, input))).toEqual(["plan-shape"]);
+  });
+});
+
+describe("verifyPlan: данные вне модели внутри разрешённых свойств", () => {
+  it("сдвиг на 11:00 переписал RRULE и потерял WKST и X-часть — untouched-changed", () => {
+    const ics = calendar(MOSCOW, vevent(["DTSTART;TZID=Europe/Moscow:20261019T100000", "DTEND;TZID=Europe/Moscow:20261019T110000",
+      "RRULE:FREQ=WEEKLY;BYDAY=MO;WKST=SU;X-YANDEX-MARK=keep", "SUMMARY:Пн"]));
+    const shift = (rewrite: boolean) => {
+      const o = load(ics);
+      const t = newTouched();
+      applyFieldPatch(o.master!, { start: "2026-10-19T11:00:00", end: "2026-10-19T12:00:00" }, { env: ENV, touched: t });
+      if (rewrite) {
+        setRuleDict(o.master!.getFirstProperty("rrule")!, { freq: "WEEKLY", byday: "MO" });
+        mark(t, o.master!, "rrule");
+      }
+      touchMetadata(o.master!, NOW, true, ENV, t);
+      return putPlan(o, { op: "update", scope: "all_series", fields: ["start", "end"], keyMap: later(3600), ruleChanged: true,
+        datesFixed: true, touched: t });
+    };
+    expect(guardCodes(ics, shift(false))).toEqual([]);
+    expect(guardCodes(ics, shift(true))).toEqual(["untouched-changed"]);
+  });
+
+  it("all_series {attendees}: у имеющегося участника потеряны CN и ROLE — untouched-changed", () => {
+    const ics = seeds.richMoscow.ics;
+    const patch = { attendees: [{ email: "petrov@example.com", status: "declined" as const }, { email: "anna@example.com" }] };
+    const plan = (dropParams: boolean) => {
+      const o = load(ics);
+      const t = newTouched();
+      applyFieldPatch(o.master!, patch, { env: ENV, touched: t });
+      if (dropParams) {
+        const petrov = o.master!.getAllProperties("attendee").find((p) => String(p.getFirstValue()).includes("petrov"))!;
+        petrov.removeParameter("cn");
+        petrov.removeParameter("role");
+      }
+      touchMetadata(o.master!, NOW, false, ENV, t);
+      return putPlan(o, { op: "update", scope: "all_series", fields: ["attendees"], touched: t });
+    };
+    expect(guardCodes(ics, plan(false))).toEqual([]);
+    const error = guardError(ics, plan(true));
+    expect([...new Set(error.problems.map((p) => p.code))]).toEqual(["untouched-changed"]);
+    expect(error.message).toContain("petrov@example.com");
+  });
+});
+
+describe("verifyPlan: keyMap знает только слоты", () => {
+  it("сдвиг серии с оторванной встречей и EXDATE мимо слотов: keyMap для них не вызывается", () => {
+    const ics = calendar(MOSCOW, vevent([...SERIES, "EXDATE;TZID=Europe/Moscow:20261022T100000"]),
+      override("20261022T120000", "20261022T150000", "20261022T160000", "SUMMARY:Отдельная"));
+    const o = load(ics);
+    const slots = new Set(PLANNING_DATES.concat("2026-10-28").map((date) => key(o, `${date}T10:00:00+03:00`)));
+    const t = newTouched();
+    applyFieldPatch(o.master!, { start: "2026-10-19T11:00:00", end: "2026-10-19T12:00:00" }, { env: ENV, touched: t });
+    touchMetadata(o.master!, NOW, true, ENV, t);
+    const keyMap = (k: SlotKey): SlotKey => {
+      if (!slots.has(k)) throw new Error(`${k} — не слот`);
+      return later(3600)(k);
+    };
+    expect(guardCodes(ics, putPlan(o, { op: "update", scope: "all_series", fields: ["start", "end"], keyMap, ruleChanged: true,
+      datesFixed: true, tail: { count: 6, lastDate: "2026-11-04" }, touched: t }))).toEqual([]);
+  });
 });
 
 // ─────────────────────────────── построители планов ───────────────────────────────
@@ -1066,6 +1479,10 @@ function truncate(o: CalendarObject, b: SlotKey, options: TruncateOptions = {}):
 }
 
 interface SplitOptions {
+  /** Исходный объект вместо PLANNING (с теми же слотами). */
+  base?: string;
+  /** Порча продолжения после сборки. */
+  mutate?: (c: CalendarObject) => void;
   count?: number;
   dropOverride?: boolean;
   sameUid?: boolean;
@@ -1079,12 +1496,13 @@ interface SplitOptions {
  * DTSTART = 26.10, COUNT = 6 − 2, EXDATE 28.10 и переопределением 26.10.
  */
 function splitAt26(patch: { summary: string }, options: SplitOptions = {}): WritePlan {
-  const o = load(PLANNING);
+  const base = options.base ?? PLANNING;
+  const o = load(base);
   const b = key(o, "2026-10-26T10:00:00+03:00");
   const t = truncate(o, b);
 
   const uid = options.sameUid ? UID : "ycm-0123456789abcdef0123456789abcdef";
-  const c = load(PLANNING);
+  const c = load(base);
   const cm = c.master!;
   for (const [k, refs] of c.overrides) {
     for (const ref of refs) {
@@ -1106,6 +1524,7 @@ function splitAt26(patch: { summary: string }, options: SplitOptions = {}): Writ
   applyFieldPatch(cm, patch, { env: ENV });
   if (options.dropMark) cm.removeProperty("x-client-mark");
   touchMetadata(cm, NOW, false, ENV);
+  options.mutate?.(c);
 
   return {
     kind: "split",
