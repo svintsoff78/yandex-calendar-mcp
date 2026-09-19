@@ -236,16 +236,16 @@ export function seriesExtent(o: CalendarObject, cap = SERIES_CAP): SeriesExtent 
 }
 
 /**
- * Объект пуст (Р3): нет живых оторванных встреч (роль detached и эхо
- * оторванной встречи) и ни одного незакрытого слота. Без горизонта:
- * бесконечное правило находит незакрытую позицию за число шагов не больше
- * числа EXDATE, конечная серия проходится целиком. Больше `cap` слотов или
+ * Объект пуст (Р3): нет оторванных встреч (роль detached) и ни одного
+ * незакрытого слота. Без горизонта: бесконечное правило находит незакрытую
+ * позицию за число шагов не больше числа EXDATE, конечная серия проходится
+ * целиком. Больше `cap` слотов или
  * сбой итератора — «не пуст»: ошибка в сторону сохранения данных.
  * Скрытые переопределения пустоте не мешают — это следы прошлых удалений.
  */
 export function isEmpty(o: CalendarObject, cap = SERIES_CAP): boolean {
   for (const info of o.roles.values()) {
-    if (info.role === "detached" || (info.role === "echo" && info.slot === undefined)) return false;
+    if (info.role === "detached") return false;
   }
   if (!o.master) return true;
 

@@ -95,7 +95,7 @@ export function typeContract(calendar: Calendar, client: CaldavClient, config: C
   };
   // Объект без новых полей остаётся CalendarEvent: производители, которых
   // переделка ещё не коснулась, компилируются.
-  const legacyEvent: CalendarEvent = base;
+  const plainEvent: CalendarEvent = base;
   const hourly: CalendarEvent = {
     ...base,
     recurring: true,
@@ -115,9 +115,9 @@ export function typeContract(calendar: Calendar, client: CaldavClient, config: C
         reason: "RECURRENCE-ID за концом серии",
       },
     ],
-    anomalies: ["legacy-override: второе переопределение с RECURRENCE-ID нового времени"],
+    anomalies: ["duplicate-override: у встречи 21.10 два компонента с одним RECURRENCE-ID"],
   };
-  void legacyEvent;
+  void plainEvent;
   void hourly;
   // @ts-expect-error — такого STATUS у VEVENT нет.
   const badStatus: CalendarEvent = { ...base, status: "needs-action" };
@@ -125,8 +125,12 @@ export function typeContract(calendar: Calendar, client: CaldavClient, config: C
 
   // ── EventException ──────────────────────────────────────────────────────
   expectTypeOf<ExceptionState>().toEqualTypeOf<
-    "changed" | "moved" | "cancelled" | "excluded" | "hidden" | "detached" | "legacy" | "duplicate"
+    "changed" | "moved" | "cancelled" | "excluded" | "hidden" | "detached" | "duplicate"
   >();
+  // @ts-expect-error — состояния «след прежнего кода» нет: роли переопределений
+  // только slot, hidden, detached (поправка к плану от 19.09.2026).
+  const legacyState: ExceptionState = "legacy";
+  void legacyState;
   expectTypeOf<EventException>().toEqualTypeOf<{
     instanceStart: string;
     state: ExceptionState;
@@ -150,8 +154,8 @@ export function typeContract(calendar: Calendar, client: CaldavClient, config: C
     resolveCalendar: async () => calendar,
   };
   // Прежний вид без io и now годится: src/mcp/context.ts их не задаёт.
-  const legacyContext: Context = contextBase;
-  void legacyContext;
+  const plainContext: Context = contextBase;
+  void plainContext;
 
   // ── ObjectIO ────────────────────────────────────────────────────────────
   expectTypeOf<ObjectIO["find"]>().toEqualTypeOf<

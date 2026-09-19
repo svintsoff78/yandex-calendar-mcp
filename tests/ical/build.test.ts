@@ -655,7 +655,7 @@ describe("buildEvent: на вход — только новое событие",
   it.each([
     ["recurrenceRule", { recurrenceRule: "RRULE:FREQ=HOURLY;INTERVAL=2" }, "unsupported-rule"],
     ["exceptions", { exceptions: [{ instanceStart: "2026-09-28T10:00:00+03:00", state: "excluded" }] }, "read-only-field"],
-    ["anomalies", { anomalies: ["legacy-override: эхо переноса"] }, "read-only-field"],
+    ["anomalies", { anomalies: ["duplicate-override: два компонента с одним RECURRENCE-ID"] }, "read-only-field"],
   ] as const)("прочитанное событие с %s отклоняется: сборка это состояние не пишет", (field, extra, code) => {
     const error = thrownBy(() => buildEvent({ ...readEvent, ...extra }));
 

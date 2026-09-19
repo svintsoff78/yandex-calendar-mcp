@@ -476,17 +476,16 @@ describe("isEmpty (Р3): полным проходом, без горизонт�
     expect(isEmpty(o)).toBe(false);
   });
 
-  it("живое эхо оторванной встречи (цикл эха без detached) делает объект непустым", () => {
+  it("цикл переносов мимо слотов (RID каждого равен началу другого) — оба detached, объект непуст", () => {
     // A: RID 20.10 10:00 → 12:00; B: RID 20.10 12:00 → 10:00. Во вторник у
-    // серии Пн и Ср слотов нет, у каждого RID есть «предшественник» — роли
-    // обоих echo без слота, detached нет.
+    // серии Пн и Ср слотов нет: обе встречи оторванные и показываются.
     const allExcluded = [...WEEKLY_KEYS.map((key) => `EXDATE:${new Date(Number(key.slice(2)) * 1000).toISOString().replace(/[-:]|\.000/g, "")}`)];
     const o = load(calendar(MOSCOW,
       ["DTSTART;TZID=Europe/Moscow:20261019T100000", "DURATION:PT1H", "RRULE:FREQ=WEEKLY;BYDAY=MO,WE;COUNT=6", ...allExcluded],
       ["RECURRENCE-ID;TZID=Europe/Moscow:20261020T100000", "DTSTART;TZID=Europe/Moscow:20261020T120000", "DURATION:PT1H"],
       ["RECURRENCE-ID;TZID=Europe/Moscow:20261020T120000", "DTSTART;TZID=Europe/Moscow:20261020T100000", "DURATION:PT1H"]));
 
-    expect([...o.roles.values()].map((info) => [info.role, info.slot])).toEqual([["echo", undefined], ["echo", undefined]]);
+    expect([...o.roles.values()].map((info) => [info.role, info.slot])).toEqual([["detached", undefined], ["detached", undefined]]);
     expect(isEmpty(o)).toBe(false);
   });
 

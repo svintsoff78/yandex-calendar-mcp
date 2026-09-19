@@ -15,7 +15,8 @@ import {
   type OverrideRoleInfo,
   type Unparsable,
 } from "../../src/ical/object.js";
-import type { IcalEnv, SlotKey } from "../../src/ical/values.js";
+import { iterateSlots } from "../../src/ical/slots.js";
+import { formatForModel, type IcalEnv, type SlotKey } from "../../src/ical/values.js";
 import { reorderOverridesFirst, yandexNormalize } from "../support/fakeCaldav.js";
 import * as seeds from "../support/seeds.js";
 
@@ -84,16 +85,52 @@ function roleOf(o: CalendarObject, component: ICAL.Component): OverrideRoleInfo 
   return info;
 }
 
+/** Серия Пн и Ср 09:00–10:00 МСК с 19.10.2026, COUNT=6. */
+const SERIES09 = ["DTSTART;TZID=Europe/Moscow:20261019T090000", "DTEND;TZID=Europe/Moscow:20261019T100000",
+  "RRULE:FREQ=WEEKLY;BYDAY=MO,WE;COUNT=6", "SUMMARY:Планёрка"];
+
+/** Переопределение серии Europe/Moscow на час с заголовком `summary`: RID и начало — стенное время МСК. */
+function named(summary: string, rid: string, start: string): string[] {
+  return vevent([`RECURRENCE-ID;TZID=Europe/Moscow:${rid}`, `DTSTART;TZID=Europe/Moscow:${start}`, "DURATION:PT1H",
+    `SUMMARY:${summary}`]);
+}
+
+/**
+ * Выдача конечной серии на уровне модели, по возрастанию фактического
+ * начала: «адрес → начало заголовок». Незакрытый слот — встреча слота
+ * (meetingAt) или основной компонент; detached — отдельная встреча по своему
+ * RECURRENCE-ID (у дублей — shownOverride); hidden не показывается.
+ */
+function visible(o: CalendarObject): string[] {
+  const rows: Array<[number, string]> = [];
+  const show = (address: ICAL.Time, component: ICAL.Component, start: ICAL.Time) => rows.push([start.toUnixTime(),
+    `${formatForModel(address, ENV, "instance")} → ${formatForModel(start, ENV, "time")} ${String(component.getFirstPropertyValue("summary"))}`]);
+  for (const slot of iterateSlots(o)) {
+    if (slot.excluded) continue;
+    const meeting = meetingAt(o, slot.key);
+    if (meeting) show(slot.time, meeting.shown, meeting.shown.getFirstPropertyValue("dtstart") as ICAL.Time);
+    else show(slot.time, o.master!, slot.time);
+  }
+  for (const refs of o.overrides.values()) {
+    const detached = refs.filter((ref) => o.roles.get(ref.component)?.role === "detached");
+    if (detached.length === 0) continue;
+    const shown = shownOverride(detached);
+    show(shown.recurrenceId, shown.component, shown.component.getFirstPropertyValue("dtstart") as ICAL.Time);
+  }
+  return rows.sort(([a], [b]) => a - b).map(([, row]) => row);
+}
+
 describe("loadObject: основной компонент по отсутствию RECURRENCE-ID (О1)", () => {
-  it("переопределение первым в файле не становится основным (C56, записано прежним кодом)", () => {
-    const o = load(seeds.c56StaleShift.ics);
+  it("переопределение первым в файле не становится основным", () => {
+    const o = load(calendar(MOSCOW, named("Перенос", "20261021T090000", "20261021T113000"), vevent(SERIES09)));
 
     expect(o.kind).toBe("series");
-    expect(o.uid).toBe(seeds.c56StaleShift.uid);
+    expect(o.uid).toBe(UID);
     expect(o.master?.hasProperty("recurrence-id")).toBe(false);
     expect(o.master?.getFirstPropertyValue("dtstart")?.toString()).toBe("2026-10-19T09:00:00");
     expect(o.form).toBe("zoned");
     expect(o.tzid).toBe("Europe/Moscow");
+    expect(roleOf(o, overridesOf(o)[0])).toMatchObject({ role: "slot", slot: at("2026-10-21T06:00:00Z") });
   });
 
   it("виды объектов: одиночное, серия, объект из одних переопределений", () => {
@@ -243,7 +280,7 @@ describe("loadObject: Unparsable (Р4)", () => {
   });
 });
 
-describe("роли переопределений (Р5) — строго по порядку правил", () => {
+describe("роли переопределений (Р5) — ровно три, строго по порядку: slot, hidden, detached", () => {
   it("RECURRENCE-ID на слоте — slot", () => {
     const o = load(calendar(MOSCOW, vevent(SERIES), moved("20261021T100000", "20261021T150000", "20261021T160000")));
     const [override] = overridesOf(o);
@@ -260,128 +297,24 @@ describe("роли переопределений (Р5) — строго по п
     const o = load(calendar(MOSCOW, vevent([...SERIES, ...extra]), moved(rid, "20261021T150000", "20261021T160000")));
     const [override] = overridesOf(o);
 
-    expect(roleOf(o, override).role).toBe("hidden");
-    expect(codes(o)).not.toContain("legacy-override");
+    expect(roleOf(o, override)).toEqual({ role: "hidden", ref: expect.anything() });
+    expect(o.anomalies).toEqual([]);
   });
 
-  it("C56: RECURRENCE-ID 10:00 после сдвига серии на 09:00 — stale-shift на слоте 09:00 той же даты", () => {
-    const o = load(seeds.c56StaleShift.ics);
-    const [override] = overridesOf(o);
-
-    expect(roleOf(o, override)).toMatchObject({ role: "stale-shift", slot: at("2026-10-21T06:00:00Z") });
-    expect(codes(o)).toEqual(["legacy-override"]);
-    expect(o.anomalies[0].key).toBe(at("2026-10-21T07:00:00Z"));
-  });
-
-  it("правило 2 раньше правила 3: RECURRENCE-ID под «пустым» EXDATE — hidden, а не stale-shift", () => {
-    const shifted = ["DTSTART;TZID=Europe/Moscow:20261019T090000", "DTEND;TZID=Europe/Moscow:20261019T100000",
-      "RRULE:FREQ=WEEKLY;BYDAY=MO,WE;COUNT=6", "EXDATE;TZID=Europe/Moscow:20261021T100000"];
-    const o = load(calendar(MOSCOW, vevent(shifted), moved("20261021T100000", "20261021T113000", "20261021T123000")));
+  it("правило 2 раньше правила 3: RECURRENCE-ID под «пустым» EXDATE мимо слотов — hidden, а не detached", () => {
+    const o = load(calendar(MOSCOW, vevent([...SERIES09, "EXDATE;TZID=Europe/Moscow:20261021T100000"]),
+      moved("20261021T100000", "20261021T113000", "20261021T123000")));
 
     expect(roleOf(o, overridesOf(o)[0]).role).toBe("hidden");
   });
 
-  it("stale-shift не назначается, если дату заявляют два переопределения или у слота своё переопределение", () => {
-    const shifted = ["DTSTART;TZID=Europe/Moscow:20261019T090000", "DTEND;TZID=Europe/Moscow:20261019T100000",
-      "RRULE:FREQ=WEEKLY;BYDAY=MO,WE;COUNT=6", "SUMMARY:Сдвинута"];
-    const twoClaims = load(calendar(MOSCOW, vevent(shifted),
-      moved("20261021T100000", "20261021T120000", "20261021T130000"),
-      moved("20261021T110000", "20261021T140000", "20261021T150000")));
-    const ownOverride = load(calendar(MOSCOW, vevent(shifted),
-      moved("20261021T090000", "20261021T093000", "20261021T103000"),
-      moved("20261021T100000", "20261021T120000", "20261021T130000")));
-
-    expect(overridesOf(twoClaims).map((c) => roleOf(twoClaims, c).role)).toEqual(["detached", "detached"]);
-    expect(overridesOf(ownOverride).map((c) => roleOf(ownOverride, c).role)).toEqual(["slot", "detached"]);
-  });
-
-  it("C55: второе переопределение с RID, равным новому времени первого, — echo на слоте первого", () => {
-    const o = load(seeds.c55EchoOverride.ics);
-    const [first, echo] = overridesOf(o);
-
-    expect(roleOf(o, first)).toMatchObject({ role: "slot", slot: at("2026-10-21T07:00:00Z") });
-    expect(roleOf(o, echo)).toMatchObject({ role: "echo", slot: at("2026-10-21T07:00:00Z"), via: first, root: first });
-    expect(codes(o)).toEqual(["legacy-override"]);
-    expect(o.anomalies[0].key).toBe(at("2026-10-21T12:00:00Z"));
-    expect(o.anomalies[0].components).toEqual([echo, first]);
-  });
-
-  it("цепочка эха сводится к слоту первого переопределения", () => {
-    const o = load(calendar(MOSCOW, vevent(SERIES),
-      moved("20261021T100000", "20261021T150000", "20261021T160000"),
-      moved("20261021T150000", "20261021T170000", "20261021T180000"),
-      moved("20261021T170000", "20261021T180000", "20261021T190000")));
-    const [first, echo1, echo2] = overridesOf(o);
-
-    expect(roleOf(o, echo1)).toMatchObject({ role: "echo", slot: at("2026-10-21T07:00:00Z"), via: first, root: first });
-    expect(roleOf(o, echo2)).toMatchObject({ role: "echo", slot: at("2026-10-21T07:00:00Z"), via: echo1, root: first });
-  });
-
-  it("эхо удалённой встречи скрыто вместе с ней", () => {
-    const o = load(calendar(MOSCOW, vevent([...SERIES, "EXDATE;TZID=Europe/Moscow:20261021T100000"]),
-      moved("20261021T100000", "20261021T150000", "20261021T160000"),
-      moved("20261021T150000", "20261021T150000", "20261021T160000")));
-
-    expect(overridesOf(o).map((c) => roleOf(o, c).role)).toEqual(["hidden", "hidden"]);
-  });
-
-  it("эхо встречи, перенесённой на другой день со слотом, — echo, а не stale-shift (прямое свидетельство эха)", () => {
-    // Серия Пн и Ср 10:00. O1 перенёс среду 21.10 на понедельник 26.10 15:00,
-    // затем прежний код правил её ещё раз и записал эхо с RID 26.10 15:00. В
-    // дате 26.10 ровно один слот (10:00), но RID эха равен DTSTART O1 — это
-    // правило 4, а не правило 3: иначе встреча понедельника пропала бы под
-    // эхом, а перенесённая среда показалась бы дважды.
-    const o = load(calendar(MOSCOW, vevent(SERIES),
-      moved("20261021T100000", "20261026T150000", "20261026T160000"),
-      vevent(["RECURRENCE-ID;TZID=Europe/Moscow:20261026T150000", "DTSTART;TZID=Europe/Moscow:20261026T160000",
-        "DTEND;TZID=Europe/Moscow:20261026T170000", "SUMMARY:Последняя правка"])));
-    const [first, echo] = overridesOf(o);
-
-    expect(roleOf(o, first)).toMatchObject({ role: "slot", slot: at("2026-10-21T07:00:00Z") });
-    expect(roleOf(o, echo)).toMatchObject({ role: "echo", slot: at("2026-10-21T07:00:00Z"), via: first, root: first });
-    expect(meetingAt(o, at("2026-10-21T07:00:00Z"))).toEqual({ shown: echo, components: [first, echo] });
-    expect(meetingAt(o, at("2026-10-26T07:00:00Z"))).toBeUndefined();
-    expect(codes(o)).toEqual(["legacy-override"]);
-  });
-
-  it("эхо скрытого переопределения (RID после конца серии) с RID на дату без слотов — hidden", () => {
-    // O1: RID 09.11 после конца серии (последняя — 04.11), перенесён на
-    // вторник 27.10 — в этой дате слотов нет. Эхо с RID 27.10 15:00 скрыто
-    // вместе с O1 (правило 4), правило 3 его не касается.
-    const o = load(calendar(MOSCOW, vevent(SERIES),
-      moved("20261109T100000", "20261027T150000", "20261027T160000"),
-      moved("20261027T150000", "20261027T160000", "20261027T170000")));
-
-    expect(overridesOf(o).map((c) => roleOf(o, c).role)).toEqual(["hidden", "hidden"]);
-    expect(codes(o)).not.toContain("legacy-override");
-  });
-
-  it("след сдвига серии на дату, единственный слот которой закрыт EXDATE, — hidden (правило 3, без эха)", () => {
-    const shifted = ["DTSTART;TZID=Europe/Moscow:20261019T090000", "DTEND;TZID=Europe/Moscow:20261019T100000",
-      "RRULE:FREQ=WEEKLY;BYDAY=MO,WE;COUNT=6", "EXDATE;TZID=Europe/Moscow:20261021T090000"];
-    const o = load(calendar(MOSCOW, vevent(shifted), moved("20261021T100000", "20261021T113000", "20261021T123000")));
-
-    expect(roleOf(o, overridesOf(o)[0]).role).toBe("hidden");
-    expect(codes(o)).not.toContain("legacy-override");
-  });
-
-  it("stale-shift у серии в America/New_York при поясе календаря Europe/Moscow: дата — в поясе DTSTART", () => {
-    // Пн и Ср 20:00 по Нью-Йорку — это вторник и четверг 03:00 по Москве.
-    // Прежний код сдвинул серию с 21:00 на 20:00; RID 21.10 21:00 NY по
-    // Москве — уже 22.10, где у серии слотов нет.
-    const o = load(calendar([],
-      vevent(["DTSTART;TZID=America/New_York:20261019T200000", "DURATION:PT1H", "RRULE:FREQ=WEEKLY;BYDAY=MO,WE;COUNT=6"]),
-      vevent(["RECURRENCE-ID;TZID=America/New_York:20261021T210000", "DTSTART;TZID=America/New_York:20261021T223000",
-        "DURATION:PT1H"])));
-
-    expect(roleOf(o, overridesOf(o)[0])).toMatchObject({ role: "stale-shift", slot: at("2026-10-22T00:00:00Z") });
-  });
-
-  it("настоящее оторванное переопределение — detached, без аномалии legacy-override", () => {
+  it("RECURRENCE-ID мимо слотов внутри серии — detached, без аномалий; адрес — его RECURRENCE-ID", () => {
     // Вторник 20.10: у серии Пн и Ср в эту дату слотов нет.
     const o = load(calendar(MOSCOW, vevent(SERIES), moved("20261020T100000", "20261020T120000", "20261020T130000")));
+    const info = roleOf(o, overridesOf(o)[0]);
 
-    expect(roleOf(o, overridesOf(o)[0]).role).toBe("detached");
+    expect(info).toEqual({ role: "detached", ref: expect.anything() });
+    expect(info.ref.key).toBe(at("2026-10-20T07:00:00Z"));
     expect(o.anomalies).toEqual([]);
   });
 
@@ -428,29 +361,28 @@ describe("роли переопределений (Р5) — строго по п
     expect(shownOverride(last.overrides.get(at("2026-10-21T07:00:00Z"))!).component).toBe(overridesOf(last)[1]);
   });
 
-  it("meetingAt: одна встреча слота — у эха показывается последнее в цепочке, у дублей — по SEQUENCE", () => {
-    const echo = load(calendar(MOSCOW, vevent(SERIES),
-      moved("20261021T100000", "20261021T150000", "20261021T160000"),
-      moved("20261021T150000", "20261021T170000", "20261021T180000"),
-      moved("20261021T170000", "20261021T180000", "20261021T190000")));
-    const [first, echo1, echo2] = overridesOf(echo);
-    const stale = load(seeds.c56StaleShift.ics);
+  it("meetingAt: встреча слота — его переопределения (у дублей показывается по SEQUENCE); hidden и detached — не встречи слота", () => {
     const duplicates = load(calendar(MOSCOW, vevent(SERIES),
       moved("20261021T100000", "20261021T150000", "20261021T160000", "SEQUENCE:1"),
       moved("20261021T100000", "20261021T170000", "20261021T180000", "SEQUENCE:3")));
+    const [low, high] = overridesOf(duplicates);
+    const other = load(calendar(MOSCOW, vevent([...SERIES, "EXDATE;TZID=Europe/Moscow:20261026T100000"]),
+      moved("20261026T100000", "20261026T150000", "20261026T160000"),
+      moved("20261020T100000", "20261020T120000", "20261020T130000")));
 
-    expect(meetingAt(echo, at("2026-10-21T07:00:00Z"))).toEqual({ shown: echo2, components: [first, echo1, echo2] });
-    expect(meetingAt(echo, at("2026-10-26T07:00:00Z"))).toBeUndefined();
-    expect(meetingAt(stale, at("2026-10-21T06:00:00Z"))?.shown).toBe(overridesOf(stale)[0]);
-    expect(meetingAt(duplicates, at("2026-10-21T07:00:00Z"))?.shown).toBe(overridesOf(duplicates)[1]);
+    expect(meetingAt(duplicates, at("2026-10-21T07:00:00Z"))).toEqual({ shown: high, components: [low, high] });
+    expect(meetingAt(duplicates, at("2026-10-26T07:00:00Z"))).toBeUndefined();
+    expect(overridesOf(other).map((c) => roleOf(other, c).role)).toEqual(["hidden", "detached"]);
+    expect(meetingAt(other, at("2026-10-26T07:00:00Z"))).toBeUndefined();
+    expect(meetingAt(other, at("2026-10-20T07:00:00Z"))).toBeUndefined();
   });
 
-  it("повторный осенний час: RECURRENCE-ID в UTC по RFC 5545 (первое вхождение) не теряется и не двоится", () => {
+  it("повторный осенний час: RECURRENCE-ID в UTC по RFC 5545 (первое вхождение) мимо ключа слота — detached, встреча не теряется", () => {
     // ical.js читает стенное 02:30 25.10 в Берлине как второе вхождение (CET,
     // 01:30Z), RFC 5545 §3.3.5 — как первое (CEST, 00:30Z); контракт — в
     // tests/ical/icaljs-contract.test.ts. RECURRENCE-ID другого клиента в UTC
-    // (00:30Z) мимо ключа слота, но в его стенной дате ровно один слот:
-    // встреча показывается один раз на своём слоте, с аномалией legacy-override.
+    // (00:30Z) не совпадает с ключом слота: встреча показывается отдельно по
+    // своему RECURRENCE-ID, а слот 02:30 — как обычная встреча серии.
     const text = calendar([], vevent(["DTSTART;TZID=Europe/Berlin:20261023T023000", "DURATION:PT30M",
       "RRULE:FREQ=DAILY;COUNT=5", "SUMMARY:Ночная"]),
     vevent(["RECURRENCE-ID:20261025T003000Z", "DTSTART:20261025T013000Z", "DURATION:PT30M", "SUMMARY:Перенос"]),
@@ -459,8 +391,9 @@ describe("роли переопределений (Р5) — строго по п
     const o = load(text);
     const [fold, regular] = overridesOf(o);
 
-    expect(roleOf(o, fold)).toMatchObject({ role: "stale-shift", slot: at("2026-10-25T01:30:00Z") });
+    expect(roleOf(o, fold)).toEqual({ role: "detached", ref: expect.anything() });
     expect(roleOf(o, regular)).toMatchObject({ role: "slot", slot: at("2026-10-26T01:30:00Z") });
+    expect(o.anomalies).toEqual([]);
   });
 
   it("у серии на весь день унаследованный RECURRENCE-ID в DATE-TIME попадает в слот своей даты", () => {
@@ -470,6 +403,155 @@ describe("роли переопределений (Р5) — строго по п
     const o = load(text);
 
     expect(roleOf(o, overridesOf(o)[0])).toMatchObject({ role: "slot", slot: "D:2026-10-21" });
+  });
+});
+
+describe("законные переносы, которые эвристика следов прежнего кода путала: ни одна встреча не пропадает, фантомов нет", () => {
+  // Серия Пн и Ср 09:00 МСК с 19.10.2026, COUNT=6: слоты 19.10, 21.10, 26.10,
+  // 28.10, 02.11, 04.11. Выдача — «адрес → фактическое начало, заголовок».
+  const plain = ["2026-10-19", "2026-10-21", "2026-10-26", "2026-10-28", "2026-11-02", "2026-11-04"]
+    .map((day) => `${day}T09:00:00+03:00 → ${day}T09:00:00+03:00 Планёрка`);
+  const row = (address: string, start: string, summary: string) => `2026-${address}:00+03:00 → 2026-${start}:00+03:00 ${summary}`;
+
+  it("P1: A — понедельник 26.10 перенесён на среду 28.10 10:00, B — среда 28.10 на четверг 29.10 10:00: обе slot", () => {
+    const o = load(calendar(MOSCOW, vevent(SERIES09),
+      named("A", "20261026T090000", "20261028T100000"),
+      named("B", "20261028T090000", "20261029T100000")));
+    const [a, b] = overridesOf(o);
+
+    expect(roleOf(o, a)).toMatchObject({ role: "slot", slot: at("2026-10-26T06:00:00Z") });
+    expect(roleOf(o, b)).toMatchObject({ role: "slot", slot: at("2026-10-28T06:00:00Z") });
+    expect(meetingAt(o, at("2026-10-26T06:00:00Z"))).toEqual({ shown: a, components: [a] });
+    expect(meetingAt(o, at("2026-10-28T06:00:00Z"))).toEqual({ shown: b, components: [b] });
+    expect(o.anomalies).toEqual([]);
+    expect(visible(o)).toEqual([
+      plain[0], plain[1],
+      row("10-26T09:00", "10-28T10:00", "A"),
+      row("10-28T09:00", "10-29T10:00", "B"),
+      plain[4], plain[5],
+    ]);
+  });
+
+  it.each([
+    ["в то же время", "20261028T090000", "20261026T090000", ["10-26T09:00", "10-28T09:00"]],
+    ["в другое время суток", "20261028T150000", "20261026T150000", ["10-26T15:00", "10-28T15:00"]],
+  ])("цикл: A — понедельник 26.10 на среду, B — среда 28.10 на понедельник (%s): обе slot, встречи поменялись местами", (
+    _label, startA, startB, [shownB, shownA],
+  ) => {
+    const o = load(calendar(MOSCOW, vevent(SERIES09),
+      named("A", "20261026T090000", startA),
+      named("B", "20261028T090000", startB)));
+    const [a, b] = overridesOf(o);
+
+    expect(overridesOf(o).map((c) => roleOf(o, c).role)).toEqual(["slot", "slot"]);
+    expect(meetingAt(o, at("2026-10-26T06:00:00Z"))).toEqual({ shown: a, components: [a] });
+    expect(meetingAt(o, at("2026-10-28T06:00:00Z"))).toEqual({ shown: b, components: [b] });
+    expect(o.anomalies).toEqual([]);
+    expect(visible(o)).toEqual([
+      plain[0], plain[1],
+      row("10-28T09:00", shownB, "B"),
+      row("10-26T09:00", shownA, "A"),
+      plain[4], plain[5],
+    ]);
+  });
+
+  it("RECURRENCE-ID B равен новому началу A, и оба на слотах: обе slot", () => {
+    // A: понедельник 26.10 перенесён ровно на время среды 28.10 09:00; B:
+    // среда 28.10 перенесена на четверг. RID B = DTSTART A.
+    const o = load(calendar(MOSCOW, vevent(SERIES09),
+      named("A", "20261026T090000", "20261028T090000"),
+      named("B", "20261028T090000", "20261029T100000")));
+    const [a, b] = overridesOf(o);
+
+    expect(overridesOf(o).map((c) => roleOf(o, c).role)).toEqual(["slot", "slot"]);
+    expect(meetingAt(o, at("2026-10-26T06:00:00Z"))?.shown).toBe(a);
+    expect(meetingAt(o, at("2026-10-28T06:00:00Z"))?.shown).toBe(b);
+    expect(visible(o)).toEqual([
+      plain[0], plain[1],
+      row("10-26T09:00", "10-28T09:00", "A"),
+      row("10-28T09:00", "10-29T10:00", "B"),
+      plain[4], plain[5],
+    ]);
+  });
+
+  it("RECURRENCE-ID одного равен новому началу другого, и оба мимо слотов: обе detached, показаны обе", () => {
+    // Похоже на след сдвига серии с 10:00 на 09:00: A — RID 26.10 10:00 →
+    // 28.10 10:00, B — RID 28.10 10:00 (= DTSTART A) → 29.10 10:00. Прежняя
+    // эвристика прятала A и ставила на слот среды фантом основного компонента.
+    const o = load(calendar(MOSCOW, vevent(SERIES09),
+      named("A", "20261026T100000", "20261028T100000"),
+      named("B", "20261028T100000", "20261029T100000")));
+
+    expect(overridesOf(o).map((c) => roleOf(o, c).role)).toEqual(["detached", "detached"]);
+    expect(meetingAt(o, at("2026-10-26T06:00:00Z"))).toBeUndefined();
+    expect(meetingAt(o, at("2026-10-28T06:00:00Z"))).toBeUndefined();
+    expect(o.anomalies).toEqual([]);
+    expect(visible(o)).toEqual([
+      plain[0], plain[1], plain[2], plain[3],
+      row("10-26T10:00", "10-28T10:00", "A"),
+      row("10-28T10:00", "10-29T10:00", "B"),
+      plain[4], plain[5],
+    ]);
+  });
+
+  it("цикл мимо слотов (A: Пн 10:00 → Ср 10:00, B: Ср 10:00 → Пн 10:00): обе detached, фантомов на слотах нет", () => {
+    const o = load(calendar(MOSCOW, vevent(SERIES09),
+      named("A", "20261026T100000", "20261028T100000"),
+      named("B", "20261028T100000", "20261026T100000")));
+
+    expect(overridesOf(o).map((c) => roleOf(o, c).role)).toEqual(["detached", "detached"]);
+    expect(visible(o)).toEqual([
+      plain[0], plain[1], plain[2],
+      row("10-28T10:00", "10-26T10:00", "B"),
+      plain[3],
+      row("10-26T10:00", "10-28T10:00", "A"),
+      plain[4], plain[5],
+    ]);
+  });
+
+  it("RECURRENCE-ID detached равен новому началу переопределения слота: показаны обе, встреча понедельника на месте", () => {
+    // O1: среда 21.10 перенесена на понедельник 26.10 15:00; O2 — RID 26.10
+    // 15:00 (= DTSTART O1) → 16:00. Прежняя эвристика принимала O2 за эхо O1
+    // (а до того — за сдвиг серии на слот понедельника, прятавший его встречу).
+    const o = load(calendar(MOSCOW, vevent(SERIES09),
+      named("O1", "20261021T090000", "20261026T150000"),
+      named("O2", "20261026T150000", "20261026T160000")));
+    const [o1, o2] = overridesOf(o);
+
+    expect(roleOf(o, o1)).toMatchObject({ role: "slot", slot: at("2026-10-21T06:00:00Z") });
+    expect(roleOf(o, o2).role).toBe("detached");
+    expect(meetingAt(o, at("2026-10-21T06:00:00Z"))).toEqual({ shown: o1, components: [o1] });
+    expect(meetingAt(o, at("2026-10-26T06:00:00Z"))).toBeUndefined();
+    expect(visible(o)).toEqual([
+      plain[0], plain[2],
+      row("10-21T09:00", "10-26T15:00", "O1"),
+      row("10-26T15:00", "10-26T16:00", "O2"),
+      plain[3], plain[4], plain[5],
+    ]);
+  });
+
+  it("два переопределения мимо слотов в одну дату и переопределение слота рядом со «сдвинутым» RID — всё показывается как есть", () => {
+    const twoOnDate = load(calendar(MOSCOW, vevent(SERIES09),
+      named("X", "20261021T100000", "20261021T120000"),
+      named("Y", "20261021T110000", "20261021T140000")));
+    const withOwn = load(calendar(MOSCOW, vevent(SERIES09),
+      named("S", "20261021T090000", "20261021T093000"),
+      named("D", "20261021T100000", "20261021T120000")));
+
+    expect(overridesOf(twoOnDate).map((c) => roleOf(twoOnDate, c).role)).toEqual(["detached", "detached"]);
+    expect(visible(twoOnDate)).toEqual([
+      plain[0], plain[1],
+      row("10-21T10:00", "10-21T12:00", "X"),
+      row("10-21T11:00", "10-21T14:00", "Y"),
+      plain[2], plain[3], plain[4], plain[5],
+    ]);
+    expect(overridesOf(withOwn).map((c) => roleOf(withOwn, c).role)).toEqual(["slot", "detached"]);
+    expect(visible(withOwn)).toEqual([
+      plain[0],
+      row("10-21T09:00", "10-21T09:30", "S"),
+      row("10-21T10:00", "10-21T12:00", "D"),
+      plain[2], plain[3], plain[4], plain[5],
+    ]);
   });
 });
 
@@ -492,17 +574,18 @@ describe("blockingAnomalies (О14)", () => {
     expect(blockingAnomalies(o, "delete", "all_series")).toEqual([]);
   });
 
-  it("legacy-override: t&f и all_series — отказ; update this встречи — только без confirm; delete this — можно", () => {
-    const o = load(seeds.c55EchoOverride.ics);
-    const slot = at("2026-10-21T07:00:00Z");
+  it("detached и hidden запись не блокируют: аномалии «след прежнего кода» больше нет", () => {
+    const o = load(calendar(MOSCOW, vevent([...SERIES09, "EXDATE;TZID=Europe/Moscow:20261028T090000"]),
+      named("D", "20261021T100000", "20261021T113000"),
+      named("H", "20261028T090000", "20261028T120000")));
+    const rid = at("2026-10-21T07:00:00Z");
 
-    expect(blockingAnomalies(o, "update", "all_series").map((a) => a.code)).toEqual(["legacy-override"]);
-    expect(blockingAnomalies(o, "delete", "this_and_following", { key: slot, split: true }).map((a) => a.code))
-      .toEqual(["legacy-override"]);
-    expect(blockingAnomalies(o, "update", "this", { key: slot }).map((a) => a.code)).toEqual(["legacy-override"]);
-    expect(blockingAnomalies(o, "update", "this", { key: slot, confirm: true })).toEqual([]);
-    expect(blockingAnomalies(o, "update", "this", { key: at("2026-10-26T07:00:00Z") })).toEqual([]);
-    expect(blockingAnomalies(o, "delete", "this", { key: slot })).toEqual([]);
+    expect(overridesOf(o).map((c) => roleOf(o, c).role)).toEqual(["detached", "hidden"]);
+    expect(o.anomalies).toEqual([]);
+    expect(blockingAnomalies(o, "update", "all_series")).toEqual([]);
+    expect(blockingAnomalies(o, "update", "this", { key: rid })).toEqual([]);
+    expect(blockingAnomalies(o, "delete", "this", { key: rid })).toEqual([]);
+    expect(blockingAnomalies(o, "delete", "this_and_following", { key: at("2026-10-26T06:00:00Z"), split: true })).toEqual([]);
   });
 
   it("duplicate-override блокирует только цель в своём слоте и не блокирует delete this", () => {
@@ -577,7 +660,16 @@ describe("semanticDigest (Р8): по смыслу, а не по тексту", (
   const normalize = (ics: string) => yandexNormalize(ics, {
     owner: "user@yandex.ru", calendarName: "Мои события", stamp: "20261002T100000Z", countToUntil: true });
 
-  it.each([...seeds.cleanSeeds, ...seeds.legacySeeds].map((seed) => [seed.about, seed.ics]))(
+  const withOverrides: Array<[string, string]> = [
+    ["переносы P1: обе slot", calendar(MOSCOW, vevent(SERIES09),
+      named("A", "20261026T090000", "20261028T100000"), named("B", "20261028T090000", "20261029T100000"))],
+    ["цикл переносов понедельник ↔ среда", calendar(MOSCOW, vevent(SERIES09),
+      named("A", "20261026T090000", "20261028T090000"), named("B", "20261028T090000", "20261026T090000"))],
+    ["detached и hidden", calendar(MOSCOW, vevent([...SERIES09, "EXDATE;TZID=Europe/Moscow:20261028T090000"]),
+      named("D", "20261021T100000", "20261021T113000"), named("H", "20261028T090000", "20261028T120000"))],
+  ];
+
+  it.each([...seeds.cleanSeeds.map((seed): [string, string] => [seed.about, seed.ics]), ...withOverrides])(
     "не меняется от нормализации «как Яндекс»: %s",
     (_about, ics) => {
       expect(semanticDigest(normalize(ics), ENV)).toBe(semanticDigest(ics, ENV));
@@ -659,6 +751,49 @@ describe("semanticDigest (Р8): по смыслу, а не по тексту", (
       expect(semanticDigest(since2024("EXDATE:20261021T070000Z"), ENV)).toBe(inZone);
       expect(semanticDigest(since2024("EXDATE;TZID=Europe/Moscow:20261021T113000"), ENV)).toBe(semanticDigest(since2024(), ENV));
     });
+  });
+
+  describe("EXDATE дальше предела прохода и после сбоя перебора (ветка unscanned)", () => {
+    // HOURLY с 01.01.2000: до 21.10.2026 больше 200 000 слотов (SERIES_CAP).
+    // Проход до EXDATE обрывается пределом, и EXDATE входит в дайджест как
+    // есть, приведённым к форме серии. Дайджест такого объекта считается
+    // около секунды, поэтому одинаковые тексты считаются один раз.
+    const since2000 = (...extra: string[]) => calendar(MOSCOW, vevent(["DTSTART;TZID=Europe/Moscow:20000101T100000",
+      "DURATION:PT30M", "RRULE:FREQ=HOURLY", "SUMMARY:Ежечасная с 2000 года", ...extra]));
+    const known = new Map<string, string>();
+    const digest = (ics: string) => {
+      const found = known.get(ics) ?? semanticDigest(ics, ENV);
+      known.set(ics, found);
+      return found;
+    };
+    const exdate = since2000("EXDATE;TZID=Europe/Moscow:20261021T100000");
+
+    it("EXDATE 21.10.2026 у HOURLY с 2000 года меняет дайджест; другой EXDATE — другой дайджест", () => {
+      expect(digest(exdate)).not.toBe(digest(since2000()));
+      expect(digest(since2000("EXDATE;TZID=Europe/Moscow:20261022T100000"))).not.toBe(digest(exdate));
+    }, 60_000);
+
+    it("EXDATE в UTC и в TZID серии — один дайджест", () => {
+      expect(digest(since2000("EXDATE:20261021T070000Z"))).toBe(digest(exdate));
+    }, 60_000);
+
+    it("нормализация «как Яндекс» дайджест не меняет", () => {
+      expect(digest(normalize(exdate))).toBe(digest(exdate));
+    }, 60_000);
+
+    it("правило застревает посреди серии: EXDATE после места застревания меняет дайджест, форма EXDATE — нет", () => {
+      // Позиции 29.02.2028 10:00:00 и 10:00:01 UTC, следующая — через четыре
+      // года: итератор ical.js ищет её посекундно и упирается в
+      // предохранитель, перебор обрывается SlotScanError посреди прохода.
+      const stalled = (...extra: string[]) => calendar([], vevent(["DTSTART:20280229T100000Z", "DURATION:PT1S",
+        "RRULE:FREQ=SECONDLY;BYMONTH=2;BYMONTHDAY=29;BYHOUR=10;BYMINUTE=0;BYSECOND=0,1", "SUMMARY:Две секунды", ...extra]));
+      const utc = digest(stalled("EXDATE:20320229T100000Z"));
+
+      expect(load(stalled()).anomalies).toEqual([]); // первые две позиции есть — правило пригодно
+      expect(utc).not.toBe(digest(stalled()));
+      expect(digest(stalled("EXDATE;TZID=Europe/Moscow:20320229T130000"))).toBe(utc);
+      expect(digest(stalled("EXDATE:20360229T100000Z"))).not.toBe(utc);
+    }, 60_000);
   });
 
   it("RECURRENCE-ID в UTC и в TZID серии — один дайджест", () => {

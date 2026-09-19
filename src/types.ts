@@ -60,7 +60,9 @@ export interface Attendee {
 export type EventStatus = "tentative" | "confirmed" | "cancelled";
 
 /**
- * Состояние записи в `CalendarEvent.exceptions` (решения Р5–Р7 плана):
+ * Состояние записи в `CalendarEvent.exceptions` (решения Р5–Р7 плана;
+ * роли переопределений — ровно три: slot, hidden, detached, поправка
+ * «без ремонта следов прежнего кода» от 19.09.2026):
  * - "changed" — переопределение слота с прежним временем, другие поля;
  * - "moved" — переопределение слота, перенесённое на другое время;
  * - "cancelled" — переопределение со STATUS:CANCELLED, время не занимает;
@@ -69,10 +71,8 @@ export type EventStatus = "tentative" | "confirmed" | "cancelled";
  *   серии: в list_events и find_free_slots его нет, удаляется delete this
  *   по своему адресу;
  * - "detached" — RECURRENCE-ID мимо слотов: показывается отдельной
- *   встречей и занимает время (в том числе объект без основного
- *   компонента, Р6);
- * - "legacy" — след прежнего кода (эхо переноса или сдвиг серии мимо
- *   переопределения), аномалия legacy-override;
+ *   встречей по адресу своего RECURRENCE-ID и занимает время (в том числе
+ *   объект без основного компонента, Р6);
  * - "duplicate" — лишний компонент с тем же RECURRENCE-ID.
  */
 export type ExceptionState =
@@ -82,14 +82,14 @@ export type ExceptionState =
   | "excluded"
   | "hidden"
   | "detached"
-  | "legacy"
   | "duplicate";
 
 /** Отступление серии от её правила — запись в `CalendarEvent.exceptions` (get_event). */
 export interface EventException {
   /**
    * Адрес для update_event и delete_event со scope "this" в формате Р10:
-   * слот, а у скрытого или лишнего компонента — его RECURRENCE-ID.
+   * слот, а у скрытого, оторванного или лишнего компонента — его
+   * RECURRENCE-ID.
    */
   instanceStart: string;
   state: ExceptionState;
@@ -145,13 +145,16 @@ export interface CalendarEvent {
   status?: EventStatus;
   /** Фактическое начало встречи отличается от её слота `instanceStart` (Р10). */
   moved?: boolean;
-  /** Переопределение вне слотов серии или из объекта без основного компонента (Р5, Р6). */
+  /**
+   * Переопределение вне слотов серии или из объекта без основного
+   * компонента (Р5, Р6); `instanceStart` у него — его RECURRENCE-ID.
+   */
   detached?: boolean;
   /** Отступления серии от правила; заполняет get_event. */
   exceptions?: EventException[];
   /**
    * Аномалии объекта в виде "код: пояснение", например
-   * "unparsable: …" или "legacy-override: …" (О14, Р4, Р5, Р12).
+   * "unparsable: …" или "duplicate-override: …" (О14, Р4, Р5).
    */
   anomalies?: string[];
 }
