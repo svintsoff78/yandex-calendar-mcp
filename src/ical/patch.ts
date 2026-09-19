@@ -435,7 +435,8 @@ export interface TimePlan {
    * Конец встречи после патча — тот, по которому проверено «конец позже
    * начала». При DURATION — начало плюс DURATION по RFC 5545, как её читает
    * выдача (instances.ts); при DTEND — его момент. undefined — у события нет
-   * конца. Для сведения: пишется только `dtend` или `duration`.
+   * конца. Только для сведения — проверки «конец позже начала» и тестов:
+   * `writeTimes` поле не читает, пишутся только `dtend` или `duration`.
    */
   end?: ICAL.Time;
   /** Форма со временем сменила пояс или форму (timeZone). */
@@ -458,9 +459,11 @@ export interface TimePlan {
  *   нового пояса), а не процесса; стенное время из разрыва весеннего
  *   перевода — отказ, как у сборки (build.ts, timedValue);
  * - `timeZone` без `start` сохраняет моменты: DTSTART и DTEND переписываются
- *   стенным временем нового пояса; DURATION — только если в новом поясе она
- *   дала бы другой конец (сутки через перевод часов в одном из поясов);
- *   UTC, GMT и Z — форма UTC (как build.ts);
+ *   стенным временем нового пояса; DURATION одиночной встречи или
+ *   переопределения — только если в новом поясе она дала бы другой конец
+ *   (сутки через перевод часов в одном из поясов); DURATION серии (RRULE или
+ *   RDATE) не меняется — это длительность всех встреч, и конец первой —
+ *   новое начало плюс она (О5); UTC, GMT и Z — форма UTC (как build.ts);
  *   у события в неизвестном поясе момент не определён — отказ
  *   `unknown-timezone` (как и у `start` и `end` в этом поясе);
  * - `allDay: true` без `start` — дата начала события; конец — день после
@@ -489,6 +492,9 @@ export function resolveTimes(c: ICAL.Component, p: FieldPatch, ctx: PatchContext
   // DURATION, которая задаёт конец: при DTEND выдача читает DTEND (instances.ts, timesOf).
   const ownValue = dtendProperty ? undefined : durationProperty?.getFirstValue();
   const ownDuration = ownValue instanceof ICAL.Duration ? ownValue : undefined;
+  // DURATION серии (RRULE или RDATE) — длительность всех её встреч, а не
+  // конец первой: смена пояса её не пересчитывает (О5).
+  const series = c.hasProperty("rrule") || c.hasProperty("rdate");
 
   // Целевая форма. Время в неизвестном поясе ical.js прочёл плавающим
   // (unknownZone): стенное время известно, момент — нет. Новое время в этом
@@ -539,7 +545,7 @@ export function resolveTimes(c: ICAL.Component, p: FieldPatch, ctx: PatchContext
   else if (oldEnd === undefined) end = undefined;
   else if (toDate) end = addDays(start, allDaySpan(oldStart, oldEnd, current, env));
   // DURATION остаётся: конец — новое начало плюс она, как прочтёт выдача.
-  else if (ownDuration && p.start !== undefined) end = afterDuration(start, ownDuration, env);
+  else if (ownDuration && (p.start !== undefined || series)) end = afterDuration(start, ownDuration, env);
   // DTEND — та же точная длительность; смена пояса без start — тот же момент конца.
   else end = keepDuration(oldStart, oldEnd, start, target, env);
 
@@ -559,10 +565,12 @@ export function resolveTimes(c: ICAL.Component, p: FieldPatch, ctx: PatchContext
   if (durationProperty) {
     // DURATION сохраняет длительность сама; пересчёт — только при явном
     // end или смене «весь день» (длительность в днях или секундах), а у
-    // смены пояса без start — ради момента конца: сутки DURATION в новом
-    // поясе могут быть другой длины. writeTimes пишет её, только если конец
-    // по ней другой.
-    const keepsMoments = ownDuration !== undefined && p.start === undefined && !sameFrame;
+    // одиночной встречи или переопределения при смене пояса без start — ради
+    // момента конца: сутки DURATION в новом поясе могут быть другой длины.
+    // У серии — нет: DURATION действует на все встречи, а момент конца по
+    // первой дал бы другую длительность каждой (О5). writeTimes пишет её,
+    // только если конец по ней другой.
+    const keepsMoments = ownDuration !== undefined && p.start === undefined && !sameFrame && !series;
     if (end !== undefined && (p.end !== undefined || toDate || fromDate || keepsMoments)) plan.duration = durationBetween(start, end, env);
   } else if (dtendProperty) {
     if (end !== undefined) {
@@ -899,30 +907,59 @@ function allDaySpan(oldStart: ICAL.Time, oldEnd: ICAL.Time, frame: Frame, env: I
  * (duration.js:186, fromSeconds), а сутки номинальные — 26 часов с 27.03
  * 10:00 CET стали бы P1DT2H, то есть 28.03 12:00 CEST вместо 13:00. Без
  * перевода часов между началом и концом результат тот же, что у fromSeconds
- * (P1DT2H, P1W). Если подходящих суток нет (конец не позже начала или
- * необычный перевод), — точные часы, минуты и секунды без суток.
+ * (P1DT2H, P1W). Сутки годятся, только если кончаются в однозначном стенном
+ * времени (`readOnce`): иначе другой клиент прочтёт конец на час иначе, чем
+ * выдача. Если подходящих суток нет (конец не позже начала, сутки кончаются
+ * в разрыве или повторном часе, остаток не меньше суток), — точные часы,
+ * минуты и секунды без суток: их все читают одинаково.
  */
 function durationBetween(start: ICAL.Time, end: ICAL.Time, env: IcalEnv): ICAL.Duration {
   if (start.isDate && end.isDate) return ICAL.Duration.fromData({ days: dayNumber(end) - dayNumber(start) });
   const exact = (instantOf(end, env) - instantOf(start, env)) / 1000;
   if (exact <= 0 || start.isDate) return ICAL.Duration.fromSeconds(exact);
-  // Стенная разница — в форме и поясе начала (time.js:1055, subtractDate).
-  // Целых стенных суток в ней — столько же или на одни больше или меньше:
-  // переводы часов сдвигают остаток лишь на свою величину.
+  // Целые стенные сутки — в форме и поясе начала (time.js:1055, subtractDate).
+  // Другие числа суток не пробуются: на одни больше годится, только когда
+  // сутки кончаются в разрыве весеннего перевода, на одни меньше — только
+  // когда `days` суток отброшены `readOnce`; точные часы там надёжнее.
   const frame = frameOfTime(start);
-  const wall = timeInForm(end, frame.form, frame.zone, env).subtractDate(start).toSeconds();
-  const whole = Math.floor(wall / DAY_SECONDS);
-  for (const days of [whole, whole - 1, whole + 1]) {
-    if (days < 1) continue;
+  const days = Math.floor(timeInForm(end, frame.form, frame.zone, env).subtractDate(start).toSeconds() / DAY_SECONDS);
+  if (days >= 1) {
     const middle = start.clone();
     middle.adjust(days, 0, 0, 0);
     const rest = (instantOf(end, env) - instantOf(middle, env)) / 1000;
     // При 0 ≤ rest < суток fromSeconds раскладывает ровно на `days` суток и остаток.
-    if (rest >= 0 && rest < DAY_SECONDS) return ICAL.Duration.fromSeconds(days * DAY_SECONDS + rest);
+    if (rest >= 0 && rest < DAY_SECONDS && readOnce(middle, env)) return ICAL.Duration.fromSeconds(days * DAY_SECONDS + rest);
   }
   const hours = Math.trunc(exact / 3600);
   const minutes = Math.trunc((exact - hours * 3600) / 60);
   return ICAL.Duration.fromData({ hours, minutes, seconds: exact - hours * 3600 - minutes * 60 });
+}
+
+/**
+ * Стенное время `t` означает один момент — и для ical.js, и по RFC 5545
+ * §3.3.5. Время из разрыва весеннего перевода ical.js читает со смещением
+ * после разрыва, RFC — до него; время повторного часа осеннего перевода
+ * ical.js читает вторым вхождением (timezone.js:346-356, `want_daylight =
+ * false`), RFC — первым. Проба — как у values.ts, atInstant: смещения, с
+ * которыми ical.js читает то же стенное время за сутки до, в сам день и через
+ * сутки (time.js:1136, utcOffset). Каждое даёт момент; однозначно время, если
+ * ровно один из них записывается тем же стенным временем. Сутки после нужны
+ * поясу, у которого ical.js читает повторный час первым вхождением (переход
+ * на меньшее смещение в DAYLIGHT, то же место timezone.js); в поясах тестов
+ * такого нет. У UTC, плавающего времени и дат перевода часов нет.
+ */
+function readOnce(t: ICAL.Time, env: IcalEnv): boolean {
+  if (formOf(t) !== "zoned") return true;
+  const frame = frameOfTime(t);
+  const wall = dayNumber(t) * DAY_SECONDS + t.hour * 3600 + t.minute * 60 + t.second;
+  const moments = new Set<number>();
+  for (const shift of [-1, 0, 1]) {
+    const probe = t.clone();
+    probe.adjust(shift, 0, 0, 0);
+    const moment = wall - probe.utcOffset();
+    if (atSeconds(moment, frame, env).toString() === t.toString()) moments.add(moment);
+  }
+  return moments.size === 1;
 }
 
 // Значение свойства совпадает с `time` в записи: форма, jCal-строка и TZID.
