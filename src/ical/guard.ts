@@ -55,9 +55,12 @@ import {
  *   можно: правка без recurrence меняет в RRULE только конец (UNTIL,
  *   COUNT), у оставшихся участников — только PARTSTAT (О9). Поля
  *   переопределений — по О7: своё значение (не равное прежнему основному)
- *   остаётся, унаследованное следует за новым основным. Время клона и
- *   основного продолжения, когда патч времени не трогает, — по О6: начало
- *   на слоте, длительность основного;
+ *   остаётся, унаследованное следует за новым основным (у скрытого —
+ *   только своё значение: встречи у него нет). Время клона и основного
+ *   продолжения, когда патч времени не трогает, — по О6: начало на слоте
+ *   (у продолжения — на B, и при смене повтора), длительность основного; у
+ *   цели правки и у основного при `start` без `end` — прежняя
+ *   длительность (О8);
  * - (в) видимые встречи после записи — прежние через `keyMap` минус
  *   `removed`: ни одна не пропала и не появилась, переопределение осталось
  *   переопределением, EXDATE не снят; без правки повтора даты встреч
@@ -205,6 +208,13 @@ export interface GuardOptions {
    * RRULE). Без него предохранитель верит `expect.fields`, но и тогда
    * поля у удаления не учитываются, а RDATE, EXDATE и RRULE сверяются
    * независимо от полей.
+   *
+   * Контракт с оркестрацией (З13): у `op: "update"` патч передаётся всегда.
+   * Без него заявленное планировщиком поле отключает проверку молча —
+   * лишний `start` в `expect.fields` освобождает время клона и цели (О6,
+   * О8), лишний `end` — их конец. Обязательным параметр здесь не сделан,
+   * чтобы отказ предохранителя оставался отказом плана, а не вызова: с
+   * `op: "delete"` патча нет вовсе.
    */
   patch?: EventPatch;
 }
@@ -246,7 +256,9 @@ const LIST_LIMIT = 8;
  *   RECURRENCE-ID от B, перенесённая раньше B (у delete), и спрятанная
  *   усечением оторванная; у смены повтора — видимое переопределение без
  *   пары в новом правиле (О11: такие потери — только с confirm, и
- *   пользователь о них узнаёт);
+ *   пользователь о них узнаёт). И наоборот: встречи, которую операция не
+ *   убирает, там быть не должно — ответ не объявляет удалённым то, что
+ *   останется в календаре;
  * - `touched.names` — по компоненту дерева после правки: имена изменённых
  *   свойств и подкомпонентов; `touched.components` — снятые и добавленные
  *   VEVENT. Компоненты сопоставляются по UID и RECURRENCE-ID как записаны;
@@ -282,6 +294,7 @@ export function verifyPlan(beforeIcs: string, plan: WritePlan, env: IcalEnv, opt
   // встречи план убрал под его прикрытием.
   if (findings.list.some((problem) => problem.code === "blocked")) findings.throwIfAny();
   checkLossesReported(ctx, plan);
+  checkReportedRemovals(ctx, plan);
 
   switch (plan.kind) {
     case "delete-object":
@@ -337,6 +350,10 @@ interface Ctx {
   datesMustStay: boolean;
   /** `removed` плана, ограниченный операцией (лишнее — plan-shape и не учитывается). */
   removed: ReadonlySet<SlotKey>;
+  /** Операция вправе убрать встречу с этим ключом (та же граница, что у `removed`). */
+  removalAllowed(key: SlotKey): boolean;
+  /** Чем операция ограничена — для сообщений; пусто у delete all_series. */
+  removalRule: string;
   /** Цель (у t&f — граница B), в ключах прочитанного объекта. */
   target?: SlotKey;
   /** Разрез: граница B; ключи раньше неё остаются в исходной серии как есть. */
@@ -410,7 +427,7 @@ function makeContext(
   };
 
   const target = expect.target ?? boundary;
-  const removed = boundRemoved(before, expect, { recurrence, target, split: plan.kind === "split" }, findings);
+  const removal = boundRemoved(before, expect, { recurrence, target, split: plan.kind === "split" }, findings);
 
   return {
     env,
@@ -422,7 +439,9 @@ function makeContext(
     time,
     recurrence,
     datesMustStay: expect.datesFixed || expect.op === "delete" || !recurrence,
-    removed,
+    removed: removal.kept,
+    removalAllowed: removal.allowed,
+    removalRule: removal.rule,
     target,
     boundary,
     touchedNames,
@@ -449,13 +468,25 @@ function makeContext(
  * object.ts: вне протяжённости серии) — потеря сверх цели, только с
  * confirm. Лишние ключи — plan-shape, и дальше проверки идут без них:
  * встреча, которую план убрал под их прикрытием, найдётся как пропавшая.
+ *
+ * Та же граница нужна и ответу (`plan.removed`, checkReportedRemovals),
+ * поэтому возвращается не только отобранное множество, но и сам предикат.
  */
+interface Removal {
+  /** Ключи `expect.removed`, которые операция вправе убрать. */
+  kept: Set<SlotKey>;
+  /** Операция вправе убрать встречу с этим ключом. */
+  allowed(key: SlotKey): boolean;
+  /** Чем операция ограничена — для сообщений; пусто у delete all_series. */
+  rule: string;
+}
+
 function boundRemoved(
   before: CalendarObject,
   expect: Expectation,
   known: { recurrence: boolean; target?: SlotKey; split: boolean },
   findings: Findings,
-): Set<SlotKey> {
+): Removal {
   const { op, scope } = expect;
   const { target } = known;
   const atOrAfter = (key: SlotKey) => target !== undefined && sameKind(key, target) && compareSlotKeys(key, target) >= 0;
@@ -501,7 +532,7 @@ function boundRemoved(
   if (extra.length > 0) {
     findings.add("plan-shape", `План называет убранными встречи ${listed(extra)}, а ${rule}: лишнее в removed не учитывается.`);
   }
-  return kept;
+  return { kept, allowed, rule };
 }
 
 // Последний слот (закрытый — тоже) раньше `b`; null — таких нет или проход не удался.
@@ -557,6 +588,62 @@ function checkLossesReported(ctx: Ctx, plan: WritePlan): void {
       "plan-shape",
       `План снимает сверх названной цели встречи ${listed(silent)}, а в ответе (plan.removed) их нет: пользователь не узнал бы о потере (О11).`,
     );
+  }
+}
+
+/**
+ * О11 в обратную сторону: ответ (`plan.removed`) не называет убранной
+ * встречу, которую операция не убирает. Иначе пользователь прочёл бы
+ * «удалена», а встреча осталась бы в календаре — ошибка не менее вредная,
+ * чем молчание о настоящей потере.
+ *
+ * Сверяется по той же границе операции, что и `expect.removed`
+ * (`removalAllowed`), а не по слову планировщика: у delete all_series
+ * убирается всё, у delete t&f — встречи от B, у delete this — цель и
+ * скрытые, у смены повтора — прежние переопределения. Строка без
+ * разбираемого адреса (Р10) ничего не называет и пропускается; адрес, под
+ * которым до записи не было видимой встречи, — тоже: у Loss бывают строки
+ * не про встречи этого объекта.
+ */
+function checkReportedRemovals(ctx: Ctx, plan: WritePlan): void {
+  const { before } = ctx;
+  const extra: string[] = [];
+  const seen = new Set<SlotKey>();
+  for (const loss of plan.removed) {
+    let key: SlotKey;
+    try {
+      key = parseAddress(before, loss.instanceStart);
+    } catch {
+      continue;
+    }
+    if (seen.has(key) || ctx.removed.has(key) || key === ctx.target || ctx.removalAllowed(key)) continue;
+    if (!visibleBefore(ctx, key)) continue;
+    seen.add(key);
+    extra.push(describeKey(before, key));
+  }
+  if (extra.length > 0) {
+    ctx.findings.add(
+      "plan-shape",
+      `Ответ (plan.removed) называет убранными встречи ${listed(extra)}, а ${ctx.removalRule || `${ctx.expect.op} ${ctx.expect.scope} их не убирает`}: ` +
+        `они остаются в календаре, а пользователь прочёл бы, что их удалили (О11).`,
+    );
+  }
+}
+
+/** До записи по этому адресу видна встреча: незакрытый слот или своё переопределение (slot, detached). */
+function visibleBefore(ctx: Ctx, key: SlotKey): boolean {
+  const refs = ctx.before.overrides.get(key);
+  if (refs && refs.length > 0) {
+    const role = roleOf(ctx.before, refs);
+    return role === "slot" || role === "detached";
+  }
+  if (!ctx.before.master) return false;
+  try {
+    const slot = findSlot(ctx.before, key);
+    return slot !== undefined && !slot.excluded;
+  } catch (error) {
+    if (!(error instanceof SlotScanError)) throw error;
+    return false; // Дальше предела прохода — не нам судить.
   }
 }
 
@@ -1173,7 +1260,14 @@ function compareTrees(ctx: Ctx, after: CalendarObject, options: TreeOptions = {}
 
   if (before.master) {
     if (!after.master) findings.add("untouched-changed", "Снят основной компонент серии.");
-    else compareComponent(ctx, before.master, after.master, permitted(ctx, { kind: "master" }, splitting), true, "основной компонент");
+    else {
+      compareComponent(ctx, before.master, after.master, permitted(ctx, { kind: "master" }, splitting), true, "основной компонент");
+      // Патч полей ложится на основной у правки всей серии (и t&f одним put
+      // по Р2), а у одиночного события — и при scope this.
+      if (!splitting && (expect.scope !== "this" || before.kind === "single")) {
+        checkKeptSpan(ctx, before.master, after.master, "основного компонента");
+      }
+    }
   } else if (after.master) {
     findings.add("untouched-changed", "У объекта из одних переопределений появился основной компонент.");
   }
@@ -1201,7 +1295,8 @@ function compareTrees(ctx: Ctx, after: CalendarObject, options: TreeOptions = {}
         used.add(pair.component);
         compareComponent(ctx, ref.component, pair.component, permitted(ctx, place, splitting), true, label);
         checkMovedStays(ctx, before, ref, after, pair, target, label);
-        if (inherit && !target) checkInheritedFields(ctx, inherit.from, inherit.to, ref.component, pair.component, label);
+        if (target) checkKeptSpan(ctx, ref.component, pair.component, label);
+        if (inherit && !target) checkInheritedFields(ctx, inherit.from, inherit.to, ref.component, pair.component, label, role);
       } else if (mayRemove(ctx, key, role)) {
         requireTouchedRemoval(ctx, ref.component, label);
       } else {
@@ -1421,10 +1516,17 @@ function checkCloneTime(ctx: Ctx, master: ICAL.Component, clone: ICAL.Component,
 
 /**
  * Разрез (О6, таблица §3): основной компонент продолжения — клон прежнего
- * основного с началом на B. Без start и без recurrence (с ним начало может
- * встать на первую позицию нового правила) начало — слот B: без timeZone —
- * в форме и поясе серии, с timeZone — тот же момент. Без end — прежняя
+ * основного с началом на B. Без start начало — слот B, и при смене повтора
+ * тоже: по таблице §3 продолжение начинается с B («DTSTART = дата B + время
+ * патча»), а дату переносит только start в патче — новое правило
+ * раскрывается от B, а не от собственной первой позиции. Без timeZone — в
+ * форме и поясе серии, с timeZone — тот же момент. Без end — прежняя
  * длительность в прежней форме конца. С allDay время свободно.
+ *
+ * Без этой сверки при смене повтора начало продолжения не проверял бы
+ * никто: видимые встречи при recurrence сверяются только по своим
+ * компонентам (explicitOnly), а протяжённость — по `expect.tail` того же
+ * планировщика, и сдвиг всей серии продолжения прошёл бы молча.
  */
 function checkContinuationTime(ctx: Ctx, was: ICAL.Component, cont: ICAL.Component, b: SlotKey): void {
   const fields = ctx.fields;
@@ -1433,7 +1535,7 @@ function checkContinuationTime(ctx: Ctx, was: ICAL.Component, cont: ICAL.Compone
   const wasStart = was.getFirstProperty("dtstart");
   if (!start || !wasStart) return;
   const problems: string[] = [];
-  if (!fields.has("start") && !ctx.recurrence) {
+  if (!fields.has("start")) {
     const value = start.getFirstValue() as ICAL.Time;
     if (!fields.has("timeZone")) {
       const sameForm = formOf(start) === formOf(wasStart) && String(start.getParameter("tzid") ?? "") === String(wasStart.getParameter("tzid") ?? "");
@@ -1452,6 +1554,36 @@ function checkContinuationTime(ctx: Ctx, was: ICAL.Component, cont: ICAL.Compone
     ctx.findings.add(
       "time-changed",
       `У основного компонента продолжения ${problems.join("; ")}, а поля патча [${[...fields].join(", ")}] этого не меняют (О6, таблица §3).`,
+    );
+  }
+}
+
+/**
+ * О8 у компонента, который был и остался: `start` без `end` сохраняет
+ * длительность. У нового клона это сверяет checkCloneTime, у основного
+ * компонента продолжения — checkContinuationTime; здесь — цель update this
+ * (у одиночного события — основной), основной при правке всей серии и цель
+ * B в продолжении разреза. Без этого правка времени оставляла бы конец
+ * свободным: поля патча разрешают трогать DTSTART, DTEND и DURATION, а на
+ * что их меняют, не смотрел бы никто.
+ *
+ * Форма конца сверяется как есть (sameForm = false): вместе с timeZone
+ * патча меняется и пояс DTEND. Правка одного timeZone (без start) здесь не
+ * проверяется: по О8 она сохраняет моменты, а DURATION одиночной встречи
+ * или переопределения при этом пересчитывается, чтобы конец остался тем же
+ * (patch.ts, resolveTimes), — «прежняя длительность» там не инвариант.
+ * Длительность переопределений, которые не цель, стоит на О7
+ * (checkMovedStays: перенесённые остаются, где стояли).
+ */
+function checkKeptSpan(ctx: Ctx, was: ICAL.Component, now: ICAL.Component, label: string): void {
+  const fields = ctx.fields;
+  if (ctx.expect.op !== "update") return;
+  if (!fields.has("start") || fields.has("end") || fields.has("allDay")) return;
+  const problem = spanProblem(ctx, was, now, undefined, false);
+  if (problem !== undefined) {
+    ctx.findings.add(
+      "time-changed",
+      `У ${label} ${problem}, а поля патча [${[...fields].join(", ")}] конца не задают (О8: start без end сохраняет длительность).`,
     );
   }
 }
@@ -1570,6 +1702,14 @@ function rawTime(property: ICAL.Property): string {
  * но своё: текст — по первому значению; участники — по множеству
  * «адрес|PARTSTAT»; напоминания — по управляемым VALARM (DISPLAY и EMAIL со
  * сдвигом от начала).
+ *
+ * У скрытого переопределения (`hidden` — след прошлого удаления: RID под
+ * EXDATE или вне протяжённости серии) требуется только первое: своё
+ * значение цело. Встречи у него нет, показывать его наследование некому, и
+ * следование за новым основным — дело планировщика, а не инвариант
+ * объекта: О7 говорит о встречах. Требовать наследования у скрытых значило
+ * бы отказывать верным планам на любой серии со следом удаления — а это те
+ * самые объекты, ради которых идёт переделка.
  */
 function checkInheritedFields(
   ctx: Ctx,
@@ -1578,6 +1718,7 @@ function checkInheritedFields(
   was: ICAL.Component,
   now: ICAL.Component,
   label: string,
+  role: string | undefined,
 ): void {
   const lost: string[] = [];
   const stale: string[] = [];
@@ -1585,7 +1726,7 @@ function checkInheritedFields(
     if (!ctx.fields.has(field)) continue;
     if (inheritedValue(was, field) !== inheritedValue(oldMaster, field)) {
       if (ownValue(was, field) !== ownValue(now, field)) lost.push(field);
-    } else if (!sameInherited(now, newMaster, field)) {
+    } else if (role !== "hidden" && !sameInherited(now, newMaster, field)) {
       stale.push(field);
     }
   }
@@ -1687,7 +1828,8 @@ function compareContinuation(ctx: Ctx, cont: CalendarObject, b: SlotKey): void {
         used.add(pair.component);
         compareComponent(ctx, ref.component, pair.component, allowed, false, `${label} в продолжении`);
         checkMovedStays(ctx, before, ref, cont, pair, target, label);
-        if (!target) checkInheritedFields(ctx, before.master, cont.master, ref.component, pair.component, `${label} в продолжении`);
+        if (target) checkKeptSpan(ctx, ref.component, pair.component, `${label} в продолжении`);
+        if (!target) checkInheritedFields(ctx, before.master, cont.master, ref.component, pair.component, `${label} в продолжении`, role);
       } else if (!ctx.removed.has(key) && role !== "hidden") {
         findings.add("override-lost", `${capital(label)} не перенесено в продолжение (таблица §3: RID ≥ B — в продолжение).`);
       }
