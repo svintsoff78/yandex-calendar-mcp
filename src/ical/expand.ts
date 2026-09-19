@@ -1,5 +1,5 @@
 import type ICAL from "ical.js";
-import { instanceAt, instancesBetween, toCalendarEvent, type EventMeta, type Instance } from "./instances.js";
+import { hiddenOverrides, instanceAt, instancesBetween, toCalendarEvent, type EventMeta, type Instance } from "./instances.js";
 import { isUnparsable, loadObject, type CalendarObject, type Unparsable } from "./object.js";
 import { DEFAULT_READ_ENV, eventOfObject, modelReminders, unparsableEvent } from "./parse.js";
 import { SERIES_CAP, SlotScanError } from "./slots.js";
@@ -32,9 +32,10 @@ import type { CalendarEvent } from "../types.js";
  *   время записано в компоненте и известно без перебора;
  * - серию с правилом, которое итератор не перебирает (bad-rrule, Р4: правило
  *   не читается вовсе, слоты — DTSTART и RDATE), — если окно кончается позже
- *   DTSTART, а встречи DTSTART в выдаче нет, к выдаче добавляется та же
- *   заглушка основного компонента: какие встречи назначило правило, не
- *   узнать.
+ *   первого неизвестного момента (`unknownFromMs`: DTSTART, а при
+ *   переопределении, скрытом как «вне серии», — и его собственное начало), а
+ *   встречи DTSTART в выдаче нет, к выдаче добавляется та же заглушка
+ *   основного компонента: какие встречи назначило правило, не узнать.
  * Заглушки unparsable и unexpanded показываются при любом окне: сервер отобрал
  * объект для этого окна (Ж17), а какие его встречи в окне — не узнать.
  * find_free_slots по ним отказывает (`unreadableReason`).
@@ -157,20 +158,43 @@ function scanFailure(error: SlotScanError): string {
 
 // Р4: правило, которое итератор ical.js не перебирает (bad-rrule; сломанный
 // EXRULE — тоже), не читается вовсе (slots.ts, specOf): слоты — только
-// DTSTART и RDATE, встречи правила в окне неизвестны. Правило не назначает
-// встреч раньше DTSTART (итератор пропускает такие позиции,
-// recur_iterator.js:451-453), так что в окне, которое кончается не позже
-// DTSTART, неизвестных встреч нет. Иначе, если встречи DTSTART с аномалией в
-// выдаче нет, объект показывается заглушкой основного компонента: без неё
-// list_events молча не покажет объект, а find_free_slots сочтёт время
-// свободным.
+// DTSTART и RDATE, встречи правила в окне неизвестны. Если окно кончается
+// не позже первого неизвестного момента (`unknownFromMs`), неизвестных
+// встреч в нём нет. Иначе, если встречи DTSTART с аномалией в выдаче нет,
+// объект показывается заглушкой основного компонента: без неё list_events
+// молча не покажет объект, а find_free_slots сочтёт время свободным.
 function badRuleStub(o: CalendarObject, instances: readonly Instance[], toMs: number, meta: EventMeta): Shown | undefined {
   if (!o.master || !o.anomalies.some((anomaly) => anomaly.code === "bad-rrule")) return undefined;
   const dtstart = dtstartOf(o.master);
-  if (instantOf(dtstart, o.env) >= toMs) return undefined;
+  if (unknownFromMs(o, instantOf(dtstart, o.env)) >= toMs) return undefined;
   const key = slotKeyOf(dtstart, o.form, o.env);
   if (instances.some((instance) => instance.key === key)) return undefined;
   return masterStub(o, meta, "правило не перебирается (bad-rrule), и какие встречи оно назначило, неизвестно");
+}
+
+// Раньше какого момента у объекта с bad-rrule неизвестных встреч нет.
+//
+// Обычно это DTSTART: правило не назначает встреч раньше него — итератор
+// пропускает такие позиции (recur_iterator.js:451-453). Но при bad-rrule
+// серия выглядит конечной из одной встречи DTSTART, и переопределение с
+// RECURRENCE-ID позже него `assignRoles` (object.ts) прячет как «вне серии»,
+// хотя протяжённость серии на деле неизвестна. Собственное время такого
+// компонента известно и бывает раньше DTSTART: тогда прятать объект нельзя и
+// в окне раньше DTSTART (находка перепроверки З09). Само переопределение
+// заглушка не показывает — роль ему назначает object.ts; здесь важно, что
+// объект виден и find_free_slots по нему отказывает, а не отдаёт занятое
+// время как свободное.
+//
+// Скрытое под EXDATE (reason "excluded") к правилу не относится и остаётся
+// надёжно скрытым; RECURRENCE-ID раньше DTSTART правило назначить не могло,
+// так что такое скрытие тоже надёжно.
+function unknownFromMs(o: CalendarObject, dtstartMs: number): number {
+  let earliest = dtstartMs;
+  for (const hidden of hiddenOverrides(o)) {
+    if (hidden.reason !== "outside-series" || instantOf(hidden.address, o.env) < dtstartMs) continue;
+    for (const ref of hidden.refs) earliest = Math.min(earliest, instantOf(dtstartOf(ref.component), o.env));
+  }
+  return earliest;
 }
 
 // Встречи со своим компонентом (роль slot или detached), пересекающие окно,

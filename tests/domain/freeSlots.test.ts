@@ -476,6 +476,23 @@ describe("findFreeSlots: непрочитанные встречи — отка�
     ]);
   });
 
+  // Перепроверка ревью З09: при bad-rrule переопределение с RECURRENCE-ID
+  // позже DTSTART прячется как «вне серии» (object.ts, assignRoles), хотя
+  // протяжённость серии неизвестна. Перенесённое раньше DTSTART, оно занимало
+  // 12:00–13:00, а поиск прежде отдавал весь день свободным: ["10:00–19:00"].
+  it("bad-rrule: скрытое «вне серии» переопределение раньше DTSTART — отказ с UID, а не свободный день", async () => {
+    const ics = calendarOf(
+      vevent([...WEEKLY, "RRULE:FREQ=MONTHLY;BYWEEKNO=2"], "badrule-z09@yandex.ru"),
+      vevent(["RECURRENCE-ID;TZID=Europe/Moscow:20261021T100000", "DTSTART;TZID=Europe/Moscow:20261015T120000",
+        "DTEND;TZID=Europe/Moscow:20261015T130000", "SUMMARY:Перенесена раньше начала"], "badrule-z09@yandex.ru"));
+
+    const refusal = await refusalOf(freeOn("2026-10-15", [ics]));
+    expect(refusal.code).toBe("unreadable");
+    expect(refusal.events).toEqual([
+      { id: "badrule-z09@yandex.ru", calendarId: "work", reason: expect.stringMatching(/^bad-rrule: /) },
+    ]);
+  });
+
   it("серия длиннее предела перебора до окна — отказ с UID, а не пустая занятость", async () => {
     const ics = ["BEGIN:VCALENDAR", "VERSION:2.0", ...vevent(["DTSTART:20261001T000000Z", "DURATION:PT1S",
       "RRULE:FREQ=SECONDLY", "SUMMARY:Датчик"], "secondly-z09@yandex.ru"), "END:VCALENDAR"].join(CRLF) + CRLF;

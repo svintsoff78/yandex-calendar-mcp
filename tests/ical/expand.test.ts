@@ -763,6 +763,50 @@ describe("expandOccurrences: неразбираемое не роняет чте
     });
   });
 
+  // Перепроверка ревью З09. При bad-rrule серия выглядит конечной из одной
+  // встречи DTSTART, и assignRoles (object.ts) прячет переопределение с
+  // RECURRENCE-ID позже DTSTART как «вне серии», хотя протяжённость серии
+  // неизвестна. Если такое переопределение перенесено раньше DTSTART, прежде
+  // выдача окна раньше DTSTART была пустой: list_events молча не показывал
+  // объект, а find_free_slots отдавал занятое время как свободное. Саму
+  // встречу показать нельзя — роль ей назначает object.ts (чужой файл); здесь
+  // объект виден заглушкой, и время по нему не считается свободным.
+  describe("bad-rrule: скрытое «вне серии» переопределение раньше DTSTART — заглушка и в окне раньше DTSTART", () => {
+    /** Серия с плохим правилом (DTSTART 19.10 10:00 МСК) и переопределением с RID `rid`, перенесённым на `start`–`end` 15.10. */
+    const withMoved = (rid: string, start = "20261015T120000", end = "20261015T130000") =>
+      calendarOf(MOSCOW_ZONE,
+        vevent([...WEEKLY, "RRULE:FREQ=MONTHLY;BYWEEKNO=2"]),
+        override(rid, start, end, "SUMMARY:Перенесена раньше начала"));
+
+    it("окно 15.10, раньше DTSTART: заглушка основного компонента с bad-rrule, а не пустая выдача", () => {
+      const events = expand(withMoved("20261021T100000"), "2026-10-15T00:00:00+03:00", "2026-10-16T00:00:00+03:00");
+
+      expect(events.map(line)).toEqual([
+        "- → 2026-10-19T10:00:00+03:00/2026-10-19T11:00:00+03:00 Планёрка",
+      ]);
+      expect(events[0].anomalies?.[0]).toMatch(/^bad-rrule: /);
+      expect(events[0].anomalies?.some((a) => a.startsWith("unexpanded: "))).toBe(true);
+    });
+
+    it("окно кончается раньше собственного начала перенесённой — пусто: неизвестного в нём нет", () => {
+      expect(expand(withMoved("20261021T100000"), "2026-10-14T00:00:00+03:00", "2026-10-15T00:00:00+03:00")).toEqual([]);
+    });
+
+    it("RECURRENCE-ID раньше DTSTART скрыт надёжно: правило встреч раньше DTSTART не назначает", () => {
+      // RID 12.10 раньше DTSTART 19.10 — скрыт как «раньше первой встречи»,
+      // и это от правила не зависит; собственное время 15.10 встречей не стало.
+      expect(expand(withMoved("20261012T100000"), "2026-10-15T00:00:00+03:00", "2026-10-16T00:00:00+03:00")).toEqual([]);
+    });
+
+    it("скрытое под EXDATE окна раньше DTSTART не открывает: EXDATE от правила не зависит", () => {
+      const excluded = calendarOf(MOSCOW_ZONE,
+        vevent([...WEEKLY, "RRULE:FREQ=MONTHLY;BYWEEKNO=2", "EXDATE;TZID=Europe/Moscow:20261021T100000"]),
+        override("20261021T100000", "20261015T120000", "20261015T130000", "SUMMARY:Под EXDATE"));
+
+      expect(expand(excluded, "2026-10-15T00:00:00+03:00", "2026-10-16T00:00:00+03:00")).toEqual([]);
+    });
+  });
+
   it("серия длиннее предела перебора до окна — заглушка основного компонента с аномалией unexpanded, а не пустая выдача", () => {
     // SECONDLY с 01.10: до окна 06.10 больше 200 000 слотов (SERIES_CAP, slots.ts).
     const ics = calendarOf([], vevent(["DTSTART:20261001T000000Z", "DURATION:PT1S", "RRULE:FREQ=SECONDLY", "SUMMARY:Датчик"], "secondly-z09@yandex.ru"));
