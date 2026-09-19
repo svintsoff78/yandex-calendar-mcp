@@ -325,6 +325,58 @@ describe("роли переопределений (Р5) — строго по п
     expect(overridesOf(o).map((c) => roleOf(o, c).role)).toEqual(["hidden", "hidden"]);
   });
 
+  it("эхо встречи, перенесённой на другой день со слотом, — echo, а не stale-shift (прямое свидетельство эха)", () => {
+    // Серия Пн и Ср 10:00. O1 перенёс среду 21.10 на понедельник 26.10 15:00,
+    // затем прежний код правил её ещё раз и записал эхо с RID 26.10 15:00. В
+    // дате 26.10 ровно один слот (10:00), но RID эха равен DTSTART O1 — это
+    // правило 4, а не правило 3: иначе встреча понедельника пропала бы под
+    // эхом, а перенесённая среда показалась бы дважды.
+    const o = load(calendar(MOSCOW, vevent(SERIES),
+      moved("20261021T100000", "20261026T150000", "20261026T160000"),
+      vevent(["RECURRENCE-ID;TZID=Europe/Moscow:20261026T150000", "DTSTART;TZID=Europe/Moscow:20261026T160000",
+        "DTEND;TZID=Europe/Moscow:20261026T170000", "SUMMARY:Последняя правка"])));
+    const [first, echo] = overridesOf(o);
+
+    expect(roleOf(o, first)).toMatchObject({ role: "slot", slot: at("2026-10-21T07:00:00Z") });
+    expect(roleOf(o, echo)).toMatchObject({ role: "echo", slot: at("2026-10-21T07:00:00Z"), via: first, root: first });
+    expect(meetingAt(o, at("2026-10-21T07:00:00Z"))).toEqual({ shown: echo, components: [first, echo] });
+    expect(meetingAt(o, at("2026-10-26T07:00:00Z"))).toBeUndefined();
+    expect(codes(o)).toEqual(["legacy-override"]);
+  });
+
+  it("эхо скрытого переопределения (RID после конца серии) с RID на дату без слотов — hidden", () => {
+    // O1: RID 09.11 после конца серии (последняя — 04.11), перенесён на
+    // вторник 27.10 — в этой дате слотов нет. Эхо с RID 27.10 15:00 скрыто
+    // вместе с O1 (правило 4), правило 3 его не касается.
+    const o = load(calendar(MOSCOW, vevent(SERIES),
+      moved("20261109T100000", "20261027T150000", "20261027T160000"),
+      moved("20261027T150000", "20261027T160000", "20261027T170000")));
+
+    expect(overridesOf(o).map((c) => roleOf(o, c).role)).toEqual(["hidden", "hidden"]);
+    expect(codes(o)).not.toContain("legacy-override");
+  });
+
+  it("след сдвига серии на дату, единственный слот которой закрыт EXDATE, — hidden (правило 3, без эха)", () => {
+    const shifted = ["DTSTART;TZID=Europe/Moscow:20261019T090000", "DTEND;TZID=Europe/Moscow:20261019T100000",
+      "RRULE:FREQ=WEEKLY;BYDAY=MO,WE;COUNT=6", "EXDATE;TZID=Europe/Moscow:20261021T090000"];
+    const o = load(calendar(MOSCOW, vevent(shifted), moved("20261021T100000", "20261021T113000", "20261021T123000")));
+
+    expect(roleOf(o, overridesOf(o)[0]).role).toBe("hidden");
+    expect(codes(o)).not.toContain("legacy-override");
+  });
+
+  it("stale-shift у серии в America/New_York при поясе календаря Europe/Moscow: дата — в поясе DTSTART", () => {
+    // Пн и Ср 20:00 по Нью-Йорку — это вторник и четверг 03:00 по Москве.
+    // Прежний код сдвинул серию с 21:00 на 20:00; RID 21.10 21:00 NY по
+    // Москве — уже 22.10, где у серии слотов нет.
+    const o = load(calendar([],
+      vevent(["DTSTART;TZID=America/New_York:20261019T200000", "DURATION:PT1H", "RRULE:FREQ=WEEKLY;BYDAY=MO,WE;COUNT=6"]),
+      vevent(["RECURRENCE-ID;TZID=America/New_York:20261021T210000", "DTSTART;TZID=America/New_York:20261021T223000",
+        "DURATION:PT1H"])));
+
+    expect(roleOf(o, overridesOf(o)[0])).toMatchObject({ role: "stale-shift", slot: at("2026-10-22T00:00:00Z") });
+  });
+
   it("настоящее оторванное переопределение — detached, без аномалии legacy-override", () => {
     // Вторник 20.10: у серии Пн и Ср в эту дату слотов нет.
     const o = load(calendar(MOSCOW, vevent(SERIES), moved("20261020T100000", "20261020T120000", "20261020T130000")));
@@ -479,6 +531,15 @@ describe("blockingAnomalies (О14)", () => {
     expect(blockingAnomalies(rdate, "delete", "this_and_following", { key: B, split: true })).toEqual([]);
   });
 
+  it("DTSTART вне правила с UNTIL разрез не блокирует: COUNT не пересчитывается", () => {
+    const unsynced = load(calendar(MOSCOW, vevent(["DTSTART;TZID=Europe/Moscow:20261020T100000", "DURATION:PT1H",
+      "RRULE:FREQ=WEEKLY;BYDAY=MO,WE;UNTIL=20261105T000000Z"])));
+
+    expect(codes(unsynced)).toEqual(["unsynced-dtstart"]);
+    expect(blockingAnomalies(unsynced, "update", "this_and_following", { key: at("2026-10-26T07:00:00Z"), split: true }))
+      .toEqual([]);
+  });
+
   it("unknown-tzid блокирует запись, которая трогает значения в этом поясе", () => {
     const o = load(calendar(MOSCOW, vevent(SERIES), vevent(["RECURRENCE-ID;TZID=Europe/Moscow:20261021T100000",
       "DTSTART;TZID=Nowhere/Zone:20261021T150000", "DURATION:PT1H"])));
@@ -570,6 +631,42 @@ describe("semanticDigest (Р8): по смыслу, а не по тексту", (
     ];
 
     for (const variant of variants) expect(semanticDigest(variant, ENV)).not.toBe(digest);
+  });
+
+  describe("EXDATE и RDATE бесконечной серии — и за окном первых 500 слотов", () => {
+    const since2024 = (...extra: string[]) => calendar(MOSCOW, vevent(["DTSTART;TZID=Europe/Moscow:20240101T100000",
+      "DTEND;TZID=Europe/Moscow:20240101T110000", "RRULE:FREQ=DAILY", "SUMMARY:Ежедневная", ...extra]));
+    const hourly = (...extra: string[]) => calendar(MOSCOW, vevent(["DTSTART;TZID=Europe/Moscow:20261001T100000",
+      "DURATION:PT30M", "RRULE:FREQ=HOURLY", "SUMMARY:Ежечасная", ...extra]));
+    const variants: Array<[string, string, string]> = [
+      ["delete this 21.10.2026 у DAILY с 2024 года", since2024(), since2024("EXDATE;TZID=Europe/Moscow:20261021T100000")],
+      ["RDATE 21.10.2026 у DAILY с 2024 года", since2024(), since2024("RDATE;TZID=Europe/Moscow:20261021T150000")],
+      ["EXDATE у HOURLY через три недели", hourly(), hourly("EXDATE;TZID=Europe/Moscow:20261022T100000")],
+    ];
+
+    it.each(variants)("%s — дайджест меняется", (_label, before, after) => {
+      expect(semanticDigest(after, ENV)).not.toBe(semanticDigest(before, ENV));
+    });
+
+    it.each(variants)("%s — нормализация «как Яндекс» дайджест не меняет", (_label, _before, after) => {
+      expect(semanticDigest(normalize(after), ENV)).toBe(semanticDigest(after, ENV));
+      expect(semanticDigest(reorderOverridesFirst(after), ENV)).toBe(semanticDigest(after, ENV));
+    });
+
+    it("EXDATE в UTC равен EXDATE в поясе серии; EXDATE мимо слотов смысла не несёт", () => {
+      const inZone = semanticDigest(since2024("EXDATE;TZID=Europe/Moscow:20261021T100000"), ENV);
+
+      expect(semanticDigest(since2024("EXDATE:20261021T070000Z"), ENV)).toBe(inZone);
+      expect(semanticDigest(since2024("EXDATE;TZID=Europe/Moscow:20261021T113000"), ENV)).toBe(semanticDigest(since2024(), ENV));
+    });
+  });
+
+  it("RECURRENCE-ID в UTC и в TZID серии — один дайджест", () => {
+    const zoned = calendar(MOSCOW, vevent(SERIES), moved("20261021T100000", "20261021T150000", "20261021T160000"));
+    const utc = zoned.replace("RECURRENCE-ID;TZID=Europe/Moscow:20261021T100000", "RECURRENCE-ID:20261021T070000Z");
+
+    expect(utc).not.toBe(zoned);
+    expect(semanticDigest(utc, ENV)).toBe(semanticDigest(zoned, ENV));
   });
 
   it("различает перенос переопределения", () => {

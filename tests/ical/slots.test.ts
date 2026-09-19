@@ -1,6 +1,6 @@
 import ICAL from "ical.js";
 import { describe, expect, it } from "vitest";
-import { loadObject, type CalendarObject } from "../../src/ical/object.js";
+import { loadObject, semanticDigest, type CalendarObject } from "../../src/ical/object.js";
 import {
   SlotScanError,
   findSlot,
@@ -194,6 +194,21 @@ describe("iterateSlots: DTSTART, позиции правила и RDATE мину
     for (let i = 1; i < numbers.length; i++) expect(numbers[i]).toBeGreaterThan(numbers[i - 1]);
   });
 
+  it("MINUTELY через весенний разрыв в Берлине: ключи строго растут, поиск по ключу и граница работают", () => {
+    // ical.js читает стенное 02:00 и 02:30 из разрыва 29.03 со смещением после
+    // него (00:00Z и 00:30Z) — это моменты 01:00 и 01:30 CET, уже выданные.
+    const o = load(calendar(BERLIN, ["DTSTART;TZID=Europe/Berlin:20260328T233000", "DURATION:PT15M",
+      "RRULE:FREQ=MINUTELY;INTERVAL=30;COUNT=10", "SUMMARY:Каждые полчаса"]));
+    const slots = collect(o);
+    const numbers = keys(slots).map((key) => Number(key.slice(2)));
+
+    for (let i = 1; i < numbers.length; i++) expect(numbers[i]).toBeGreaterThan(numbers[i - 1]);
+    expect(keys(slots)).toEqual(["2026-03-28T22:30", "2026-03-28T23:00", "2026-03-28T23:30", "2026-03-29T00:00",
+      "2026-03-29T00:30", "2026-03-29T01:00", "2026-03-29T01:30", "2026-03-29T02:00"].map((t) => at(`${t}:00Z`)));
+    for (const slot of slots) expect(findSlot(o, slot.key)?.key).toBe(slot.key);
+    expect(keys(collect(o, { until: at("2026-03-29T00:30:00Z") }))).toEqual(keys(slots).slice(0, 5));
+  });
+
   it("BYSETPOS: последний рабочий день месяца", () => {
     const o = moscow("FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1;COUNT=4", "DTSTART;TZID=Europe/Moscow:20261030T100000");
 
@@ -273,6 +288,27 @@ describe("годовые серии с несуществующей датой (
     const o = moscow("FREQ=YEARLY;INTERVAL=2", "DTSTART;TZID=Europe/Moscow:20280229T100000");
 
     expect(keys(collect(o, { limit: 3 }))).toEqual(["2028-02-29", "2032-02-29", "2036-02-29"].map((d) => at(`${d}T07:00:00Z`)));
+  });
+
+  it("правило без существующей даты (YEARLY;BYMONTH=2 с 31 января) отбрасывается сразу, а не за 100 000 выдач", () => {
+    const text = calendar(MOSCOW, ["DTSTART;TZID=Europe/Moscow:20260131T100000", "DURATION:PT1H", "RRULE:FREQ=YEARLY;BYMONTH=2",
+      "SUMMARY:Тридцать первое февраля"]);
+    const started = performance.now();
+    const o = load(text);
+    semanticDigest(text, ENV);
+    const elapsed = performance.now() - started;
+
+    expect(o.anomalies.map((a) => a.code)).toContain("no-positions");
+    expect(keys(collect(o))).toEqual([at("2026-01-31T07:00:00Z")]);
+    expect(elapsed).toBeLessThan(500);
+  });
+
+  it("предел пропусков покрывает 400-летний цикл: YEARLY;INTERVAL=25 с 29.02.2000 — следующая 29.02.2400", () => {
+    // 2025, 2050, …, 2375 — пятнадцать выдач подряд без 29 февраля.
+    const o = moscow("FREQ=YEARLY;INTERVAL=25;COUNT=2", "DTSTART;TZID=Europe/Moscow:20000229T100000");
+
+    expect(o.anomalies).toEqual([]);
+    expect(keys(collect(o))).toEqual([at("2000-02-29T07:00:00Z"), at("2400-02-29T07:00:00Z")]);
   });
 
   it("YEARLY;BYMONTH=1,2,3 с 31-го — февраль пропускается", () => {
@@ -428,6 +464,32 @@ describe("isEmpty (Р3): полным проходом, без горизонт�
     expect(isEmpty(o, 2)).toBe(false);
   });
 
+  it("правило, которое застревает посреди серии, — «не пуст»: сбой перебора не удаляет объект", () => {
+    // Позиции 29.02.2028 10:00:00 и 10:00:01, следующая — через четыре года:
+    // итератор ical.js ищет её посекундно и упирается в предохранитель.
+    const o = load(calendar([], ["DTSTART:20280229T100000Z", "DURATION:PT1S",
+      "RRULE:FREQ=SECONDLY;BYMONTH=2;BYMONTHDAY=29;BYHOUR=10;BYMINUTE=0;BYSECOND=0,1",
+      "EXDATE:20280229T100000Z,20280229T100001Z", "SUMMARY:Две секунды"]));
+
+    expect(o.anomalies).toEqual([]); // первые две позиции есть — правило пригодно
+    expect(() => collect(o, { limit: 3 })).toThrow(SlotScanError);
+    expect(isEmpty(o)).toBe(false);
+  });
+
+  it("живое эхо оторванной встречи (цикл эха без detached) делает объект непустым", () => {
+    // A: RID 20.10 10:00 → 12:00; B: RID 20.10 12:00 → 10:00. Во вторник у
+    // серии Пн и Ср слотов нет, у каждого RID есть «предшественник» — роли
+    // обоих echo без слота, detached нет.
+    const allExcluded = [...WEEKLY_KEYS.map((key) => `EXDATE:${new Date(Number(key.slice(2)) * 1000).toISOString().replace(/[-:]|\.000/g, "")}`)];
+    const o = load(calendar(MOSCOW,
+      ["DTSTART;TZID=Europe/Moscow:20261019T100000", "DURATION:PT1H", "RRULE:FREQ=WEEKLY;BYDAY=MO,WE;COUNT=6", ...allExcluded],
+      ["RECURRENCE-ID;TZID=Europe/Moscow:20261020T100000", "DTSTART;TZID=Europe/Moscow:20261020T120000", "DURATION:PT1H"],
+      ["RECURRENCE-ID;TZID=Europe/Moscow:20261020T120000", "DTSTART;TZID=Europe/Moscow:20261020T100000", "DURATION:PT1H"]));
+
+    expect([...o.roles.values()].map((info) => [info.role, info.slot])).toEqual([["echo", undefined], ["echo", undefined]]);
+    expect(isEmpty(o)).toBe(false);
+  });
+
   it("живое оторванное переопределение делает объект непустым, скрытое — нет", () => {
     const allExcluded = [...WEEKLY_KEYS.map((key) => `EXDATE:${new Date(Number(key.slice(2)) * 1000).toISOString().replace(/[-:]|\.000/g, "")}`)];
     const detached = load(calendar(MOSCOW,
@@ -450,6 +512,47 @@ describe("lastSlotUpTo: последний слот не позже момент
     const last = lastSlotUpTo(o, until);
     expect(last.kind).toBe("slot");
     if (last.kind === "slot") expect(last.slot).toMatchObject({ key: at("2028-10-30T07:00:00Z"), excluded: true });
+  });
+
+  it.each([
+    ["UNTIL-дата", "UNTIL=20261025"],
+    ["плавающий UNTIL", "UNTIL=20261025T000000"],
+  ])("%s у серии со временем — как у итератора ical.js: по полуночи UTC, последняя встреча не теряется", (_label, until) => {
+    // time.js, compare → toUnixTime: DATE и плавающее время читаются со
+    // смещением 0 (utcOffset). 25.10 01:30 МСК — это 24.10 22:30Z, раньше
+    // полуночи UTC 25.10: последняя позиция правила — 25.10.
+    const o = moscow(`FREQ=DAILY;${until}`, "DTSTART;TZID=Europe/Moscow:20261020T013000");
+    const rule = o.master!.getFirstPropertyValue("rrule") as ICAL.Recur;
+    const extent = seriesExtent(o);
+
+    if (extent.kind !== "finite") throw new Error(extent.kind);
+    expect(extent.last?.key).toBe(at("2026-10-24T22:30:00Z"));
+    const last = lastSlotUpTo(o, rule.until!);
+    expect(last.kind === "slot" && last.slot.key).toBe(at("2026-10-24T22:30:00Z"));
+  });
+
+  it("UNTIL в UTC у плавающей серии и у серии на весь день — тоже как у итератора", () => {
+    // Плавающее время итератор сравнивает с UNTIL как UTC: 25.10 00:15 ≤
+    // 25.10 00:30Z. В поясе календаря New York этот UNTIL — ещё 24.10 20:30.
+    const newYork: IcalEnv = { floatingZone: "America/New_York" };
+    const loadIn = (text: string, env: IcalEnv) => {
+      const object = loadObject(text, env);
+      if (object.kind === "unparsable") throw new Error(object.error);
+      return object;
+    };
+    const floating = loadIn(calendar([], ["DTSTART:20261020T001500", "DURATION:PT1H", "RRULE:FREQ=DAILY;UNTIL=20261025T003000Z",
+      "SUMMARY:Плавающая"]), newYork);
+    const allDay = loadIn(calendar([], ["DTSTART;VALUE=DATE:20261020", "RRULE:FREQ=DAILY;UNTIL=20261024T233000Z",
+      "SUMMARY:Весь день"]), newYork);
+    const untilOf = (o: CalendarObject) => (o.master!.getFirstPropertyValue("rrule") as ICAL.Recur).until!;
+
+    for (const [o, expected] of [[floating, "F:2026-10-25T00:15:00"], [allDay, "D:2026-10-24"]] as const) {
+      const extent = seriesExtent(o);
+      if (extent.kind !== "finite") throw new Error(extent.kind);
+      expect(extent.last?.key).toBe(expected);
+      const last = lastSlotUpTo(o, untilOf(o));
+      expect(last.kind === "slot" && last.slot.key).toBe(expected);
+    }
   });
 
   it("момент между слотами — предыдущий слот; ключ тоже принимается", () => {
@@ -543,6 +646,30 @@ describe("sameTail: хвост исходной серии совпадает с
     expect(sameTail(weeklyInfinite, WEEKLY_KEYS[0], fourYears, identity).same).toBe(false);
     expect(sameTail(yearly, WEEKLY_KEYS[0], moscow("FREQ=YEARLY;COUNT=21"), identity)).toEqual({ same: true, compared: 21 });
     expect(sameTail(yearly, WEEKLY_KEYS[0], moscow("FREQ=YEARLY;COUNT=19"), identity).same).toBe(false);
+  });
+
+  it("лишняя встреча продолжения между последним сравнённым слотом и концом окна замечается", () => {
+    // Окно — пять лет от 19.10.2026: последний сравнённый понедельник —
+    // 13.10.2031, следующий (20.10.2031) уже за окном. У продолжения в
+    // среду 15.10.2031 — лишний RDATE внутри окна.
+    const weeklyInfinite = moscow("FREQ=WEEKLY;BYDAY=MO");
+    const extra = moscow("FREQ=WEEKLY;BYDAY=MO;UNTIL=20311020T000000Z", "RDATE;TZID=Europe/Moscow:20311015T100000");
+
+    expect(sameTail(weeklyInfinite, WEEKLY_KEYS[0], extra, identity)).toMatchObject({
+      same: false, actual: at("2031-10-15T07:00:00Z"),
+    });
+  });
+
+  it("лишняя встреча продолжения после 500 сравнённых слотов, раньше следующего слота хвоста, замечается", () => {
+    const daily = moscow("FREQ=DAILY");
+    const from = at("2026-10-20T07:00:00Z");
+    // 500-й слот хвоста — 02.03.2028 10:00, следующий — 03.03.2028 10:00.
+    const extra = moscow("FREQ=DAILY;COUNT=500", "DTSTART;TZID=Europe/Moscow:20261020T100000",
+      "RDATE;TZID=Europe/Moscow:20280302T180000");
+
+    expect(sameTail(daily, from, extra, identity)).toMatchObject({ same: false, actual: at("2028-03-02T15:00:00Z") });
+    expect(sameTail(daily, from, moscow("FREQ=DAILY;COUNT=501", "DTSTART;TZID=Europe/Moscow:20261020T100000"), identity))
+      .toEqual({ same: true, compared: 500 });
   });
 
   it("явный предел заменяет умолчания", () => {

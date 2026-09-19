@@ -17,6 +17,8 @@ import {
   compareSlotKeys,
   formOf,
   formatForModel,
+  instantOf,
+  listEntries,
   listKeys,
   slotKeyOf,
   timeInForm,
@@ -394,30 +396,8 @@ function assignRoles(o: CalendarObject, roles: Map<ICAL.Component, OverrideRoleI
     else pending.push(key);
   }
 
-  // Правило 3: stale-shift — в стенной дате RECURRENCE-ID (пояс DTSTART)
-  // ровно один слот, у слота нет своего переопределения, дату не заявляет
-  // другое такое же. Единственный слот даты закрыт EXDATE — встречу удалили:
-  // след прежнего кода скрыт (отступление от плана, см. отчёт З06).
-  const claims = new Map<string, Array<{ key: SlotKey; slot: Slot }>>();
-  for (const key of pending) {
-    if (scannedTo !== undefined && compareSlotKeys(key, scannedTo) > 0) continue;
-    const date = wallDate(o.overrides.get(key)![0].recurrenceId, o);
-    const onDate = byDate.get(date) ?? [];
-    if (onDate.length !== 1) continue;
-    const [slot] = onDate;
-    if (slot.excluded) {
-      assign(key, { role: "hidden" });
-      continue;
-    }
-    if (o.overrides.has(slot.key)) continue;
-    claims.set(date, [...(claims.get(date) ?? []), { key, slot }]);
-  }
-  for (const list of claims.values()) {
-    if (list.length === 1) assign(list[0].key, { role: "stale-shift", slot: list[0].slot.key });
-  }
-
-  // Правило 4: echo — RECURRENCE-ID по моменту равен DTSTART другого
-  // переопределения; цепочка сводится к первому переопределению.
+  // Правило 4 (свидетельство): RECURRENCE-ID по моменту равен DTSTART другого
+  // переопределения. Карта нужна уже правилу 3.
   const starts = new Map<SlotKey, ICAL.Component[]>();
   const keyOfComponent = new Map<ICAL.Component, SlotKey>();
   for (const [key, list] of o.overrides) {
@@ -433,6 +413,36 @@ function assignRoles(o: CalendarObject, roles: Map<ICAL.Component, OverrideRoleI
     const score = (component: ICAL.Component) => rank[assigned.get(keyOfComponent.get(component)!)?.role ?? "echo"];
     return [...candidates].sort((a, b) => score(a) - score(b))[0];
   };
+
+  // Правило 3: stale-shift — в стенной дате RECURRENCE-ID (пояс DTSTART)
+  // ровно один слот, у слота нет своего переопределения, дату не заявляет
+  // другое такое же. Два отступления от плана (см. отчёт З06):
+  // - RECURRENCE-ID, равный DTSTART другого переопределения, — прямое
+  //   свидетельство эха: правило 3 его не заявляет, он уходит в правило 4.
+  //   Иначе эхо встречи, перенесённой на другой день со слотом, заняло бы
+  //   чужой слот этой даты, а перенесённая встреча показалась бы дважды;
+  // - единственный слот даты закрыт EXDATE — встречу удалили: след прежнего
+  //   кода скрыт.
+  const claims = new Map<string, Array<{ key: SlotKey; slot: Slot }>>();
+  for (const key of pending) {
+    if (scannedTo !== undefined && compareSlotKeys(key, scannedTo) > 0) continue;
+    if (echoTarget(key)) continue;
+    const date = wallDate(o.overrides.get(key)![0].recurrenceId, o);
+    const onDate = byDate.get(date) ?? [];
+    if (onDate.length !== 1) continue;
+    const [slot] = onDate;
+    if (slot.excluded) {
+      assign(key, { role: "hidden" });
+      continue;
+    }
+    if (o.overrides.has(slot.key)) continue;
+    claims.set(date, [...(claims.get(date) ?? []), { key, slot }]);
+  }
+  for (const list of claims.values()) {
+    if (list.length === 1) assign(list[0].key, { role: "stale-shift", slot: list[0].slot.key });
+  }
+
+  // Правило 4: echo — цепочка сводится к первому переопределению.
   const resolveEcho = (key: SlotKey, seen: Set<SlotKey>): Omit<OverrideRoleInfo, "ref"> | undefined => {
     const via = echoTarget(key);
     if (!via) return undefined;
@@ -713,10 +723,13 @@ const DIGEST_SLOTS = 500;
  *   ACTION и TRIGGER;
  * - серия — раскрытыми слотами: первые 500 незакрытых слотов стенным
  *   временем и протяжённость (бесконечна; или число незакрытых и последний);
+ *   кроме того, независимо от этого окна, — все слоты, закрытые EXDATE, и все
+ *   слоты из RDATE (`listsPayload`): иначе EXDATE за 500-м слотом бесконечной
+ *   серии дайджест не меняло бы;
  * - переопределения — по RECURRENCE-ID, приведённому к форме серии, с RANGE.
  * Не входят: DTSTAMP, LAST-MODIFIED, CREATED, SEQUENCE, X-*, CATEGORIES,
- * ORGANIZER, CLASS, URL, TRANSP, VTIMEZONE, текст RRULE, EXDATE и RDATE вне
- * слотов. Неразбираемый текст — по строкам без служебных.
+ * ORGANIZER, CLASS, URL, TRANSP, VTIMEZONE, текст RRULE, EXDATE мимо слотов.
+ * Неразбираемый текст — по строкам без служебных.
  */
 export function semanticDigest(ics: string, env: IcalEnv): string {
   const object = loadObject(ics, env);
@@ -806,6 +819,7 @@ function seriesPayload(o: CalendarObject): unknown {
   const rulesText = () =>
     ["rrule", "exrule"].flatMap((name) => o.master!.getAllProperties(name).map((p) => p.toICALString()));
   const unusable = o.anomalies.some((anomaly) => anomaly.code === "bad-rrule" || anomaly.code === "no-positions");
+  const lists = listsPayload(o);
   try {
     const extent = seriesExtent(o);
     const slots: string[] = [];
@@ -819,12 +833,84 @@ function seriesPayload(o: CalendarObject): unknown {
     return {
       extent: extent.kind === "finite" ? `finite:${extent.live}:${extent.lastLive?.time.toString() ?? "-"}` : extent.kind,
       slots,
+      ...lists,
       rules: unusable ? rulesText() : undefined,
       synced: isDtstartSynced(o),
     };
   } catch (error) {
     if (!(error instanceof SlotScanError)) throw error;
-    return { error: error.code, rules: rulesText() };
+    return { error: error.code, ...lists, rules: rulesText() };
+  }
+}
+
+/**
+ * EXDATE и RDATE серии — независимо от окна первых DIGEST_SLOTS слотов. У
+ * бесконечной серии протяжённость — просто infinite, и без этого удаление
+ * сегодняшней встречи давней ежедневной серии (EXDATE далеко за 500-м слотом)
+ * дайджест не меняло бы: по Р8 «применено» не распознавалось бы никогда.
+ *
+ * - `closed` — слоты, закрытые EXDATE, стенным временем в форме серии, как в
+ *   `slots` (устойчиво к замене VTIMEZONE, Ж10, и к форме записи EXDATE: в UTC
+ *   или в TZID серии — один слот). EXDATE мимо слотов ничего не закрывает и
+ *   смысла не несёт — не входит;
+ * - `added` — слоты из RDATE (у PERIOD — с длительностью в секундах);
+ * - `unscanned` — значения дальше предела прохода SERIES_CAP или после сбоя
+ *   перебора: их слоты не проверить, они входят как есть, приведёнными к
+ *   форме серии (О4).
+ */
+function listsPayload(o: CalendarObject): { closed: string[]; added: string[]; unscanned?: string[] } {
+  const master = o.master!;
+  const exdates = listEntries(master, "exdate", o);
+  const rdates = listEntries(master, "rdate", o);
+  const all = [...exdates, ...rdates];
+  if (all.length === 0) return { closed: [], added: [] };
+
+  const exdateKeys = new Set(exdates.map((entry) => entry.key));
+  const until = all.map((entry) => entry.key).reduce((a, b) => (compareSlotKeys(a, b) >= 0 ? a : b));
+  const closed = new Set<string>();
+  const added = new Set<string>();
+  let reached: SlotKey | undefined; // последний проверенный ключ
+  let complete = true;
+  try {
+    let seen = 0;
+    for (const slot of iterateSlots(o, { until })) {
+      if (++seen > SERIES_CAP) {
+        complete = false;
+        break;
+      }
+      reached = slot.key;
+      if (slot.excluded && exdateKeys.has(slot.key)) closed.add(slot.time.toString());
+      if (slot.sources.includes("rdate")) added.add(rdateRepr(slot, o));
+    }
+  } catch (error) {
+    if (!(error instanceof SlotScanError)) throw error;
+    complete = false;
+  }
+  const payload: { closed: string[]; added: string[]; unscanned?: string[] } = {
+    closed: [...closed].sort(),
+    added: [...added].sort(),
+  };
+  if (!complete) {
+    const rest = all.filter((entry) => reached === undefined || compareSlotKeys(entry.key, reached) > 0);
+    const exdateSet = new Set(exdates);
+    payload.unscanned = [...new Set(rest.map((entry) => `${exdateSet.has(entry) ? "EX" : "R"}:${seriesWall(entry.time, o)}`))].sort();
+  }
+  return payload;
+}
+
+// Слот RDATE: стенное время в форме серии; у PERIOD — ещё длительность.
+function rdateRepr(slot: Slot, o: CalendarObject): string {
+  if (!slot.periodEnd) return slot.time.toString();
+  const seconds = (instantOf(slot.periodEnd, o.env) - instantOf(slot.time, o.env)) / 1000;
+  return `${slot.time.toString()}/${seconds}`;
+}
+
+// Значение в форме серии (О4) стенной строкой; не переводится — как записано.
+function seriesWall(t: ICAL.Time, o: CalendarObject): string {
+  try {
+    return timeInForm(t, o.form, o.zone, o.env).toString();
+  } catch {
+    return t.toString();
   }
 }
 

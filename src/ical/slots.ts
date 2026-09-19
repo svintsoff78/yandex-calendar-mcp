@@ -44,7 +44,12 @@ import {
  *   `expand_year_days` (recur_iterator.js) берёт номер дня года от
  *   несуществующей даты, и 29.02 превращается в 01.03 невисокосного года.
  *   По RFC 5545 §3.3.10 такие даты не входят в набор и не считаются в COUNT.
- *   Здесь они отбрасываются, а COUNT считается по оставшимся позициям.
+ *   Здесь они отбрасываются, а COUNT считается по оставшимся позициям; подряд
+ *   отбрасывается не больше выдач 400-летнего цикла (`dayFilterSkips`), а
+ *   правило, у месяцев которого нет дня DTSTART, узнаётся сразу.
+ *
+ * Внутри каждого источника ключи строго растут (`Stream`): у частот мельче
+ * часа итератор через весенний разрыв отдаёт уже выданные моменты.
  */
 
 /** Предел полного прохода серии (Р1, Р3, О12д): слотов или позиций. */
@@ -140,9 +145,9 @@ export function* iterateSlots(o: CalendarObject, bound: SlotBound = {}): Generat
     if (min === undefined) return;
     if (bound.until !== undefined && compareSlotKeys(min, bound.until) > 0) return;
 
-    // Все кандидаты с этим ключом, в том числе повторы из одного источника:
-    // у HOURLY стенное время из весеннего разрыва ical.js читает в тот же
-    // момент, что и час до него (timezone.js:287-364, utcOffset).
+    // Все кандидаты с этим ключом из разных источников (DTSTART и первая
+    // позиция, позиция и RDATE). Повторы ключа внутри источника отбрасывает
+    // Stream.
     const found: Candidate[] = [];
     for (const stream of streams) {
       while (stream.head && stream.head.key === min) {
@@ -266,11 +271,15 @@ export type LastSlot = { kind: "slot"; slot: Slot } | { kind: "none" } | { kind:
  * считаются: UNTIL ограничивает правило, а не RDATE. Нужен для пересчёта
  * UNTIL в all_series (Р1): U' = новое время на дате этого слота. Проход без
  * горизонта; больше `cap` слотов — too-far (отказ until-too-far у вызывающего).
+ *
+ * Значение UNTIL сравнивается так же, как его сравнивает итератор ical.js
+ * (`untilCutoff`), — иначе у UNTIL-даты при серии со временем последняя
+ * встреча правила терялась бы при пересчёте.
  */
 export function lastSlotUpTo(o: CalendarObject, until: ICAL.Time | SlotKey, cap = SERIES_CAP): LastSlot {
   const spec = specOf(o);
   if (!spec) return { kind: "none" };
-  const untilKey = typeof until === "string" ? until : slotKeyOf(until, spec.form, spec.env);
+  const untilKey = typeof until === "string" ? until : untilCutoff(until, spec);
 
   let found: Slot | undefined;
   let seen = 0;
@@ -321,8 +330,11 @@ export type SameTail =
  * же порядок, те же закрытые EXDATE, и у `b` нет слотов раньше хвоста.
  * Сравнивается min(конец серии `a`, 500 слотов, 5 лет), у YEARLY — 20 лет
  * (задача З06). Если хвост `a` кончился раньше пределов, у `b` не должно
- * быть слотов и после него. Так разрез проверяет, что продолжение повторяет
- * расписание, а причуды итератора не превращаются в тихую порчу (Р9).
+ * быть слотов и после него; если хвост оборван пределом, у `b` не должно быть
+ * слотов между последним сравнённым и отображением первого несравнённого
+ * слота `a` — `map` вызывается и для него. Так разрез проверяет, что
+ * продолжение повторяет расписание, а причуды итератора не превращаются в
+ * тихую порчу (Р9).
  */
 export function sameTail(
   a: CalendarObject,
@@ -337,7 +349,9 @@ export function sameTail(
   const years = limit.years ?? (spec.rules[0]?.freq === "YEARLY" ? TAIL_YEARS_YEARLY : TAIL_YEARS);
 
   const expected: Array<{ key: SlotKey; excluded: boolean }> = [];
-  let tailEnded = true;
+  // Первый слот `a` за пределами сверки (в ключах `b`); undefined — хвост `a`
+  // кончился раньше пределов.
+  let beyond: SlotKey | undefined;
   let windowEnd: SlotKey | undefined;
   let seen = 0;
   try {
@@ -346,7 +360,7 @@ export function sameTail(
       if (compareSlotKeys(slot.key, from) < 0) continue;
       windowEnd ??= slotKeyOf(yearsLater(slot.time, years), spec.form, spec.env);
       if (expected.length >= maxSlots || compareSlotKeys(slot.key, windowEnd) > 0) {
-        tailEnded = false;
+        beyond = map(slot.key);
         break;
       }
       expected.push({ key: map(slot.key), excluded: slot.excluded });
@@ -360,8 +374,14 @@ export function sameTail(
   try {
     for (const slot of iterateSlots(b)) {
       if (index === expected.length) {
-        if (tailEnded) {
+        // После сравнённых слотов у `b` не должно быть ничего раньше
+        // следующего слота `a`: ни после конца хвоста, ни внутри окна сверки
+        // (между последним сравнённым слотом и концом окна или 500-м слотом).
+        if (beyond === undefined) {
           return { same: false, reason: "у продолжения есть встречи после конца исходной серии", actual: slot.key };
+        }
+        if (compareSlotKeys(slot.key, beyond) < 0) {
+          return { same: false, reason: "у продолжения лишняя встреча внутри окна сверки", expected: beyond, actual: slot.key };
         }
         break;
       }
@@ -480,16 +500,39 @@ interface Position {
   position: number;
 }
 
+/**
+ * Поток кандидатов одного источника с ключами строго по возрастанию. Слияние
+ * потоков в `iterateSlots`, граница `until` и `findSlot` на этом стоят.
+ * Итератор ical.js идёт по стенному времени, и стенное время из весеннего
+ * разрыва он читает со смещением после разрыва (timezone.js:287-364,
+ * utcOffset): у HOURLY такая позиция попадает в момент часа до разрыва, а у
+ * MINUTELY с шагом меньше часа — в моменты, которые поток уже выдал (ключ идёт
+ * назад). Такие кандидаты отбрасываются: момент уже есть в наборе. RFC 5545
+ * читает время из разрыва со смещением до разрыва, так что у частот мельче
+ * часа позиции в разрыве и так расходятся с другими клиентами; запись таких
+ * правил — вопрос З14.
+ */
 class Stream {
   head: Candidate | undefined;
+  private last: SlotKey | undefined;
 
   constructor(private readonly source: Iterator<Candidate>) {
     this.advance();
   }
 
   advance(): void {
-    const next = this.source.next();
-    this.head = next.done ? undefined : next.value;
+    if (this.head) this.last = this.head.key;
+    for (;;) {
+      const next = this.source.next();
+      if (next.done) {
+        this.head = undefined;
+        return;
+      }
+      if (this.last === undefined || compareSlotKeys(next.value.key, this.last) > 0) {
+        this.head = next.value;
+        return;
+      }
+    }
   }
 }
 
@@ -555,6 +598,7 @@ function* ruleCandidates(rule: ICAL.Recur, spec: SeriesSpec, numbered: boolean):
 function* positionsOf(rule: ICAL.Recur, spec: SeriesSpec): Generator<Position> {
   const dayFilter = needsDayFilter(rule, spec.dtstart);
   const count = dayFilter ? rule.count : null;
+  const maxSkipped = dayFilter ? dayFilterSkips(rule, spec.dtstart) : 0;
   const next = guardedIterator(dayFilter && count ? withoutCount(rule) : rule, spec.dtstart);
 
   let position = 0;
@@ -563,7 +607,7 @@ function* positionsOf(rule: ICAL.Recur, spec: SeriesSpec): Generator<Position> {
     const time = next();
     if (!time) return;
     if (dayFilter && time.day !== spec.dtstart.day) {
-      if (++skipped > STALL_STEPS) throw new SlotScanError("stalled", "Правило не находит существующей даты.");
+      if (++skipped > maxSkipped) throw new SlotScanError("stalled", "Правило не находит существующей даты.");
       continue;
     }
     skipped = 0;
@@ -576,6 +620,26 @@ function* positionsOf(rule: ICAL.Recur, spec: SeriesSpec): Generator<Position> {
 function needsDayFilter(rule: ICAL.Recur, dtstart: ICAL.Time): boolean {
   if (rule.freq !== "YEARLY" || dtstart.day < 29) return false;
   return !["BYMONTHDAY", "BYYEARDAY", "BYWEEKNO", "BYDAY"].some((part) => part in rule.parts);
+}
+
+/**
+ * Сколько выдач итератора подряд может отбросить фильтр дней годового
+ * правила, пока ещё возможна существующая дата. Выдачи идут по месяцам
+ * BYMONTH (без него — месяц DTSTART) каждого года правила. Григорианский
+ * календарь повторяется через 400 лет, поэтому годы y0 + n·INTERVAL по модулю
+ * 400 повторяются не реже чем через 400 шагов: если за 400 лет подряд нет
+ * существующей даты, её нет никогда (у 29.02 при INTERVAL=25 — 15 выдач
+ * подряд, при INTERVAL=1 — до 7). Если ни в одном из месяцев нет столько
+ * дней, сколько у DTSTART, предел — ноль: правило без позиций узнаётся на
+ * первой же отброшенной выдаче, а не за STALL_STEPS выдач (секунды на каждое
+ * чтение объекта).
+ */
+function dayFilterSkips(rule: ICAL.Recur, dtstart: ICAL.Time): number {
+  const byMonth = (rule.parts.BYMONTH ?? []).map(Number).filter((month) => month >= 1 && month <= 12);
+  const months = byMonth.length > 0 ? byMonth : [dtstart.month];
+  // Високосный 2000 год: наибольшее число дней месяца, у февраля — 29.
+  const possible = months.some((month) => ICAL.Time.daysInMonth(month, 2000) >= dtstart.day);
+  return possible ? 400 * months.length : 0;
 }
 
 // recur.js, clone: new Recur(this.toJSON()) — неизвестные части теряются, для перебора они не нужны.
@@ -619,6 +683,34 @@ function guardedIterator(rule: ICAL.Recur, dtstart: ICAL.Time): () => ICAL.Time 
       throw new SlotScanError("rule-error", `Итератор правила упал: ${messageOf(error)}`);
     }
   };
+}
+
+/**
+ * Наибольший ключ слота, который итератор ical.js ещё выдаёт при этом UNTIL.
+ * Итератор сравнивает позицию с UNTIL через `Time.compare`, то есть по
+ * `toUnixTime` (recur_iterator.js:390 и 462; time.js:1079 compare, 1340
+ * toUnixTime), а `utcOffset` у DATE и плавающего времени — ноль (time.js:1136).
+ * Поэтому UNTIL-дата у серии со временем — полночь UTC, а не полночь пояса
+ * календаря; плавающие позиции и позиции-даты тоже читаются как UTC. Отсюда
+ * граница по форме серии:
+ * - zoned, utc — момент `until.toUnixTime()`;
+ * - floating — стенное время этого момента в UTC;
+ * - date — дата этого момента в UTC.
+ */
+function untilCutoff(until: ICAL.Time, spec: SeriesSpec): SlotKey {
+  const seconds = until.toUnixTime();
+  // time.js:1313, fromUnixTime — поля через getUTC*, от пояса процесса не зависят.
+  const utc = ICAL.Time.fromData(
+    { year: 1970, month: 1, day: 1, hour: 0, minute: 0, second: 0, isDate: false },
+    ICAL.Timezone.utcTimezone,
+  );
+  utc.fromUnixTime(seconds);
+  if (spec.form !== "floating") return slotKeyOf(utc, spec.form, spec.env);
+  const wall = ICAL.Time.fromData(
+    { year: utc.year, month: utc.month, day: utc.day, hour: utc.hour, minute: utc.minute, second: utc.second, isDate: false },
+    ICAL.Timezone.localTimezone,
+  );
+  return slotKeyOf(wall, "floating", spec.env);
 }
 
 function slotOf(key: SlotKey, found: Candidate[], excluded: boolean): Slot {
