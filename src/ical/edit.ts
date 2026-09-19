@@ -491,9 +491,11 @@ function deletePlan(run: Run, scope: EditScope, instanceStart: string | undefine
   if (o.kind === "single") {
     // Событие удаляется целиком при любом scope; неизвестный пояс удалению не мешает.
     refuseBlocking(blockingAnomalies(o, "delete", scope).filter((anomaly) => anomaly.code !== "unknown-tzid"));
-    const instance = instanceStart !== undefined
-      ? addressedInstance(resolveTarget(o, instanceStart, "delete", { confirm: run.confirmed }))
-      : singleInstance(o);
+    const resolved = instanceStart !== undefined ? resolveTarget(o, instanceStart, "delete", { confirm: run.confirmed }) : undefined;
+    // Скрытый компонент одиночного события (RECURRENCE-ID мимо его начала) адресуется своим
+    // RECURRENCE-ID и снимается сам, как в серии (Р5): само событие остаётся.
+    if (resolved?.target.kind === "hidden") return deleteThis(run, resolved.target);
+    const instance = resolved ? addressedInstance(resolved) : singleInstance(o);
     return {
       kind: "delete-object",
       expect: expectation("delete", scope, [], { target: instance.key, removed: [instance.key] }),
@@ -592,10 +594,14 @@ function deleteFollowing(run: Run, target: Target): WritePlan {
   const boundaryTime = target.kind === "slot" ? target.slot.time : target.instance.address;
   const boundaryMs = instantOf(boundaryTime, env);
 
+  // Встречи хвоста (адрес после B), перенесённые раньше B: для пользователя они до границы —
+  // потеря сверх цели (C50). Сама B — названная цель, куда бы её ни перенесли.
   const early = ownMeetingsFrom(o, boundary)
-    .filter((instance) => instance.startMs < boundaryMs)
-    .map((instance) => lossOf(env, instance, `её адрес не раньше ${target.instance.instanceStart}, а перенесена она раньше — удаляется вместе с хвостом`));
-  const earlyMessage = `Встречи из удаляемого хвоста перенесены раньше ${target.instance.instanceStart} и тоже будут удалены.`;
+    .filter((instance) => instance.key !== boundary && instance.startMs < boundaryMs)
+    .map((instance) => lossOf(env, instance, `её адрес позже ${target.instance.instanceStart}, а перенесена она раньше — удаляется вместе с хвостом`));
+  const earlyMessage = early.length > 0
+    ? `Встречи ${early.map((loss) => loss.instanceStart).join(", ")} из удаляемого хвоста перенесены раньше ${target.instance.instanceStart} и тоже будут удалены.`
+    : "";
 
   if (!o.master) return deleteDetachedFollowing(run, boundary, early, earlyMessage);
 
@@ -612,14 +618,15 @@ function deleteFollowing(run: Run, target: Target): WritePlan {
   }
 
   refuseBlocking(blockingAnomalies(o, "delete", "this_and_following", { key: boundary, split: true }));
+  refuseUncuttable(o, boundary, "delete");
   const work = copyOf(o);
   const touched = newTouched();
   truncate(run, work, boundary, boundaryTime, touched);
   const next = copyOf(work);
-  const hidden = becameHidden(o, next, boundary);
+  const hidden = hiddenAfterCut(o, next, boundary, "delete");
   const losses = [...early, ...hidden.map((entry) => entry.loss)];
   if (losses.length > 0 && !run.confirmed) {
-    throw needConfirm(losses, hidden.length > 0 ? `${earlyMessage} Кроме того, встречи до границы остались бы за концом серии и стали бы невидимы.` : earlyMessage);
+    throw needConfirm(losses, [earlyMessage, hidden.length > 0 ? HIDDEN_MESSAGE : ""].filter(Boolean).join(" "));
   }
   run.notices.push(...hiddenNotice(hidden));
   run.notices.push(...movedPastBoundary(o, boundary, boundaryMs, "остаются в серии: их адрес раньше границы"));
@@ -632,9 +639,8 @@ function deleteFollowing(run: Run, target: Target): WritePlan {
     touched,
   });
   const removed = [...tail.losses.filter((loss) => !early.some((e) => e.instanceStart === loss.instanceStart)), ...early, ...hidden.map((e) => e.loss)];
-  if (isEmpty(next)) {
-    return { kind: "delete-object", expect, removed, notices: [...run.notices, ...tail.notices, "После усечения в серии не осталось встреч: объект удалён целиком."] };
-  }
+  // Пустым усечённый объект не бывает: видимая встреча до B — незакрытый слот (он остаётся)
+  // или оторванная, которая либо видна и дальше, либо без неё объект пуст — отказ выше.
   return { kind: "put", ics: serializeObject(work), expect, removed, notices: [...run.notices, ...tail.notices] };
 }
 
@@ -760,6 +766,63 @@ function becameHidden(o: CalendarObject, next: CalendarObject, boundary: SlotKey
   return lost;
 }
 
+const HIDDEN_MESSAGE = "Встречи до границы остались бы за концом усечённой серии и стали бы невидимы (их компоненты сохранятся скрытыми).";
+
+/**
+ * Оторванные встречи до границы, которые усечение сделало бы невидимыми
+ * (`becameHidden`): с confirm — потеря видимости, данные остаются. Но если
+ * после усечения в объекте не осталось бы ни одной видимой встречи, отказ:
+ * пустой объект не записывается (Р3), а удалить его целиком — значит
+ * удалить и встречи до границы, которых удалять не просили.
+ */
+function hiddenAfterCut(o: CalendarObject, next: CalendarObject, boundary: SlotKey, op: EditOp): Array<{ key: SlotKey; loss: Loss }> {
+  const hidden = becameHidden(o, next, boundary);
+  if (hidden.length > 0 && isEmpty(next)) {
+    throw cutRefusal(
+      o,
+      boundary,
+      op,
+      `до неё видны только отдельные встречи ${hidden.map((entry) => entry.loss.instanceStart).join(", ")}, а после усечения они оказались бы ` +
+        "за концом серии: в объекте не осталось бы ни одной видимой встречи",
+    );
+  }
+  return hidden;
+}
+
+/**
+ * Можно ли усечь серию перед границей B, не оставив в ней слотов от B и не
+ * испортив правило (таблица §3, t&f):
+ * - B позже DTSTART: DTSTART не снять ни UNTIL, ни COUNT, а EXDATE оставил бы
+ *   в усечённой серии закрытый слот от B (так бывает, когда раньше DTSTART
+ *   стоят значения RDATE);
+ * - у правила есть позиции раньше B: иначе UNTIL перед B дал бы правило без
+ *   позиций (аномалия no-positions), а снять RRULE целиком правка без
+ *   recurrence не вправе (О12б; так бывает при DTSTART вне правила).
+ */
+function refuseUncuttable(o: CalendarObject, boundary: SlotKey, op: EditOp): void {
+  const master = o.master!;
+  const startKey = slotKeyOf(master.getFirstPropertyValue("dtstart") as ICAL.Time, o.form, o.env);
+  if (compareSlotKeys(boundary, startKey) <= 0) {
+    throw cutRefusal(o, boundary, op, "это начало серии (DTSTART), а раньше него есть встречи из RDATE: отрезать начало, оставив их, нельзя");
+  }
+  if (master.hasProperty("rrule") && positionsBefore(o, boundary) === 0) {
+    throw cutRefusal(o, boundary, op, `начало серии стоит вне правила, а у правила нет встреч раньше ${keyLabel(o, boundary, "instance")}: усечённое правило не дало бы ни одной встречи`);
+  }
+}
+
+function cutRefusal(o: CalendarObject, boundary: SlotKey, op: EditOp, reason: string): EditRefusal {
+  const label = keyLabel(o, boundary, "instance");
+  return new EditRefusal(
+    "split-mismatch",
+    `${op === "update" ? "Разрезать" : "Усечь"} серию на встрече ${label} нельзя: ${reason}. Объект не тронут.`,
+    {
+      hint: op === "update"
+        ? "Измените всю серию (scope all_series) или отдельные встречи (scope this)."
+        : "Удалите встречи по одной (scope this) или всю серию (scope all_series).",
+    },
+  );
+}
+
 function hiddenNotice(hidden: ReadonlyArray<{ loss: Loss }>): string[] {
   if (hidden.length === 0) return [];
   return [
@@ -796,8 +859,7 @@ const LOSS_LIST = 50;
  */
 function meetingsFrom(o: CalendarObject, from: SlotKey, now: Date | number, reason: string): { keys: SlotKey[]; losses: Loss[]; notices: string[] } {
   const env = o.env;
-  const explicit = [...o.overrides.keys(), ...(o.master ? [...listKeys(o.master, "exdate", o), ...listKeys(o.master, "rdate", o)] : [])];
-  const until = keyPlusDays(o, [from, keyOfMs(o, msOf(now)), ...explicit].reduce((a, b) => (compareSlotKeys(a, b) >= 0 ? a : b)), HORIZON_DAYS);
+  const until = horizonKey(o, from, now);
   const entries = new Map<SlotKey, () => Loss>();
   let exhausted = true;
   if (o.master) {
@@ -831,6 +893,12 @@ function meetingsFrom(o: CalendarObject, from: SlotKey, now: Date | number, reas
   return { keys, losses, notices };
 }
 
+/** Горизонт перебора: HORIZON_DAYS дней после max(from, сейчас, последний явный ключ — RID, EXDATE, RDATE). */
+function horizonKey(o: CalendarObject, from: SlotKey, now: Date | number): SlotKey {
+  const explicit = [...o.overrides.keys(), ...(o.master ? [...listKeys(o.master, "exdate", o), ...listKeys(o.master, "rdate", o)] : [])];
+  return keyPlusDays(o, [from, keyOfMs(o, msOf(now)), ...explicit].reduce((a, b) => (compareSlotKeys(a, b) >= 0 ? a : b)), HORIZON_DAYS);
+}
+
 function msOf(now: Date | number): number {
   return typeof now === "number" ? now : now.getTime();
 }
@@ -850,6 +918,20 @@ function keyOfMs(o: CalendarObject, ms: number): SlotKey {
 function timeOfKey(key: SlotKey): ICAL.Time {
   if (key.startsWith("T:")) return utcAt(Number(key.slice(2)));
   return parseModelTime(key.slice(2)).time;
+}
+
+/**
+ * Ключ для сообщений по Р10 — в форме серии `o`: у серии в Москве со
+ * смещением Москвы, а не UTC, которое отдаёт `timeOfKey`. Если пояс серии для
+ * перевода не годится — как есть.
+ */
+function keyLabel(o: CalendarObject, key: SlotKey, as: "time" | "instance"): string {
+  const t = timeOfKey(key);
+  try {
+    return formatForModel(timeInForm(t, o.form, o.zone, o.env), o.env, as);
+  } catch {
+    return formatForModel(t, o.env, as);
+  }
 }
 
 function keyPlusDays(o: CalendarObject, key: SlotKey, days: number): SlotKey {
@@ -923,15 +1005,26 @@ function updatePlan(run: Run, scope: EditScope, request: UpdateRequest): WritePl
   if (!hasVisibleBefore(o, target.key)) {
     refuseBlocking(blockingAnomalies(o, "update", "this_and_following", { key: target.key }));
     run.notices.push(`До ${target.instance.instanceStart} встреч нет: изменена вся серия, событие то же (разреза нет).`);
-    return updateAll(run, patch, "this_and_following", target.key);
+    return updateAll(run, patch, "this_and_following", target);
   }
   refuseBlocking(blockingAnomalies(o, "update", "this_and_following", { key: target.key, split: true }));
   return updateSplit(run, target, patch);
 }
 
-/** Одиночное событие: правка на месте; recurrence делает его серией. */
+/**
+ * Одиночное событие: правка на месте; recurrence делает его серией.
+ *
+ * Если событие показано своим переопределением (RECURRENCE-ID = DTSTART,
+ * роль slot — так бывает у серии из DTSTART и RDATE после снятия последнего
+ * RDATE, усечения или разреза), правка ложится на него, как update this:
+ * иначе поля ушли бы в невидимый основной компонент, а сдвиг DTSTART увёл бы
+ * основной из-под RECURRENCE-ID — переопределение стало бы скрытым, и
+ * встреча потеряла бы свои поля.
+ */
 function updateSingle(run: Run, patch: EventPatch, scope: EditScope): WritePlan {
   const { o } = run;
+  const key = slotKeyOf(o.master!.getFirstPropertyValue("dtstart") as ICAL.Time, o.form, o.env);
+  if (roleOfKey(o, key) === "slot") return updateShownOverride(run, key, patch);
   const work = copyOf(o);
   const master = work.master!;
   const touched = newTouched();
@@ -941,17 +1034,60 @@ function updateSingle(run: Run, patch: EventPatch, scope: EditScope): WritePlan 
     addRule(master, patch.recurrence, run.env, touched);
     ruleAdded = true;
   }
-  const key = slotKeyOf(o.master!.getFirstPropertyValue("dtstart") as ICAL.Time, o.form, o.env);
   const expect = expectation("update", scope, requestedFields(patch), { target: key, touched });
   if (!touchedEvents(touched)) return { kind: "noop", expect, removed: [], notices: run.notices };
   stampTouched(run, [master], touched);
+  const next = copyOf(work);
+  // Скрытые компоненты (RECURRENCE-ID мимо начала) остаются скрытыми: новое начало или правило
+  // не делает их видимыми встречами со старыми полями.
+  const changed = changedRoles(o, next);
+  if (changed.length > 0) {
+    throw new EditRefusal(
+      "invalid-time",
+      `После правки скрытые компоненты события стали бы видимыми встречами: ${changed.join(", ")}.`,
+      { hint: "Сначала удалите скрытый компонент (delete_event со scope this по его адресу), затем повторите правку." },
+    );
+  }
   if (ruleAdded) {
-    const next = copyOf(work);
     requireSynced(next, "первая встреча события");
     expect.ruleChanged = true;
     expect.tail = tailOf(next);
   }
   return { kind: "put", ics: serializeObject(work), expect, removed: [], notices: run.notices };
+}
+
+/**
+ * Одиночное событие, показанное своим переопределением: правится оно, как
+ * update this (цель — слот DTSTART), основной компонент не меняется. Для
+ * предохранителя это правка одной встречи (scope this): у одиночного события
+ * любой scope означает само событие. Повтор так не задать — правило легло бы
+ * на основной компонент, чьих полей не видно.
+ */
+function updateShownOverride(run: Run, key: SlotKey, patch: EventPatch): WritePlan {
+  const { o } = run;
+  const instance = instanceAt(o, key);
+  const slot = findSlot(o, key);
+  if (!instance || !slot) throw new Error(`У одиночного события ${o.uid} нет встречи в его DTSTART.`);
+  if (patch.recurrence !== undefined) {
+    throw new EditRefusal(
+      "invalid-field",
+      `Событие ${instance.instanceStart} показано своим переопределением (RECURRENCE-ID), а не основным компонентом: ` +
+        "сделать его повторяющимся нельзя — правило легло бы на основной компонент, чьих полей не видно.",
+      { hint: "Измените поля и время события без recurrence или создайте новую серию." },
+    );
+  }
+  return updateThis(run, { kind: "single", key, slot, instance }, patch);
+}
+
+/** Переопределения, чья роль после правки другая (скрытое стало видимым, видимое — скрытым или отдельным). */
+function changedRoles(o: CalendarObject, next: CalendarObject): string[] {
+  const changed: string[] = [];
+  for (const key of new Set([...o.overrides.keys(), ...next.overrides.keys()])) {
+    const was = roleOfKey(o, key);
+    const now = roleOfKey(next, key);
+    if (was !== now) changed.push(`${keyLabel(o, key, "instance")} (${was ?? "нет"} → ${now ?? "нет"})`);
+  }
+  return changed;
 }
 
 const FREQUENCIES: Readonly<Record<string, string>> = { daily: "DAILY", weekly: "WEEKLY", monthly: "MONTHLY", yearly: "YEARLY" };
@@ -1001,6 +1137,14 @@ function updateThis(run: Run, target: Target, patch: EventPatch): WritePlan {
   }
   const fields = fieldsOf(patch);
   if (fields.allDay !== undefined && fields.allDay !== instance.start.isDate) {
+    if (target.kind === "single") {
+      throw new EditRefusal(
+        "invalid-time",
+        "Событие показано своим переопределением (RECURRENCE-ID): «весь день» у него не переключить — " +
+          "форма времени переопределения обязана совпадать с основным компонентом (RFC 5545 §3.8.4.4).",
+        { hint: "Измените только время события или создайте новое событие на весь день." },
+      );
+    }
     throw new EditRefusal("invalid-time", "«Весь день» меняется только у всей серии: у одной встречи форма времени должна совпадать с серией (RFC 5545 §3.8.4.4).", {
       hint: 'Передайте scope: "all_series" или измените только время этой встречи.',
     });
@@ -1061,11 +1205,17 @@ function isMoved(c: ICAL.Component, key: SlotKey, o: CalendarObject): boolean {
  * серии прежняя (дата — только вместе с recurrence). При сдвиге начала —
  * позиционное сопоставление: EXDATE, RECURRENCE-ID и UNTIL идут за своими
  * встречами, RDATE — на ту же стенную разницу (при смене одного пояса —
- * моменты прежние), COUNT не меняется. Переопределения — по О7. Смена
- * правила — сопоставление по ключу: переопределения без пары снимаются только
- * с confirm, EXDATE без встречи — с пояснением.
+ * моменты прежние), COUNT не меняется; даты встреч прежние (иначе отказ
+ * unsynced-rule), начало серии обязано стоять на первой позиции правила.
+ * Переопределения — по О7. Смена правила — сопоставление по ключу:
+ * переопределения без пары снимаются только с confirm, EXDATE остаются.
+ *
+ * `boundary` — t&f без встреч до границы (Р2): правка всей серии, но цель —
+ * встреча B. Она получает поля патча безусловно (как при разрезе), дата в
+ * start сверяется с датой B, а новое время суток берётся от B — поэтому,
+ * если B идёт в другое время суток, чем начало серии, start и end отказ.
  */
-function updateAll(run: Run, patch: EventPatch, scope: EditScope, target?: SlotKey): WritePlan {
+function updateAll(run: Run, patch: EventPatch, scope: EditScope, boundary?: SlotTarget): WritePlan {
   const { o, env } = run;
   const source = o.master!;
   const fields = fieldsOf(patch);
@@ -1078,6 +1228,8 @@ function updateAll(run: Run, patch: EventPatch, scope: EditScope, target?: SlotK
       hint: "Измените время отдельных встреч (scope this) или задайте серию заново в веб-интерфейсе.",
     });
   }
+  const boundaryDate = boundary ? refuseForeignTimeOfDay(run, boundary, fields) : undefined;
+  const place = boundary ? `у встреч с ${boundary.instance.instanceStart}` : "у всей серии";
 
   const work = copyOf(o);
   const master = work.master!;
@@ -1087,9 +1239,18 @@ function updateAll(run: Run, patch: EventPatch, scope: EditScope, target?: SlotK
   const oldLength = lengthOf(master, env);
 
   // 1. Поля и время основного (Р1): время суток на прежней дате.
-  const applied = applyRebased(run, master, fields, touched, { place: "у всей серии", literalLater: recurrence !== undefined });
+  const applied = applyRebased(run, master, fields, touched, { place, literalLater: recurrence !== undefined, shownDate: boundaryDate });
   const newLength = lengthOf(master, env);
   const startMoved = !sameTimeProperty(source.getFirstProperty("dtstart")!, master.getFirstProperty("dtstart")!);
+  // Р1: начало вне первой позиции правила (другой клиент, BYHOUR) — отдельная встреча вне правила;
+  // позиционный сдвиг слил бы её с позицией или потерял бы.
+  if (startMoved && recurrence === undefined && source.hasProperty("rrule") && !isDtstartSynced(o)) {
+    throw unsynced(
+      `Начало серии ${formatForModel(source.getFirstPropertyValue("dtstart") as ICAL.Time, env, "instance")} стоит вне правила ` +
+        "(RFC 5545 §3.8.5.3: это отдельная встреча): сдвинуть время серии, сопоставив встречи по позициям правила, нельзя.",
+    );
+  }
+  const mode = fields.start !== undefined || toggle ? "wall" : "moment";
   let retimed: Retimed | undefined;
   if (startMoved) {
     const dtstart = source.getFirstPropertyValue("dtstart") as ICAL.Time;
@@ -1102,7 +1263,7 @@ function updateAll(run: Run, patch: EventPatch, scope: EditScope, target?: SlotK
         anchorKey: slotKeyOf(dtstart, o.form, env),
         anchorTime: dtstart,
         skip: 0,
-        mode: fields.start !== undefined || toggle ? "wall" : "moment",
+        mode,
         overrides: infos,
         lengths: { old: oldLength, new: newLength },
         touched,
@@ -1111,28 +1272,31 @@ function updateAll(run: Run, patch: EventPatch, scope: EditScope, target?: SlotK
       if (error instanceof MappingError) throw unsynced(error.message);
       throw error;
     }
+    if (mode === "wall" && !toggle && recurrence === undefined) refuseShiftedDates(retimed);
   } else if (!sameLength(oldLength, newLength)) {
     for (const info of infos) {
       if (info.moved) continue;
       if (sameLength(lengthOf(info.component, env), oldLength) && newLength) {
-        writeEnd(info.component, info.component.getFirstPropertyValue("dtstart") as ICAL.Time, newLength, env, touched);
+        const start = info.component.getFirstPropertyValue("dtstart") as ICAL.Time;
+        writeEnd(info.component, start, newLength, env, touched, ownEndFrame(info.component, env));
       }
     }
   }
   const inheritable = requested.filter((field) => INHERITED.has(field));
-  if (inheritable.length > 0) {
-    for (const info of infos) {
-      if (info.role !== "hidden") inheritFields(info.component, oldMaster, master, inheritable, touched);
-    }
+  for (const info of infos) {
+    if (info.role === "hidden") continue;
+    // Р2: встреча B — цель правки, как при разрезе, получает патч безусловно (дата — её собственная).
+    if (boundary && info.oldKey === boundary.key) applyRebased(run, info.component, fields, touched, { place, literalLater: true, quiet: true });
+    else if (inheritable.length > 0) inheritFields(info.component, oldMaster, master, inheritable, touched);
   }
   if (retimed) checkPositional(o, copyOf(work), infos, retimed);
 
   // 2. Повтор (Р1, Р4): сопоставление по ключу.
-  let removed: Loss[] = [];
-  let removedKeys: SlotKey[] = [];
   let ruleChanged = startMoved || (retimed?.untilChanged ?? false);
+  let step: RuleStep | undefined;
   if (recurrence !== undefined) {
-    const step = applyRule(run, {
+    step = prepareRule(run, {
+      source: o,
       root: work.root,
       master,
       recurrence,
@@ -1141,12 +1305,11 @@ function updateAll(run: Run, patch: EventPatch, scope: EditScope, target?: SlotK
       loss: (info) => lossOf(env, instanceAt(o, info.oldKey)!, "у встречи нет пары в новом правиле"),
       touched,
     });
-    removed = step.removed;
-    removedKeys = step.keys;
+    commitRule(run, work.root, step, touched);
     ruleChanged ||= step.changed;
   }
 
-  const expect = expectation("update", scope, requested, { target, touched });
+  const expect = expectation("update", scope, requested, { target: boundary?.key, touched });
   if (!touchedEvents(touched)) return { kind: "noop", expect, removed: [], notices: run.notices };
   if (touched.names.get(master)?.has("rrule")) refuseDistorted(master, "менять правило или время серии");
   stampTouched(run, [master, ...infos.map((info) => info.component)], touched);
@@ -1154,11 +1317,46 @@ function updateAll(run: Run, patch: EventPatch, scope: EditScope, target?: SlotK
   // Начало на первой позиции правила (RFC 5545 §3.8.5.3): иначе оно — лишняя встреча вне правила (Р1, unsynced-rule).
   if (ruleChanged && isDtstartSynced(o)) requireSynced(next, "у всей серии");
   expect.keyMap = retimed ? retimed.mapper.mapKey : undefined;
-  expect.removed = removedKeys;
+  expect.removed = step?.keys ?? [];
   expect.ruleChanged = ruleChanged;
   expect.datesFixed = recurrence === undefined && (!startMoved || retimed!.sameDates);
   if (ruleChanged) expect.tail = tailOf(next);
-  return { kind: "put", ics: serializeObject(work), expect, removed, notices: run.notices };
+  if (step) confirmRule(run, step);
+  return { kind: "put", ics: serializeObject(work), expect, removed: step ? ruleLosses(step) : [], notices: run.notices };
+}
+
+/**
+ * Р2 (t&f без встреч до B): новое время суток из start и end считается от B,
+ * а ложится на начало серии — это одно и то же, только если B идёт в то же
+ * время суток, что и DTSTART. Иначе (B — RDATE в другое время, у DTSTART
+ * своё время) встреча B уехала бы не туда, куда просили, — отказ.
+ * Возвращает дату B (для пояснения о дате из start).
+ */
+function refuseForeignTimeOfDay(run: Run, boundary: SlotTarget, fields: FieldPatch): string {
+  const { o, env } = run;
+  const b = boundary.slot.time; // в форме и поясе DTSTART (slots.ts, Slot.time)
+  const date = dateString(b);
+  if (fields.start === undefined && fields.end === undefined) return date;
+  if ((fields.allDay ?? o.form === "date") || o.form === "date") return date;
+  const d = o.master!.getFirstPropertyValue("dtstart") as ICAL.Time;
+  if (b.hour === d.hour && b.minute === d.minute && b.second === d.second) return date;
+  throw unsynced(
+    `Встреча ${boundary.instance.instanceStart} идёт в другое время суток, чем начало серии ` +
+      `${formatForModel(d, env, "instance")}: новое время нельзя однозначно применить к ней и ко всем следующим встречам.`,
+  );
+}
+
+/**
+ * Р1 без recurrence: сопоставление n → n не переносит встречи на другие
+ * даты. У HOURLY или BYHOUR новое время суток переводит часть позиций через
+ * полночь — такой сдвиг не выразить с прежними датами.
+ */
+function refuseShiftedDates(retimed: Retimed): void {
+  if (retimed.sameDates) return;
+  throw unsynced(
+    `После сдвига времени встречи правила перешли бы на другие даты${retimed.shiftedAt ? ` (${retimed.shiftedAt})` : ""}: ` +
+      "без правила повтора меняется только время суток, даты встреч прежние (Р1).",
+  );
 }
 
 function refuseToggle(o: CalendarObject, withOverrides: boolean): void {
@@ -1197,13 +1395,22 @@ function checkPositional(o: CalendarObject, next: CalendarObject, infos: readonl
   }
   for (const key of retimed.orphans) {
     if (findSlot(next, key)) {
-      throw unsynced(`После сдвига серии исключение EXDATE, не относившееся ни к одной встрече, совпало бы со встречей ${formatForModel(timeOfKey(key), env, "time")} и скрыло бы её.`);
+      throw unsynced(`После сдвига серии исключение EXDATE, не относившееся ни к одной встрече, совпало бы со встречей ${keyLabel(next, key, "time")} и скрыло бы её.`);
     }
   }
+  // RDATE сдвигается сам (стенной разницей или моментом), позиция правила — по правилу: отдельная
+  // дата не должна слиться с позицией, а дата на позиции — разойтись с ней (встреча раздвоилась бы).
+  const onlyRdate = (slot: Slot | undefined) => slot !== undefined && slot.sources.length === 1 && slot.sources[0] === "rdate";
   for (const [oldKey, newKey] of retimed.rdates) {
-    const onlyRdate = (slot: Slot | undefined) => slot !== undefined && slot.sources.length === 1 && slot.sources[0] === "rdate";
-    if (onlyRdate(findSlot(o, oldKey)) && !onlyRdate(findSlot(next, newKey))) {
-      throw unsynced(`После сдвига серии отдельная дата RDATE ${formatForModel(timeOfKey(oldKey), env, "time")} совпала бы со встречей по правилу, и одна из встреч пропала бы.`);
+    const was = findSlot(o, oldKey);
+    const now = findSlot(next, newKey);
+    if (onlyRdate(was) && !onlyRdate(now)) {
+      throw unsynced(`После сдвига серии отдельная дата RDATE ${keyLabel(o, oldKey, "time")} совпала бы со встречей по правилу, и одна из встреч пропала бы.`);
+    }
+    if (was !== undefined && !onlyRdate(was) && onlyRdate(now)) {
+      throw unsynced(
+        `Встреча ${keyLabel(o, oldKey, "time")} задана и правилом, и RDATE: после сдвига серии дата RDATE разошлась бы с позицией правила, и встреча раздвоилась бы.`,
+      );
     }
   }
 }
@@ -1211,6 +1418,8 @@ function checkPositional(o: CalendarObject, next: CalendarObject, infos: readonl
 // ─────────────────────────────── смена правила ───────────────────────────────
 
 interface RuleStepInput {
+  /** Исходный объект — для адресов в перечне потерь. */
+  source: CalendarObject;
   root: ICAL.Component;
   master: ICAL.Component;
   recurrence: RecurrencePatch;
@@ -1221,15 +1430,37 @@ interface RuleStepInput {
   touched: Touched;
 }
 
+/** Итог смены правила: что меняется и что теряется (подтверждение — у вызывающего, О11). */
+interface RuleStep {
+  changed: boolean;
+  /** Части прежнего правила, потерянные при replace. */
+  lostParts: string[];
+  /** Видимые встречи без пары в новом правиле. */
+  losses: Loss[];
+  /** Их прежние ключи — для expect.removed. */
+  keys: SlotKey[];
+  /** Скрытые компоненты, которые новое правило сделало бы видимыми встречами. */
+  traces: Loss[];
+  /** Компоненты к снятию: переопределения без пары и такие скрытые. */
+  drop: ICAL.Component[];
+}
+
 /**
  * Смена правила (Р1 «с recurrence», Р4): дата начала из start, правка
- * правила (patchRule), затем сопоставление по ключу. EXDATE без встречи и без
- * своего переопределения снимаются (они ничего не исключали). Видимое
- * переопределение, у которого в новом правиле нет своего слота, — потеря
- * (confirm), скрытое, ставшее видимым, — след, снимается с пояснением. Части
- * правила, теряемые при replace, тоже требуют confirm.
+ * правила (patchRule), затем сопоставление по ключу. Дерево меняется на месте,
+ * но компоненты не снимаются (это `commitRule`) и подтверждение не требуется
+ * (это `confirmRule`): вызывающий собирает все потери плана в один отказ.
+ * - видимое переопределение, у которого в новом правиле нет своего слота, —
+ *   потеря; оторванное (detached), получившее слот, — не потеря: оно
+ *   становится переопределением этого слота со всеми своими полями;
+ * - скрытое, которое новое правило сделало бы видимым (след прошлых правок
+ *   со старыми полями), — тоже потеря сверх цели: снимается, но только с
+ *   confirm и с перечнем;
+ * - части правила, теряемые при replace, — тоже с confirm;
+ * - EXDATE не снимаются никогда: EXDATE вне нового правила безвреден, а без
+ *   него следующая правка правила воскресила бы удалённую встречу.
  */
-function applyRule(run: Run, input: RuleStepInput): { removed: Loss[]; keys: SlotKey[]; changed: boolean } {
+function prepareRule(run: Run, input: RuleStepInput): RuleStep {
   const { env } = run;
   const { root, master, touched } = input;
   if (input.literal) applyFieldPatch(master, input.literal, patchContext(run, touched));
@@ -1245,44 +1476,57 @@ function applyRule(run: Run, input: RuleStepInput): { removed: Loss[]; keys: Slo
     addRule(master, input.recurrence, env, touched);
   }
 
-  let next = reparse(textOf(root), env);
-  const ridKeys = new Set(next.overrides.keys());
-  const dropped = dropListValues(master, "exdate", next, (key) => !ridKeys.has(key) && !findSlot(next, key), touched);
-  if (dropped.length > 0) {
-    run.notices.push(`Исключения EXDATE ${dropped.map((key) => formatForModel(timeOfKey(key), env, "time")).join(", ")} сняты: в новом правиле таких встреч нет, они ничего не исключали.`);
-    next = reparse(textOf(root), env);
-  }
-
-  const losses: Loss[] = [];
-  const keys: SlotKey[] = [];
-  const lost: ICAL.Component[] = [];
-  const traces: ICAL.Component[] = [];
+  const next = reparse(textOf(root), env);
+  const step: RuleStep = { changed, lostParts, losses: [], keys: [], traces: [], drop: [] };
   for (const info of input.overrides) {
     if (!info.component.parent) continue;
     const key = slotKeyOf(info.component.getFirstPropertyValue("recurrence-id") as ICAL.Time, next.form, env);
     const role = roleOfKey(next, key);
     if (info.role !== "hidden") {
-      if (role === info.role) continue;
-      lost.push(info.component);
-      if (!keys.includes(info.oldKey)) {
-        keys.push(info.oldKey);
-        losses.push(input.loss(info));
+      if (role === info.role || (info.role === "detached" && role === "slot")) continue;
+      step.drop.push(info.component);
+      if (!step.keys.includes(info.oldKey)) {
+        step.keys.push(info.oldKey);
+        step.losses.push(input.loss(info));
       }
     } else if (role === "slot" || role === "detached") {
-      traces.push(info.component);
+      step.drop.push(info.component);
+      step.traces.push({
+        instanceStart: keyLabel(input.source, info.oldKey, "instance"),
+        start: formatForModel(info.component.getFirstPropertyValue("dtstart") as ICAL.Time, env, "time"),
+        summary: summaryOf(info.component),
+        reason: "скрытый компонент (след прошлых правок) снят: в новом правиле он стал бы видимой встречей со старыми полями",
+      });
     }
   }
-  if ((losses.length > 0 || lostParts.length > 0) && !run.confirmed) {
-    const parts = lostParts.length > 0 ? `Правило задано заново (replace): теряются части прежнего правила ${lostParts.join(", ")}.` : "";
-    const meetings = losses.length > 0 ? "У изменённых или перенесённых встреч нет пары в новом правиле, и они будут удалены." : "";
-    throw needConfirm(losses, [parts, meetings].filter(Boolean).join(" "));
-  }
-  for (const c of [...lost, ...traces]) removeComponent(root, c, touched);
-  if (traces.length > 0) {
-    run.notices.push(`Сняты скрытые компоненты (следы прошлых удалений): в новом правиле они стали бы видимыми встречами (${traces.length}).`);
-  }
-  if (lostParts.length > 0) run.notices.push(`Из правила удалены части ${lostParts.join(", ")}.`);
-  return { removed: losses, keys, changed };
+  return step;
+}
+
+function commitRule(run: Run, root: ICAL.Component, step: RuleStep, touched: Touched): void {
+  for (const c of step.drop) removeComponent(root, c, touched);
+  if (step.lostParts.length > 0) run.notices.push(`Из правила удалены части ${step.lostParts.join(", ")}.`);
+}
+
+/** Потери смены правила для перечня и ответа: встречи без пары и скрытые следы. */
+function ruleLosses(step: RuleStep): Loss[] {
+  return [...step.losses, ...step.traces];
+}
+
+function ruleConfirmMessage(step: RuleStep): string {
+  return [
+    step.lostParts.length > 0 ? `Правило задано заново (replace): теряются части прежнего правила ${step.lostParts.join(", ")}.` : "",
+    step.losses.length > 0 ? "У изменённых или перенесённых встреч нет пары в новом правиле, и они будут удалены." : "",
+    step.traces.length > 0 ? "Скрытые компоненты серии в новом правиле стали бы видимыми встречами со старыми полями — они будут сняты." : "",
+  ].filter(Boolean).join(" ");
+}
+
+function ruleNeedsConfirm(step: RuleStep): boolean {
+  return step.losses.length > 0 || step.traces.length > 0 || step.lostParts.length > 0;
+}
+
+/** Подтверждение потерь смены правила (О11): без confirm — один отказ со всем перечнем. */
+function confirmRule(run: Run, step: RuleStep): void {
+  if (ruleNeedsConfirm(step) && !run.confirmed) throw needConfirm(ruleLosses(step), ruleConfirmMessage(step));
 }
 
 // ─────────────────────────────── разрез (Р9) ───────────────────────────────
@@ -1293,12 +1537,17 @@ type SlotTarget = Extract<Target, { kind: "single" | "slot" }>;
  * update this_and_following с видимыми встречами до границы B (таблица §3,
  * Р9): продолжение — клон основного без SEQUENCE и CREATED с UID
  * `continuationUid`, DTSTART = дата B и время патча (дата — только с
- * recurrence), COUNT минус позиции до B, UNTIL пересчитан по последней
- * встрече; EXDATE, RDATE и переопределения с адресом ≥ B переходят в
- * продолжение со сдвигом по позиции, поля — по О7, встреча B получает патч
- * безусловно; расписание сверяется с хвостом исходной серии (`sameTail`).
- * Исходный объект усекается перед B. Разрез с чужими участниками требует
- * confirm: новое событие может разослать приглашения.
+ * recurrence, и не раньше даты B), COUNT минус позиции до B, UNTIL пересчитан
+ * по последней встрече; EXDATE, RDATE и переопределения с адресом ≥ B
+ * переходят в продолжение со сдвигом по позиции, поля — по О7, встреча B
+ * получает патч безусловно; расписание сверяется с хвостом исходной серии
+ * (`sameTail`). Исходный объект усекается перед B.
+ *
+ * Пустой патч (О13) ничего не пишет и серию не делит. Все потери разреза —
+ * письма чужим участникам (новое событие может разослать приглашения),
+ * встречи без пары в новом правиле, скрытые следы, встречи до B, которые
+ * усечение сделало бы невидимыми, — подтверждаются одним отказом с полным
+ * перечнем (О11).
  */
 function updateSplit(run: Run, target: SlotTarget, patch: EventPatch): WritePlan {
   const { o, env } = run;
@@ -1311,15 +1560,6 @@ function updateSplit(run: Run, target: SlotTarget, patch: EventPatch): WritePlan
   const toggle = fields.allDay !== undefined && fields.allDay !== (o.form === "date");
   const moving = [...o.overrides].filter(([key]) => compareSlotKeys(key, boundary) >= 0).flatMap(([, refs]) => refs);
   if (toggle) refuseToggle(o, moving.length > 0);
-
-  const guests = foreignAttendees([o.master!, ...moving.map((ref) => ref.component)], env);
-  if (guests.length > 0) {
-    const message =
-      `Разрез серии создаст новое событие с участниками ${guests.join(", ")}: Яндекс может разослать им приглашение на новую серию ` +
-      "и отмену части прежней.";
-    if (!run.confirmed) throw needConfirm([], message);
-    run.notices.push(message);
-  }
 
   // Продолжение: VCALENDAR с копиями нужных VTIMEZONE, клон основного и переносимых переопределений.
   const uid = continuationUid(o.uid, boundary);
@@ -1347,17 +1587,22 @@ function updateSplit(run: Run, target: SlotTarget, patch: EventPatch): WritePlan
 
   // Начало продолжения — встреча B с прежней длительностью, затем патч (время суток на дате B).
   const startProperty = master.getFirstProperty("dtstart")!;
+  const endFrame = ownEndFrame(master, env);
   const start = timeInForm(boundaryTime, o.form, seriesZoneOf(startProperty, env), env);
   markProperty(contTouched, master, setTimeProperty(master, "dtstart", start));
-  if (oldLength && master.hasProperty("dtend")) writeEnd(master, start, oldLength, env, contTouched);
+  if (oldLength && master.hasProperty("dtend")) writeEnd(master, start, oldLength, env, contTouched, endFrame);
   const place = `у встреч с ${label}`;
+  const settled = JSON.stringify(master.jCal);
   const applied = applyRebased(run, master, fields, contTouched, { place, literalLater: recurrence !== undefined });
+  // Меняет ли патч хоть что-то (О13): основной продолжения, встречу B или правило.
+  let changed = JSON.stringify(master.jCal) !== settled;
 
   const before = positionsBefore(o, boundary);
   const rule = master.getFirstProperty("rrule");
   const count = rule ? ruleDict(rule).count : undefined;
   if (rule && count !== undefined) setRuleEnd(rule, { count: Number(count) - before }, contTouched);
 
+  const mode = fields.start !== undefined || toggle ? "wall" : "moment";
   let retimed: Retimed;
   try {
     retimed = retime({
@@ -1369,7 +1614,7 @@ function updateSplit(run: Run, target: SlotTarget, patch: EventPatch): WritePlan
       anchorTime: boundaryTime,
       skip: before,
       from: boundary,
-      mode: fields.start !== undefined || toggle ? "wall" : "moment",
+      mode,
       overrides: infos,
       lengths: { old: oldLength, new: lengthOf(master, env) },
       touched: contTouched,
@@ -1378,19 +1623,25 @@ function updateSplit(run: Run, target: SlotTarget, patch: EventPatch): WritePlan
     if (error instanceof MappingError) throw splitMismatch(error.message);
     throw error;
   }
+  if (mode === "wall" && !toggle && recurrence === undefined) refuseShiftedDates(retimed);
 
   // О7; встреча самой границы получает патч безусловно.
   const inheritable = requested.filter((field) => INHERITED.has(field));
   for (const info of infos) {
     if (info.role === "hidden") continue;
-    if (info.oldKey === boundary) applyRebased(run, info.component, fields, contTouched, { place, literalLater: true, quiet: true });
-    else if (inheritable.length > 0) inheritFields(info.component, oldMaster, master, inheritable, contTouched);
+    if (info.oldKey === boundary) {
+      const was = JSON.stringify(info.component.jCal);
+      applyRebased(run, info.component, fields, contTouched, { place, literalLater: true, quiet: true });
+      if (JSON.stringify(info.component.jCal) !== was) changed = true;
+    } else if (inheritable.length > 0) {
+      inheritFields(info.component, oldMaster, master, inheritable, contTouched);
+    }
   }
 
-  let removed: Loss[] = [];
-  let removedKeys: SlotKey[] = [];
+  let step: RuleStep | undefined;
   if (recurrence !== undefined) {
-    const step = applyRule(run, {
+    step = prepareRule(run, {
+      source: o,
       root,
       master,
       recurrence,
@@ -1399,9 +1650,17 @@ function updateSplit(run: Run, target: SlotTarget, patch: EventPatch): WritePlan
       loss: (info) => lossOf(env, instanceAt(o, info.oldKey)!, "у встречи нет пары в новом правиле продолжения"),
       touched: contTouched,
     });
-    removed = step.removed;
-    removedKeys = step.keys;
+    if (step.changed) changed = true;
   }
+  // О13: патч ничего не меняет — ничего не пишется, серия не делится (и писем нет).
+  if (!changed) {
+    return { kind: "noop", expect: expectation("update", "this_and_following", requested, { target: boundary }), removed: [], notices: run.notices };
+  }
+
+  refuseUncuttable(o, boundary, "update");
+  refusePeriodBoundary(o, target, oldLength);
+  if (applied.literal) refuseEarlierContinuation(master, target);
+  if (step) commitRule(run, root, step, contTouched);
   touchMetadata(master, run.now, true, env, contTouched);
   stampTouched(run, infos.map((info) => info.component), contTouched);
   ensureAllTimezones(root, contTouched);
@@ -1411,14 +1670,14 @@ function updateSplit(run: Run, target: SlotTarget, patch: EventPatch): WritePlan
   if (recurrence === undefined) {
     const tail = sameTail(o, boundary, continuation, retimed.mapper.mapKey);
     if (!tail.same) {
-      const where = tail.expected ? ` (ожидалась встреча ${formatForModel(timeOfKey(tail.expected), env, "time")})` : "";
+      const where = tail.expected ? ` (ожидалась встреча ${keyLabel(continuation, tail.expected, "time")})` : "";
       throw splitMismatch(`Расписание продолжения не совпадает с хвостом серии: ${tail.reason}${where}.`);
     }
     for (const info of infos) {
       const rid = info.component.getFirstPropertyValue("recurrence-id") as ICAL.Time;
       const role = roleOfKey(continuation, slotKeyOf(rid, continuation.form, env));
       if (role !== info.role) {
-        throw splitMismatch(`Встреча с адресом ${formatForModel(timeOfKey(info.oldKey), env, "instance")} в продолжении не совпала бы со своим местом в серии.`);
+        throw splitMismatch(`Встреча с адресом ${keyLabel(o, info.oldKey, "instance")} в продолжении не совпала бы со своим местом в серии.`);
       }
     }
   }
@@ -1427,10 +1686,18 @@ function updateSplit(run: Run, target: SlotTarget, patch: EventPatch): WritePlan
   const work = copyOf(o);
   const touched = newTouched();
   truncate(run, work, boundary, boundaryTime, touched);
-  const hidden = becameHidden(o, copyOf(work), boundary);
-  if (hidden.length > 0 && !run.confirmed) {
-    throw needConfirm(hidden.map((entry) => entry.loss), "Встречи до границы остались бы за концом усечённой серии и стали бы невидимы.");
+  const hidden = hiddenAfterCut(o, copyOf(work), boundary, "update");
+
+  // Подтверждение (О11): все потери разреза — одним отказом с полным перечнем.
+  const guests = foreignAttendees([o.master!, ...moving.map((ref) => ref.component)], env);
+  const guestMessage = guests.length > 0
+    ? `Разрез серии создаст новое событие с участниками ${guests.join(", ")}: Яндекс может разослать им приглашение на новую серию и отмену части прежней.`
+    : "";
+  const losses = [...(step ? ruleLosses(step) : []), ...hidden.map((entry) => entry.loss)];
+  if ((guests.length > 0 || losses.length > 0 || (step !== undefined && ruleNeedsConfirm(step))) && !run.confirmed) {
+    throw needConfirm(losses, [guestMessage, step ? ruleConfirmMessage(step) : "", hidden.length > 0 ? HIDDEN_MESSAGE : ""].filter(Boolean).join(" "));
   }
+  if (guestMessage) run.notices.push(guestMessage);
   run.notices.push(...hiddenNotice(hidden));
   run.notices.push(...movedPastBoundary(o, boundary, instantOf(boundaryTime, env), "остаются в прежней серии: их адрес раньше границы, изменения к ним не применены"));
   for (const info of infos) {
@@ -1444,7 +1711,7 @@ function updateSplit(run: Run, target: SlotTarget, patch: EventPatch): WritePlan
   const expect = expectation("update", "this_and_following", requested, {
     target: boundary,
     keyMap: (key) => (compareSlotKeys(key, boundary) < 0 ? key : retimed.mapper.mapKey(key)),
-    removed: [...removedKeys, ...hidden.map((entry) => entry.key)],
+    removed: [...(step?.keys ?? []), ...hidden.map((entry) => entry.key)],
     ruleChanged: true,
     datesFixed: recurrence === undefined && retimed.sameDates,
     tail: tailOf(continuation),
@@ -1456,9 +1723,43 @@ function updateSplit(run: Run, target: SlotTarget, patch: EventPatch): WritePlan
     truncated: { ics: serializeObject(work) },
     boundary,
     expect,
-    removed: [...removed, ...hidden.map((entry) => entry.loss)],
+    removed: losses,
     notices: run.notices,
   };
+}
+
+/**
+ * Граница — значение RDATE;VALUE=PERIOD со своей длительностью: в
+ * продолжении эта встреча становится DTSTART и получила бы длительность
+ * основного — её конец изменился бы молча. Отказ, если длительности разные.
+ */
+function refusePeriodBoundary(o: CalendarObject, target: SlotTarget, oldLength: Length | undefined): void {
+  const periodEnd = target.slot.periodEnd;
+  if (!periodEnd) return;
+  const env = o.env;
+  const start = target.slot.time;
+  const end = endAfter(start, oldLength ?? { days: start.isDate ? 1 : 0, seconds: 0 }, env);
+  if (instantOf(end, env) === instantOf(periodEnd, env)) return;
+  throw splitMismatch(
+    `Встреча ${target.instance.instanceStart} задана периодом RDATE до ${formatForModel(periodEnd, env, "time")}, а её длительность не как у серии: ` +
+      "в продолжении она стала бы началом серии с длительностью серии, и её конец изменился бы.",
+  );
+}
+
+/**
+ * С recurrence дата из start применяется (Р1), но не раньше даты границы:
+ * иначе встречи продолжения легли бы на встречи, оставшиеся в прежней серии, —
+ * двойники в двух объектах.
+ */
+function refuseEarlierContinuation(master: ICAL.Component, target: SlotTarget): void {
+  const startDate = dateString(master.getFirstPropertyValue("dtstart") as ICAL.Time);
+  const boundaryDate = dateString(target.slot.time);
+  if (startDate >= boundaryDate) return;
+  throw new EditRefusal(
+    "invalid-time",
+    `Продолжение с ${target.instance.instanceStart} начиналось бы ${startDate}, раньше границы: его встречи легли бы на встречи, которые остаются в прежней серии.`,
+    { hint: "Передайте start не раньше даты границы или измените всю серию (scope all_series)." },
+  );
 }
 
 function splitMismatch(message: string): EditRefusal {
@@ -1552,8 +1853,10 @@ interface Retimed {
   /** Старый ключ RDATE → новый. */
   rdates: Map<SlotKey, SlotKey>;
   untilChanged: boolean;
-  /** Даты встреч прежние (сдвиг внутри суток). */
+  /** Даты сопоставленных встреч прежние (до горизонта сверки, shiftedDate). */
   sameDates: boolean;
+  /** Первая встреча, перешедшая на другую дату, — «адрес → новое начало». */
+  shiftedAt?: string;
 }
 
 /**
@@ -1661,13 +1964,42 @@ function retime(input: RetimeInput): Retimed {
     if (info.moved) continue;
     const own = lengthOf(c, env);
     const length = sameLength(own, input.lengths.old) && input.lengths.new ? input.lengths.new : own;
+    const endFrame = ownEndFrame(c, env);
     const startProp = c.getFirstProperty("dtstart")!;
     if (!sameTimeValue(startProp, rid)) markProperty(touched, c, setTimeProperty(c, "dtstart", rid));
-    if (length) writeEnd(c, rid, length, env, touched);
+    if (length) writeEnd(c, rid, length, env, touched, endFrame);
   }
 
-  const anchorWall = timeInForm(input.anchorTime, source.form, source.zone, env);
-  return { mapper, orphans, rdates, untilChanged, sameDates: dateString(newStart) === dateString(anchorWall) };
+  const shiftedAt = shiftedDate(source, from ?? input.anchorKey, from !== undefined, mapper, run.now);
+  return { mapper, orphans, rdates, untilChanged, sameDates: shiftedAt === undefined, shiftedAt };
+}
+
+/** Предел сверки дат при сдвиге: слотов исходной серии. */
+const DATE_CHECK_STEPS = 100_000;
+
+/**
+ * Первая встреча, которую позиционный сдвиг переносит на другую дату, —
+ * строкой «адрес → новое начало»; undefined — даты прежние (Р1, datesFixed).
+ * Сверяются все слоты исходной серии (с закрытыми EXDATE) от `from` до
+ * горизонта, как у перечня удаляемых встреч: 800 дней после max(граница,
+ * сейчас, последний явный ключ). Даты теряются не только у DTSTART: у HOURLY
+ * и BYHOUR новое время суток переводит часть позиций через полночь, при смене
+ * пояса — позиции после перехода часов.
+ */
+function shiftedDate(source: CalendarObject, from: SlotKey, cut: boolean, mapper: SlotMapper, now: Date | number): string | undefined {
+  const env = source.env;
+  const until = horizonKey(source, from, now);
+  let steps = 0;
+  for (const slot of iterateSlots(source)) {
+    if (++steps > DATE_CHECK_STEPS) return undefined;
+    if (cut && compareSlotKeys(slot.key, from) < 0) continue;
+    if (compareSlotKeys(slot.key, until) > 0) return undefined;
+    const mapped = mapper.slotTime(slot.key);
+    if (mapped && dateString(mapped) !== dateString(slot.time)) {
+      return `${formatForModel(slot.time, env, "instance")} → ${formatForModel(mapped, env, "time")}`;
+    }
+  }
+  return undefined;
 }
 
 /** UNTIL в форме DTSTART (О4): дата — датой, прочее — как есть (setRuleDict переводит время с поясом в UTC). */
@@ -1938,15 +2270,16 @@ function atMoment(seconds: number, like: ICAL.Time, env: IcalEnv): ICAL.Time {
   return timeInForm(utcAt(seconds), form, form === "zoned" ? like.zone : undefined, env);
 }
 
-/** Конец компонента после нового начала: DTEND — в форме и поясе начала, DURATION — длительностью; без конца — ничего. */
-function writeEnd(c: ICAL.Component, start: ICAL.Time, length: Length, env: IcalEnv, touched: Touched): void {
+/**
+ * Конец компонента после нового начала: DTEND — в форме и поясе начала или,
+ * если до правки он был в своих (`endFrame`, рейс с DTEND в поясе прилёта), —
+ * в них; DURATION — длительностью; без конца — ничего.
+ */
+function writeEnd(c: ICAL.Component, start: ICAL.Time, length: Length, env: IcalEnv, touched: Touched, endFrame?: Frame): void {
   const dtend = c.getFirstProperty("dtend");
   if (dtend) {
-    const own = formOf(dtend);
     let end = endAfter(start, length, env);
-    if (own !== formOf(start) && !(own === "date") && !(formOf(start) === "date")) {
-      end = timeInForm(end, own, own === "zoned" ? seriesZoneOf(dtend, env) : undefined, env);
-    }
+    if (endFrame && !end.isDate) end = timeInForm(end, endFrame.form, endFrame.zone, env);
     if (!sameTimeValue(dtend, end)) markProperty(touched, c, setTimeProperty(c, "dtend", end));
     return;
   }
@@ -1958,6 +2291,22 @@ function writeEnd(c: ICAL.Component, start: ICAL.Time, length: Length, env: Ical
     duration.setValue(value);
     markProperty(touched, c, duration);
   }
+}
+
+/**
+ * Форма и пояс DTEND, если они не как у DTSTART (читать до правки начала):
+ * такой конец сохраняет свой пояс. Конец в форме начала идёт за новым
+ * началом — и за сменой пояса серии.
+ */
+function ownEndFrame(c: ICAL.Component, env: IcalEnv): Frame | undefined {
+  const dtend = c.getFirstProperty("dtend");
+  const dtstart = c.getFirstProperty("dtstart");
+  if (!dtend || !dtstart) return undefined;
+  const endForm = formOf(dtend);
+  const startForm = formOf(dtstart);
+  if (endForm === "date" || startForm === "date") return undefined;
+  if (endForm === startForm && (endForm !== "zoned" || String(dtend.getParameter("tzid")) === String(dtstart.getParameter("tzid")))) return undefined;
+  return { form: endForm, zone: endForm === "zoned" ? seriesZoneOf(dtend, env) : undefined };
 }
 
 // Значение свойства совпадает с `time` в записи: форма, jCal-строка и TZID.
@@ -2054,7 +2403,7 @@ function applyRebased(
   c: ICAL.Component,
   fields: FieldPatch,
   touched: Touched,
-  options: { place: string; literalLater: boolean; quiet?: boolean },
+  options: { place: string; literalLater: boolean; quiet?: boolean; shownDate?: string },
 ): Rebased {
   const ctx = patchContext(run, touched);
   if (fields.start === undefined && fields.end === undefined) {
@@ -2072,11 +2421,14 @@ function applyRebased(
     if (start) {
       rebased.start = compose(anchor, start, frame);
       if (end) rebased.end = compose(addDaysTo(anchor, daysBetween(start.date, end.date)), end, frame);
-      if (start.date !== anchor) {
+      // Дата, которую видит пользователь: у t&f без встреч до границы (Р2) — дата границы, а не
+      // DTSTART серии (ранние встречи могут быть удалены EXDATE).
+      const shown = frame.form === "date" ? anchor : options.shownDate ?? anchor;
+      if (start.date !== shown) {
         if (options.literalLater) {
           result.literal = { start: fields.start, ...(fields.end !== undefined ? { end: fields.end } : {}) };
         } else if (!options.quiet) {
-          run.notices.push(dateIgnored("start", start.date, anchor, options.place));
+          run.notices.push(dateIgnored("start", start.date, shown, options.place));
         }
       }
     }
@@ -2100,8 +2452,10 @@ function applyRebased(
   const current = c.getFirstPropertyValue("dtstart") as ICAL.Time;
   const startWall = { hour: current.hour, minute: current.minute, second: current.second };
   const seconds = (w: { hour: number; minute: number; second: number }) => w.hour * 3600 + w.minute * 60 + w.second;
-  const date = seconds(end) <= seconds(startWall) ? addDaysTo(dateString(current), 1) : dateString(current);
-  if (end.date !== date && !options.quiet) run.notices.push(dateIgnored("end", end.date, date, options.place));
+  const nextDay = seconds(end) <= seconds(startWall);
+  const date = nextDay ? addDaysTo(dateString(current), 1) : dateString(current);
+  const shown = options.shownDate === undefined ? date : nextDay ? addDaysTo(options.shownDate, 1) : options.shownDate;
+  if (end.date !== shown && !options.quiet) run.notices.push(dateIgnored("end", end.date, shown, options.place));
   applyFieldPatch(c, { end: compose(date, end, frame) }, ctx);
   return result;
 }
