@@ -145,11 +145,12 @@ type CodeCheck = readonly string[] | { test: (code: unknown) => boolean; what: s
 
 /**
  * Коды отказов, названные планом для других причин: адрес (Р10, AddressError
- * в §2), время (О8), аномалии и блокировки (О14, Р3, Р5), разрез (Р9) и
- * пределы (Р1, О12д). Коды отказа по устаревшему etag (Р11) и по потере
- * данных (О11, needsConfirm) план не называет; пока их проверяет
- * `refusalFor`: код — строка и ни один из этих. Когда З10 или З13 назовут
- * коды, проверки сузить до точных.
+ * в §2), время (О8), аномалии и блокировки (О14, Р3), разрез (Р9) и
+ * пределы (Р1, О12д). Кода legacy-override нет: ремонт следов прежнего
+ * кода исключён поправкой плана. Коды отказа по устаревшему etag (Р11)
+ * и по потере данных (О11, needsConfirm) план не называет; пока их
+ * проверяет `refusalFor`: код — строка и ни один из этих. Когда З10 или
+ * З13 назовут коды, проверки сузить до точных.
  */
 const OTHER_REASONS = [
   "invalid",
@@ -167,7 +168,6 @@ const OTHER_REASONS = [
   "unknown-tzid",
   "range-override",
   "duplicate-override",
-  "legacy-override",
   "empty-series",
   "series-too-long",
   "unsynced-rule",
@@ -445,7 +445,7 @@ const twoMeetings = seedOf("c21count2mw@yandex.ru", "Пн и Ср 10:00–11:00 
 /** C42 (а): COUNT=2 и настоящее отдельное переопределение (RID вторник 20.10 — мимо позиций, внутри серии). */
 const withDetached = seedOf(
   "c42detached1@yandex.ru",
-  "Пн и Ср 10:00 МСК, COUNT=2; отдельная встреча с RECURRENCE-ID 20.10 10:00 (Р5.5, detached)",
+  "Пн и Ср 10:00 МСК, COUNT=2; отдельная встреча с RECURRENCE-ID 20.10 10:00 (Р5, роль detached)",
   masterLines("FREQ=WEEKLY;BYDAY=MO,WE;COUNT=2"),
   [
     `RECURRENCE-ID;${moscow("20261020T100000")}`,

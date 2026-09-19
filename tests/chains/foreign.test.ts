@@ -20,6 +20,13 @@
 // На текущем коде все цепочки красные — `it.fails`; снимает `.fails`
 // задача З13. Первое упавшее утверждение каждой цепочки — в отчёте З05c
 // (.superpowers/sdd/2026-09-18-yandex-calendar-mcp/rework-З05c-report.md).
+//
+// Цепочек C55 (эхо) и C56 (stale-shift) здесь нет: по поправке плана «без
+// ремонта следов прежнего кода» роли echo и stale-shift и ремонт
+// legacy-override исключены. Переопределение получает одну из трёх ролей —
+// slot, hidden, detached. Цепочки «наследие» (C34) остались: они проверяют
+// роль hidden, ключ О3 и аномалию multiple-masters, а такие объекты
+// оставляют и другие клиенты.
 import ICAL from "ical.js";
 import { assert, describe, expect, it } from "vitest";
 import { deleteEvent, readEvent, readEvents, updateEvent } from "../../src/domain/events.js";
@@ -1244,77 +1251,6 @@ describe("З05c: объекты других клиентов и следы пр
     assertPropsPreserved(before, fake.ics(path), { except: ["DTSTART", "DTEND", "EXDATE"] });
     assertStoredInvariants(fake);
     done(s2, fake);
-  });
-
-  it.fails("C55: затравка AE12 — перенос и эхо: одна встреча; update без confirm — отказ, с confirm — один компонент с RID 10:00", async () => {
-    const { fake, ctx } = makeStand();
-    const uid = seeds.c55EchoOverride.uid;
-    const path = plant(fake, seeds.c55EchoOverride);
-    const echo = (tail: string) => [
-      "2026-10-19 10:00–11:00 Планёрка",
-      `2026-10-21 15:00–16:00 Планёрка (перенесена)${tail} [слот 2026-10-21 10:00]`,
-      ...lines(SERIES_DAYS.slice(2), "10:00–11:00", "Планёрка"),
-    ];
-
-    // Р5.4: эхо показывается одной встречей по адресу слота переноса, с полями эха.
-    expect(await visible(ctx), describeStand(fake)).toEqual(echo(""));
-    const main = await readEvent(ctx, calendarA.id, uid);
-    expect((main.anomalies ?? []).some((a) => a.startsWith("legacy-override"))).toBe(true);
-
-    // update без confirm — отказ со списком компонентов (Р5).
-    const before = fake.ics(path);
-    let mark = fake.mark();
-    let target = await instance(ctx, uid, "2026-10-21 10:00");
-    const patch = { location: "Переговорная 5" };
-    const s1 = await settle(update(ctx, { id: uid, scope: "this", instanceStart: target.instanceStart, patch }));
-    expectNoWrites(fake, mark);
-    expect(fake.ics(path)).toBe(before);
-    expect(await visible(ctx)).toEqual(echo(""));
-    expect(refusal(s1)).toMatchObject({ code: "legacy-override" });
-
-    // С confirm и etag — ремонт: остаётся один компонент с RID слота, затем патч.
-    mark = fake.mark();
-    target = await instance(ctx, uid, "2026-10-21 10:00");
-    const s2 = await settle(
-      update(ctx, { id: uid, scope: "this", instanceStart: target.instanceStart, patch, confirm: true, etag: target.etag }),
-    );
-    expect(await visible(ctx), describeStand(fake)).toEqual(echo(" @Переговорная 5"));
-    expect(writes(fake, mark)).toEqual(["PUT"]);
-    masterOf(fake.ics(path));
-    expect(overridesOf(fake.ics(path)).flatMap((c) => timeValues(c, "RECURRENCE-ID"))).toEqual([
-      "TZID=Europe/Moscow:20261021T100000",
-    ]);
-    assertStoredInvariants(fake);
-    done(s2, fake);
-  });
-
-  it.fails("C56: затравка R13-N6 — серия сдвинута на 09:00, перенос 21.10 с RID 10:00: одна встреча; delete this — дата пуста", async () => {
-    const { fake, ctx } = makeStand();
-    const uid = seeds.c56StaleShift.uid;
-    const path = plant(fake, seeds.c56StaleShift);
-
-    // Р5.3: stale-shift показывается как перенос единственного слота своей даты.
-    expect(await visible(ctx), describeStand(fake)).toEqual([
-      "2026-10-19 09:00–10:00 Планёрка",
-      "2026-10-21 11:30–12:30 Планёрка [слот 2026-10-21 09:00]",
-      ...lines(SERIES_DAYS.slice(2), "09:00–10:00", "Планёрка"),
-    ]);
-    const main = await readEvent(ctx, calendarA.id, uid);
-    expect((main.anomalies ?? []).some((a) => a.startsWith("legacy-override"))).toBe(true);
-
-    // delete this по адресу встречи снимает её целиком: EXDATE на слот и все её компоненты.
-    const mark = fake.mark();
-    const target = await instance(ctx, uid, "2026-10-21 09:00");
-    const s = await settle(remove(ctx, { id: uid, scope: "this", instanceStart: target.instanceStart, etag: target.etag }));
-    expect(await visible(ctx), describeStand(fake)).toEqual([
-      "2026-10-19 09:00–10:00 Планёрка",
-      ...lines(SERIES_DAYS.slice(2), "09:00–10:00", "Планёрка"),
-    ]);
-    expect(writes(fake, mark)).toEqual(["PUT"]);
-    expect(timeValues(masterOf(fake.ics(path)), "EXDATE")).toEqual(["TZID=Europe/Moscow:20261021T090000"]);
-    expect(overridesOf(fake.ics(path))).toEqual([]);
-    assertStoredInvariants(fake);
-    done(s, fake);
   });
 
   it.fails("C62: основной компонент с DURATION — update this и t&f без DTEND рядом с DURATION", async () => {
