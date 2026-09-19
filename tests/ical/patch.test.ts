@@ -1,5 +1,6 @@
 import ICAL from "ical.js";
 import { describe, expect, it } from "vitest";
+import { instancesBetween } from "../../src/ical/instances.js";
 import { loadObject, serializeObject, type CalendarObject } from "../../src/ical/object.js";
 import { EditRefusal, type Touched } from "../../src/ical/plan.js";
 import {
@@ -10,12 +11,13 @@ import {
   newTouched,
   overrideFromMaster,
   patchRule,
+  resolveTimes,
   setRuleEnd,
   touchMetadata,
 } from "../../src/ical/patch.js";
 import { findSlot } from "../../src/ical/slots.js";
 import { vtimezoneFor } from "../../src/ical/timezones.js";
-import type { IcalEnv, SlotKey } from "../../src/ical/values.js";
+import { formatForModel, type IcalEnv, type SlotKey } from "../../src/ical/values.js";
 
 // Точечная правка полей и правила (О5–О10, Р4 плана переделки,
 // docs/superpowers/plans/2026-09-19-recurring-events-rework.md, задача З08).
@@ -575,6 +577,168 @@ describe("время (О8)", () => {
     const { master: wall } = patchMaster(floating, { start: "2026-10-21T12:00:00" });
     expect(lines(wall, "dtstart")).toEqual(["DTSTART:20261021T120000"]);
     expect(lines(wall, "dtend")).toEqual(["DTEND:20261021T130000"]);
+  });
+});
+
+// ───────────────────── конец при DURATION — как в выдаче (RFC 5545) ─────────────────────
+
+// Правка и выдача обязаны одинаково понимать конец встречи с DURATION (RFC
+// 5545 §3.3.6, §3.8.2.5): дни и недели — номинальные, до того же стенного
+// времени; часы, минуты и секунды — точные, реального времени. Прежняя
+// правка прибавляла часы к стенному времени: в ночь весеннего перевода конец
+// выходил на час раньше, а у часовой встречи совпадал с началом — и
+// корректная встреча получала отказ invalid-time.
+//
+// Берлин, 28.03.2027: в 02:00 CET часы переводятся на 03:00 CEST.
+describe("конец при DURATION — как в выдаче (RFC 5545 §3.3.6, §3.8.2.5)", () => {
+  const berlin = (start: string, duration: string, ...extra: string[]) =>
+    calendar([], vevent([`DTSTART;TZID=Europe/Berlin:${start}`, `DURATION:${duration}`, ...extra, "SUMMARY:Встреча"]));
+  const iso = (t: ICAL.Time | undefined) => {
+    if (!t) throw new Error("правка не назвала конец встречи");
+    return formatForModel(t, ENV, "time");
+  };
+
+  /** Первая встреча объекта так, как её показывает выдача (instances.ts). */
+  function shown(ics: string) {
+    const [first] = instancesBetween(load(ics), 0, Date.parse("2100-01-01T00:00:00Z"));
+    return { start: iso(first.start), end: iso(first.end), hours: (first.endMs - first.startMs) / 3_600_000 };
+  }
+
+  function planOf(ics: string, patch: Parameters<typeof resolveTimes>[1]) {
+    const plan = resolveTimes(load(ics).master!, patch, { env: ENV });
+    if (!plan) throw new Error("в патче нет времени");
+    return plan;
+  }
+
+  it("DURATION:PT2H в ночь перевода: конец ровно через два часа реального времени и совпадает с концом из выдачи", () => {
+    // 01:00 CET + 2 ч = 04:00 CEST; стенное прибавление давало 03:00 CEST — один час.
+    const night = berlin("20270328T010000", "PT2H");
+    expect(shown(night)).toEqual({ start: "2027-03-28T01:00:00+01:00", end: "2027-03-28T04:00:00+02:00", hours: 2 });
+    expect(iso(planOf(night, { start: "2027-03-28T01:00:00" }).end)).toBe("2027-03-28T04:00:00+02:00");
+
+    // Смена пояса сохраняет оба момента, 00:00Z – 02:00Z: DURATION прежняя.
+    // Прежний конец (01:00Z) укоротил бы её до PT1H.
+    expect(iso(planOf(night, { timeZone: "Europe/Moscow" }).end)).toBe("2027-03-28T05:00:00+03:00");
+    const { o: moscow, master: inMoscow } = patchMaster(night, { timeZone: "Europe/Moscow" });
+    expect(lines(inMoscow, "duration")).toEqual(["DURATION:PT2H"]);
+    expect(shown(serializeObject(moscow))).toEqual({ start: "2027-03-28T03:00:00+03:00", end: "2027-03-28T05:00:00+03:00", hours: 2 });
+
+    // Перенос с ночи перевода на обычный день: встреча остаётся двухчасовой.
+    expect(iso(planOf(night, { start: "2027-03-29T10:00:00" }).end)).toBe("2027-03-29T12:00:00+02:00");
+    const { o, master, result } = patchMaster(night, { start: "2027-03-29T10:00:00" });
+    expect(lines(master, "duration")).toEqual(["DURATION:PT2H"]);
+    expect(result.changed).toEqual(["start"]);
+    expect(shown(serializeObject(o))).toEqual({ start: "2027-03-29T10:00:00+02:00", end: "2027-03-29T12:00:00+02:00", hours: 2 });
+
+    // Перенос на ночь перевода — те же два часа по выдаче и по правке.
+    const day = berlin("20270321T010000", "PT2H");
+    expect(iso(planOf(day, { start: "2027-03-28T01:00:00" }).end)).toBe("2027-03-28T04:00:00+02:00");
+    const { o: onNight } = patchMaster(day, { start: "2027-03-28T01:00:00" });
+    expect(shown(serializeObject(onNight))).toEqual({ start: "2027-03-28T01:00:00+01:00", end: "2027-03-28T04:00:00+02:00", hours: 2 });
+  });
+
+  it("DURATION:P1D — номинальные сутки: до того же стенного времени, в ночь перевода — 23 часа, как в выдаче", () => {
+    const week = berlin("20270320T100000", "P1D");
+    // Перенос на 27.03: сутки кончаются 28.03 в 10:00 CEST. Прежняя правка
+    // переносила точные 24 часа прежней встречи — 11:00.
+    expect(iso(planOf(week, { start: "2027-03-27T10:00:00" }).end)).toBe("2027-03-28T10:00:00+02:00");
+    const { o, master } = patchMaster(week, { start: "2027-03-27T10:00:00" });
+    expect(lines(master, "duration")).toEqual(["DURATION:P1D"]);
+    const onNight = serializeObject(o);
+    expect(shown(onNight)).toEqual({ start: "2027-03-27T10:00:00+01:00", end: "2027-03-28T10:00:00+02:00", hours: 23 });
+
+    // И обратно, с ночи перевода на обычный день: снова 24 часа, а не 23.
+    expect(iso(planOf(onNight, { start: "2027-03-30T10:00:00" }).end)).toBe("2027-03-31T10:00:00+02:00");
+    const { o: back } = patchMaster(onNight, { start: "2027-03-30T10:00:00" });
+    expect(shown(serializeObject(back))).toEqual({ start: "2027-03-30T10:00:00+02:00", end: "2027-03-31T10:00:00+02:00", hours: 24 });
+  });
+
+  it("часовая встреча 01:30 CET в ночь перевода не нулевая: перенос и смена пояса — без отказа invalid-time", () => {
+    // 01:30 CET + 1 ч = 03:30 CEST. Стенное прибавление давало 02:30 — время
+    // из разрыва, которое ical.js читает как 01:30 CET: конец = начало.
+    const night = berlin("20270328T013000", "PT1H");
+    expect(shown(night)).toEqual({ start: "2027-03-28T01:30:00+01:00", end: "2027-03-28T03:30:00+02:00", hours: 1 });
+
+    const { o, master, result } = patchMaster(night, { start: "2027-03-29T10:00:00" });
+    expect(result.changed).toEqual(["start"]);
+    expect(lines(master, "dtstart")).toEqual(["DTSTART;TZID=Europe/Berlin:20270329T100000"]);
+    expect(lines(master, "duration")).toEqual(["DURATION:PT1H"]);
+    expect(shown(serializeObject(o)).hours).toBe(1);
+
+    // Смена пояса сохраняет моменты: 00:30Z – 01:30Z, DURATION та же.
+    const { o: moscow, master: inMoscow } = patchMaster(night, { timeZone: "Europe/Moscow" });
+    expect(lines(inMoscow, "dtstart")).toEqual(["DTSTART;TZID=Europe/Moscow:20270328T033000"]);
+    expect(lines(inMoscow, "duration")).toEqual(["DURATION:PT1H"]);
+    expect(shown(serializeObject(moscow))).toEqual({ start: "2027-03-28T03:30:00+03:00", end: "2027-03-28T04:30:00+03:00", hours: 1 });
+  });
+
+  it("timeZone у DURATION в сутках через перевод сохраняет и момент конца: DURATION пересчитана", () => {
+    // 27.03 10:00 CET – 28.03 10:00 CEST — 23 часа. В Москве сутки — 24 часа:
+    // прежняя DURATION:P1D сдвинула бы конец на час.
+    const { o, master } = patchMaster(berlin("20270327T100000", "P1D"), { timeZone: "Europe/Moscow" });
+    expect(lines(master, "dtstart")).toEqual(["DTSTART;TZID=Europe/Moscow:20270327T120000"]);
+    expect(lines(master, "duration")).toEqual(["DURATION:PT23H"]);
+    expect(shown(serializeObject(o))).toEqual({ start: "2027-03-27T12:00:00+03:00", end: "2027-03-28T11:00:00+03:00", hours: 23 });
+  });
+
+  it("end у события с DURATION через перевод: записанная DURATION даёт в выдаче ровно этот конец", () => {
+    // ical.js сворачивает секунды в сутки (duration.js, fromSeconds): 24 часа
+    // — P1D, а P1D через перевод — 23 часа. Сутки берутся по стенному
+    // календарю, остаток — точный.
+    const cases: Array<[string, string, number]> = [
+      ["2027-03-28T13:00:00", "DURATION:P1DT3H", 26],
+      ["2027-03-28T11:00:00", "DURATION:P1DT1H", 24],
+      ["2027-03-28T10:00:00", "DURATION:P1D", 23],
+      ["2027-03-28T09:00:00", "DURATION:PT22H", 22],
+    ];
+    for (const [end, duration, hours] of cases) {
+      const { o, master } = patchMaster(berlin("20270327T100000", "PT1H"), { end });
+      expect(lines(master, "duration"), end).toEqual([duration]);
+      expect(shown(serializeObject(o)), end).toEqual({ start: "2027-03-27T10:00:00+01:00", end: `${end}+02:00`, hours });
+    }
+
+    // Осенний перевод, 25.10.2026 в 03:00 CEST на 02:00 CET: сутки — 25 часов.
+    // 24,5 часа не дотягивают до стенных суток — точные часы без суток.
+    const autumn: Array<[string, string, number]> = [
+      ["2026-10-25T10:00:00", "DURATION:P1D", 25],
+      ["2026-10-25T09:30:00", "DURATION:PT24H30M", 24.5],
+    ];
+    for (const [end, duration, hours] of autumn) {
+      const { o, master } = patchMaster(berlin("20261024T100000", "PT1H"), { end });
+      expect(lines(master, "duration"), end).toEqual([duration]);
+      expect(shown(serializeObject(o)), end).toEqual({ start: "2026-10-24T10:00:00+02:00", end: `${end}+01:00`, hours });
+    }
+  });
+
+  it("DURATION с той же суммой секунд, но другим концом, переписывается; с тем же концом — нет (О13)", () => {
+    // PT24H от 27.03 10:00 CET — 28.03 11:00 CEST; P1D — 10:00 CEST.
+    const exact = berlin("20270327T100000", "PT24H");
+    const { o, master, result } = patchMaster(exact, { end: "2027-03-28T10:00:00" });
+    expect(lines(master, "duration")).toEqual(["DURATION:P1D"]);
+    expect(result.changed).toEqual(["end"]);
+    expect(shown(serializeObject(o)).end).toBe("2027-03-28T10:00:00+02:00");
+
+    // Без перевода часов PT24H и P1D — один и тот же конец: запись не нужна.
+    const plain = berlin("20271020T100000", "PT24H");
+    const { master: same, result: nothing, before, o: untouched } = patchMaster(plain, { end: "2027-10-21T10:00:00" });
+    expect(lines(same, "duration")).toEqual(["DURATION:PT24H"]);
+    expect(nothing).toEqual({ changed: [], significant: false });
+    expect(jcalOf(untouched)).toEqual(before);
+  });
+
+  it("клон слота RDATE;VALUE=PERIOD через перевод: DURATION клона даёт конец периода, как у слота в выдаче", () => {
+    const ics = berlin("20270320T100000", "PT1H", "RRULE:FREQ=WEEKLY;COUNT=1",
+      "RDATE;VALUE=PERIOD;TZID=Europe/Berlin:20270327T100000/20270328T130000");
+    const slotKey: SlotKey = `T:${Date.parse("2027-03-27T10:00:00+01:00") / 1000}`;
+    const before = instancesBetween(load(ics), 0, Date.parse("2100-01-01T00:00:00Z")).find((i) => i.key === slotKey)!;
+    expect(iso(before.end)).toBe("2027-03-28T13:00:00+02:00");
+
+    const o = load(ics);
+    const clone = overrideFromMaster(o, findSlot(o, slotKey)!);
+    expect(lines(clone, "duration")).toEqual(["DURATION:P1DT3H"]);
+    const after = instancesBetween(load(serializeObject(o)), 0, Date.parse("2100-01-01T00:00:00Z")).find((i) => i.key === slotKey)!;
+    expect(after.kind).toBe("override");
+    expect(iso(after.end)).toBe("2027-03-28T13:00:00+02:00");
   });
 });
 
