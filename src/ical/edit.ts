@@ -1337,7 +1337,8 @@ function refuseForeignTimeOfDay(run: Run, boundary: SlotTarget, fields: FieldPat
   const b = boundary.slot.time; // в форме и поясе DTSTART (slots.ts, Slot.time)
   const date = dateString(b);
   if (fields.start === undefined && fields.end === undefined) return date;
-  if ((fields.allDay ?? o.form === "date") || o.form === "date") return date;
+  // «Весь день» — у него времени суток нет: ни до правки (форма серии date), ни после (allDay: true).
+  if (fields.allDay === true || o.form === "date") return date;
   const d = o.master!.getFirstPropertyValue("dtstart") as ICAL.Time;
   if (b.hour === d.hour && b.minute === d.minute && b.second === d.second) return date;
   throw unsynced(
