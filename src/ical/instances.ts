@@ -63,7 +63,21 @@ import {
  * маскируется: в повторный осенний час RECURRENCE-ID другого клиента,
  * записанный в UTC на первое вхождение часа, не совпадает с ключом слота
  * ical.js (второе вхождение). Такое переопределение — detached, и встреча
- * видна дважды: отдельно и обычным слотом. Данные не теряются.
+ * видна дважды: отдельно и обычным слотом. При чтении данные не теряются,
+ * но адресация этой пары сломана. У detached и у слота один и тот же
+ * `instanceStart`: адрес detached приводится к стенному времени серии
+ * (Berlin, RID 20261025T003000Z → «2026-10-25T02:30:00+01:00»), а ical.js
+ * читает это время как второе вхождение часа, то есть как слот. Поэтому:
+ * - `resolveTarget` по этой строке всегда выбирает слот. Если detached
+ *   начинается в своём RECURRENCE-ID, неоднозначность не находится (ключ его
+ *   начала T:…00:30Z, ключ слота T:…01:30Z), и delete по адресу, показанному
+ *   у detached, молча снимает слот (EXDATE), а detached остаётся;
+ * - если detached перенесён на время слота, отказ ambiguous приходит с двумя
+ *   одинаковыми адресами, и подсказка «передайте instanceStart
+ *   перенесённой» ведёт снова к слоту;
+ * - сам detached достижим только по моменту в UTC («2026-10-25T00:30:00Z»),
+ *   а такой строки выдача не показывает.
+ * Чинить — в ключах и формате адреса (values.ts, владелец дефекта), не здесь.
  */
 
 // ─────────────────────────────── типы ───────────────────────────────
@@ -210,7 +224,9 @@ export interface EventMeta {
  * их конечное число, — так что встреча, перенесённая в окно с любого
  * слота, в выдаче есть. Слоты без своего компонента перебираются от начала
  * серии (итератор ical.js иначе не умеет, recur.js iterator) до конца окна
- * плюс сутки и наибольший сдвиг RANGE назад.
+ * плюс сутки и наибольший сдвиг RANGE назад. Встреча строится только у
+ * слота, который может дотянуться до окна (`latestEndMs`): у давней серии
+ * слоты до окна лишь перебираются.
  *
  * Бросает `SlotScanError`: "too-long" — до конца окна больше SERIES_CAP
  * слотов; "stalled" и "rule-error" — итератор сбился посреди серии. Решать,
@@ -229,8 +245,10 @@ export function instancesBetween(o: CalendarObject, fromMs: number, toMs: number
     const view = seriesView(o);
     const stopMs = toMs + view.lookaheadMs;
     for (const slot of boundedSlots(o, SERIES_CAP)) {
-      if (instantOf(slot.time, o.env) >= stopMs) break;
+      const slotMs = instantOf(slot.time, o.env);
+      if (slotMs >= stopMs) break;
       if (slot.excluded || hasSlotOverride(o, slot.key)) continue;
+      if (latestEndMs(view, slot, slotMs) < fromMs) continue; // кончилась до окна — не строим
       keep(slotInstance(view, slot));
     }
   }
@@ -594,21 +612,59 @@ interface SeriesView {
   ranges: RangeShift[];
   /** Насколько дальше конца окна перебирать слоты: сутки и наибольший сдвиг RANGE назад. */
   lookaheadMs: number;
+  /**
+   * Насколько конец встречи слота может быть позже момента слота (верхняя
+   * граница): наибольший сдвиг RANGE вперёд, наибольшая длительность —
+   * основного и переопределений RANGE — и запас на переводы часов. Конец
+   * RDATE;VALUE=PERIOD — свой, его учитывает `latestEndMs`.
+   */
+  reachMs: number;
 }
+
+/**
+ * Запас границ на переводы часов: стенной сдвиг (RANGE, номинальные сутки
+ * DURATION) расходится с точным на величину переводов внутри него. Двое
+ * суток покрывают и обычный час, и переход через линию перемены дат (Самоа,
+ * 30.12.2011, — сутки).
+ */
+const DRIFT_MS = 2 * DAY_MS;
 
 function seriesView(o: CalendarObject): SeriesView {
   const master = o.master!;
   const dtend = master.getFirstPropertyValue("dtend");
   const ranges = rangeShifts(o);
+  const length = lengthOf(master, o.env);
   const back = Math.max(0, ...ranges.map((range) => -range.seconds * 1000));
+  const forward = Math.max(0, ...ranges.map((range) => range.seconds * 1000));
+  const longest = Math.max(lengthBoundMs(length), ...ranges.map((range) => lengthBoundMs(range.length)));
   return {
     o,
     master,
-    length: lengthOf(master, o.env),
+    length,
     dtend: dtend instanceof ICAL.Time ? dtend : undefined,
     ranges,
     lookaheadMs: back + DAY_MS,
+    reachMs: forward + longest + DRIFT_MS,
   };
+}
+
+// Верхняя граница длительности в миллисекундах: номинальные сутки — не
+// длиннее суток, расхождение с точными покрывает DRIFT_MS; отрицательные
+// части — ноль (конец тогда раньше начала, а начало граница и так покрывает).
+function lengthBoundMs(length: Length): number {
+  return Math.max(0, length.days) * DAY_MS + Math.max(0, length.seconds) * 1000;
+}
+
+// Позже какого момента встреча слота кончиться не может (`slotMs` — момент
+// слота): момент слота плюс `reachMs`, у RDATE;VALUE=PERIOD без сдвига RANGE
+// — конец периода (slotInstance). Нужна, чтобы не строить встречи слотов,
+// которые кончились до окна (instancesBetween): у DAILY с 1990 года это
+// тысячи встреч на каждый вызов. Отсечение верно и для встречи без
+// длительности или с концом раньше начала: её начало не позже этой границы.
+function latestEndMs(view: SeriesView, slot: Slot, slotMs: number): number {
+  const bound = slotMs + view.reachMs;
+  if (!slot.periodEnd) return bound;
+  return Math.max(bound, instantOf(slot.periodEnd, view.o.env) + DRIFT_MS);
 }
 
 // RFC 5545 §3.8.4.4: у RANGE=THISANDFUTURE время и поля переопределения

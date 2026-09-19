@@ -1,5 +1,5 @@
 import ICAL from "ical.js";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   AddressError,
   hiddenOverrides,
@@ -22,6 +22,23 @@ import * as seeds from "../support/seeds.js";
 // slot, hidden, detached).
 // Ожидания — строки ISO со смещением: тесты не зависят от пояса процесса
 // (прогон под тремя поясами — npm run test:tz).
+//
+// formatForModel обёрнут счётчиком: адрес (instanceStart) каждая
+// построенная встреча получает через него (makeInstance), так что число
+// вызовов — число построенных встреч. По нему видно, что у давней серии
+// встречи слотов до окна не строятся. Остальное в values.ts — как есть.
+const formatted = vi.hoisted(() => ({ count: 0 }));
+
+vi.mock("../../src/ical/values.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/ical/values.js")>();
+  return {
+    ...actual,
+    formatForModel: (...args: Parameters<typeof actual.formatForModel>) => {
+      formatted.count += 1;
+      return actual.formatForModel(...args);
+    },
+  };
+});
 
 const ENV: IcalEnv = { floatingZone: "Europe/Moscow", ownerEmail: "user@yandex.ru" };
 const CRLF = "\r\n";
@@ -236,6 +253,57 @@ describe("instancesBetween: окно и сортировка по фактиче
     ]);
   });
 
+  // Ежедневно с 1990 года: до окна в октябре 2026 года больше 13 000 слотов.
+  const since1990 = () => load(calendar(MOSCOW, vevent(["DTSTART;TZID=Europe/Moscow:19900101T100000",
+    "DTEND;TZID=Europe/Moscow:19900101T110000", "RRULE:FREQ=DAILY", "SUMMARY:Давняя"])));
+
+  it("давняя серия: встречи слотов, кончившихся до окна, не строятся — ни в выдаче, ни в resolveTarget", () => {
+    const o = since1990();
+    formatted.count = 0;
+    const list = instancesBetween(o, Date.parse("2026-10-19T00:00:00+03:00"), Date.parse("2026-10-26T00:00:00+03:00"));
+    const builtForWindow = formatted.count;
+    expect(list.map((i) => i.instanceStart)).toEqual([
+      "2026-10-19T10:00:00+03:00", "2026-10-20T10:00:00+03:00", "2026-10-21T10:00:00+03:00", "2026-10-22T10:00:00+03:00",
+      "2026-10-23T10:00:00+03:00", "2026-10-24T10:00:00+03:00", "2026-10-25T10:00:00+03:00",
+    ]);
+    // Строятся только слоты у окна (с запасом), а не все с 1990 года.
+    expect(builtForWindow).toBeLessThan(20);
+
+    formatted.count = 0;
+    expect(resolve(o, "2026-10-21T10:00:00+03:00", "update").target.kind).toBe("slot");
+    expect(formatted.count).toBeLessThan(20);
+  });
+
+  it("отсечение слотов до окна не теряет встреч, дотянувшихся до окна: RANGE вперёд, долгая DURATION, долгий PERIOD, перевод часов", () => {
+    // RANGE со слота 19.10 на десять суток вперёд: встреча слота 21.10 — 31.10.
+    const forward = series([], vevent(["RECURRENCE-ID;RANGE=THISANDFUTURE;TZID=Europe/Moscow:20261019T100000",
+      "DTSTART;TZID=Europe/Moscow:20261029T100000", "DTEND;TZID=Europe/Moscow:20261029T110000", "SUMMARY:Вперёд"]));
+    expect(between(forward, "2026-10-31T00:00:00+03:00", "2026-11-01T00:00:00+03:00")).toEqual([
+      "2026-10-21T10:00:00+03:00 → 2026-10-31T10:00:00+03:00/2026-10-31T11:00:00+03:00 Вперёд [range, moved]",
+    ]);
+    // Каждая встреча — десять суток: в окне 28.10 и встреча слота 19.10.
+    const long = load(calendar(MOSCOW, vevent(["DTSTART;TZID=Europe/Moscow:20261019T100000", "DURATION:P10D",
+      "RRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=3", "SUMMARY:Сессия"])));
+    expect(between(long, "2026-10-28T12:00:00+03:00", "2026-10-28T13:00:00+03:00")).toEqual([
+      "2026-10-19T10:00:00+03:00 → 2026-10-19T10:00:00+03:00/2026-10-29T10:00:00+03:00 Сессия [slot]",
+      "2026-10-26T10:00:00+03:00 → 2026-10-26T10:00:00+03:00/2026-11-05T10:00:00+03:00 Сессия [slot]",
+    ]);
+    // RDATE;VALUE=PERIOD на двадцать суток с 07.10: в окне 25.10 — только она.
+    const period = load(calendar(MOSCOW, vevent(["DTSTART;TZID=Europe/Moscow:20261005T100000",
+      "DTEND;TZID=Europe/Moscow:20261005T110000", "RRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=3",
+      "RDATE;VALUE=PERIOD;TZID=Europe/Moscow:20261007T100000/P20D", "SUMMARY:Выставка"])));
+    expect(between(period, "2026-10-25T00:00:00+03:00", "2026-10-26T00:00:00+03:00")).toEqual([
+      "2026-10-07T10:00:00+03:00 → 2026-10-07T10:00:00+03:00/2026-10-27T10:00:00+03:00 Выставка [slot]",
+    ]);
+    // Сутки DURATION номинальные: встреча 24.10 10:00 CEST в Берлине кончается
+    // 25.10 10:00 CET, через 25 часов, — в последний свой час она ещё видна.
+    const day = load(calendar(BERLIN, vevent(["DTSTART;TZID=Europe/Berlin:20261024T100000", "DURATION:P1D",
+      "RRULE:FREQ=WEEKLY;COUNT=2", "SUMMARY:Сутки"])));
+    expect(between(day, "2026-10-25T09:30:00+01:00", "2026-10-25T09:45:00+01:00")).toEqual([
+      "2026-10-24T10:00:00+02:00 → 2026-10-24T10:00:00+02:00/2026-10-25T10:00:00+01:00 Сутки [slot]",
+    ]);
+  });
+
   it("весь день: адрес — дата, начало и конец — полночь пояса календаря; RECURRENCE-ID в DATE-TIME — та же дата (C34)", () => {
     const o = load(seeds.allDayWeekly.ics.replace("END:VCALENDAR", [
       ...vevent(["RECURRENCE-ID:20261021T000000Z", "DTSTART;VALUE=DATE:20261021", "DTEND;VALUE=DATE:20261022",
@@ -353,6 +421,24 @@ describe("parseAddress: приём instanceStart (Р10)", () => {
       "2026-10-21T00:00:00Z", "2026-10-21T00:00:00", "2026-10-21T00:00-05:00"]) {
       expect(parseAddress(o, input)).toBe("D:2026-10-21");
     }
+  });
+
+  // J-B6, AE9, AE14: дата — буквальная, а не дата момента в поясе календаря.
+  // Ошибка видна только там, где полночь по UTC — в календаре ещё вчера.
+  it("серия на весь день в календаре западнее UTC: полночь по UTC и восточнее — та же дата, а не предыдущая", () => {
+    const west = load(seeds.allDayWeekly.ics, { floatingZone: "America/New_York" });
+    for (const input of ["2026-10-21T00:00:00+00:00", "2026-10-21T00:00:00Z", "2026-10-21T00:00:00+03:00", "2026-10-21"]) {
+      expect(parseAddress(west, input), input).toBe("D:2026-10-21");
+    }
+    // Восточнее пояса календаря: полночь +05:00 — это 22:00 МСК накануне, а дата та же.
+    expect(parseAddress(load(seeds.allDayWeekly.ics), "2026-10-21T00:00:00+05:00")).toBe("D:2026-10-21");
+  });
+
+  it("серия со временем без смещения — стенное время пояса серии, а не пояса календаря (Берлин в календаре Москвы)", () => {
+    const o = load(seeds.dailyBerlin.ics);
+    expect(parseAddress(o, "2026-10-21T10:00:00")).toBe(at("2026-10-21T10:00:00+02:00"));
+    expect(parseAddress(o, "2026-10-26T10:00:00")).toBe(at("2026-10-26T10:00:00+01:00"));
+    expect(resolve(o, "2026-10-26T10:00:00", "update").target).toMatchObject({ kind: "slot", key: at("2026-10-26T10:00:00+01:00") });
   });
 
   it("плавающая серия: момент — стенное время пояса календаря", () => {
@@ -488,6 +574,21 @@ describe("resolveTarget: слот, detached, скрытое, фактическ�
       expect(error.alternatives).toEqual(["2026-10-21T08:00:00+03:00", "2026-10-20T08:00:00+03:00"]);
     });
 
+    // Отменённая встреча видна в list_events со своим временем (Р7), так что
+    // её фактическое начало модель может передать как адрес.
+    it("отменённая перенесённая встреча тоже участвует: адрес 28.10 — ambiguous, её начало — actual-start", () => {
+      const o = series([], moved("20261026T100000", "20261028T100000", "20261028T110000", "STATUS:CANCELLED"));
+      for (const op of ["delete", "update"] as const) {
+        const error = refusal(() => resolve(o, "2026-10-28T10:00:00+03:00", op));
+        expect(error.code).toBe("ambiguous");
+        expect(error.alternatives).toEqual(["2026-10-28T10:00:00+03:00", "2026-10-26T10:00:00+03:00"]);
+      }
+      const off = series([], moved("20261021T100000", "20261021T113000", "20261021T123000", "STATUS:CANCELLED"));
+      const error = refusal(() => resolve(off, "2026-10-21T11:30:00+03:00", "delete"));
+      expect(error.code).toBe("actual-start");
+      expect(error.alternatives).toEqual(["2026-10-21T10:00:00+03:00"]);
+    });
+
     it("адрес перенесённой (26.10) неоднозначности не даёт", () => {
       const resolved = resolve(s5c(), "2026-10-26T10:00:00+03:00", "delete");
       expect(resolved.target).toMatchObject({ kind: "slot", key: at("2026-10-26T10:00:00+03:00") });
@@ -570,6 +671,16 @@ describe("resolveTarget: слот, detached, скрытое, фактическ�
     expect(refusal(() => resolve(o, "2026-10-20", "update")).code).toBe("not-found");
   });
 
+  it("весь день в календаре западнее UTC: прежний «…T00:00:00+00:00» — встреча той же даты (J-B6)", () => {
+    const o = load(seeds.allDayWeekly.ics, { floatingZone: "America/New_York" });
+    for (const op of ["delete", "update"] as const) {
+      const { target } = resolve(o, "2026-10-21T00:00:00+00:00", op);
+      expect(target).toMatchObject({ kind: "slot", key: "D:2026-10-21" });
+      if (target.kind !== "slot") throw new Error("ожидался слот");
+      expect(target.instance.instanceStart).toBe("2026-10-21");
+    }
+  });
+
   it("instanceAt: встреча по адресу или undefined", () => {
     const o = series(["EXDATE;TZID=Europe/Moscow:20261026T100000"],
       moved("20261021T100000", "20261021T113000", "20261021T123000"));
@@ -605,6 +716,17 @@ describe("visibleMap и hiddenOverrides", () => {
     const map = visibleMap(o(), { until: at("2026-10-21T10:00:00+03:00"), minSlots: 3 });
     expect([...map.values()].map((i) => i.instanceStart)).toEqual([
       "2026-10-19T10:00:00+03:00", "2026-10-21T10:00:00+03:00", "2026-10-22T10:00:00+03:00", "2026-10-28T10:00:00+03:00",
+    ]);
+  });
+
+  it("переопределения за горизонтом в карту не попадают: ни встреча слота, ни detached", () => {
+    const beyond = series([],
+      moved("20261028T100000", "20261028T120000", "20261028T130000"),
+      moved("20261029T100000", "20261029T100000", "20261029T110000", "SUMMARY:Отдельная"));
+    const map = visibleMap(beyond, { until: at("2026-10-21T10:00:00+03:00") });
+    expect([...map.values()].map((i) => `${i.instanceStart} ${i.kind}`)).toEqual([
+      "2026-10-19T10:00:00+03:00 slot",
+      "2026-10-21T10:00:00+03:00 slot",
     ]);
   });
 
@@ -744,6 +866,13 @@ describe("toCalendarEvent: форматы Р10", () => {
     ]);
     expect(event.exceptions?.every((e) => typeof e.reason === "string" && e.reason.length > 0)).toBe(true);
     expect(event.anomalies).toEqual([expect.stringMatching(/^duplicate-override: /)]);
+  });
+
+  it("exceptions: EXDATE мимо слотов серии не выдаётся — он ничего не закрывает", () => {
+    const o = series(["EXDATE;TZID=Europe/Moscow:20261020T100000,20261021T100000", "EXDATE;TZID=Europe/Moscow:20261026T113000"]);
+    expect(toCalendarEvent(o, "object", META).exceptions?.map((e) => `${e.instanceStart} ${e.state}`)).toEqual([
+      "2026-10-21T10:00:00+03:00 excluded",
+    ]);
   });
 
   it("объект из одних переопределений (Р6) целиком: первая встреча, detached, адрес — RECURRENCE-ID", () => {
