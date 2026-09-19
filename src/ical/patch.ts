@@ -9,7 +9,7 @@ import {
   type RecurrencePatch,
   type Touched,
 } from "./plan.js";
-import { seriesZoneOf, type Slot } from "./slots.js";
+import { probeRules, seriesZoneOf, type Slot } from "./slots.js";
 import { vtimezoneFor } from "./timezones.js";
 import {
   formOf,
@@ -45,10 +45,14 @@ import type { RecurrenceFrequency, Reminder } from "../types.js";
  * `EditRefusal` оставляет компонент нетронутым. Всё, что правка изменила,
  * добавила или сняла, записывается в `Touched` — для предохранителя (О12б).
  *
- * Что модуль НЕ делает (это работа планировщика edit.ts): выбор компонентов
- * по scope, сдвиг серии по Р1, перенос RECURRENCE-ID, EXDATE и RDATE в новую
- * форму DTSTART при смене «весь день», разрез, SEQUENCE и DTSTAMP без явного
- * вызова `touchMetadata`.
+ * Что модуль НЕ делает (это работа планировщика edit.ts, З10): выбор
+ * компонентов по scope, сдвиг серии по Р1, разрез, SEQUENCE и DTSTAMP без
+ * явного вызова `touchMetadata`, а также перевод значений серии в новую форму
+ * DTSTART (О4). `applyFieldPatch` правит у основного только DTSTART, DTEND и
+ * DURATION: при смене `timeZone` или `allDay` EXDATE, RDATE, RECURRENCE-ID
+ * переопределений (и UNTIL, если форма сменилась между датой, плавающим и
+ * временем с поясом или UTC) остаются в прежнем TZID или прежней форме —
+ * перевести их обязан планировщик.
  *
  * Пояс процесса не участвует нигде: время от модели разбирает
  * `parseModelTime`, моменты считает values.ts через ical.js.
@@ -87,6 +91,17 @@ function markComponent(touched: Touched | undefined, parent: ICAL.Component, sub
  * Глубокая копия компонента без родителя — например, снимок основного до
  * правки для `inheritFields`. jCal копируется целиком
  * (node_modules/ical.js/lib/ical/helpers.js, clone с aDeep).
+ *
+ * Внимание: у копии нет дерева, и значения с TZID она читает не по VTIMEZONE
+ * объекта, а из глобального ICAL.TimezoneService (time.js,
+ * fromDateTimeString: `prop.parent.getTimeZoneByID`, иначе `timezone: zoneId`
+ * → time.js, fromData → TimezoneService.get; component.js, getTimeZoneByID
+ * ищет только вверх по родителям). Пояс, описанный лишь в дереве, там не
+ * зарегистрирован (object.ts, registerZones берёт из базы только TZID без
+ * VTIMEZONE), и значение прочтётся плавающим, а другой описанный пояс — по
+ * чужому описанию. Время, пояс и правило (`resolveTimes`, `patchRule`, UNTIL)
+ * у такой копии не читать: сначала вставить её в VCALENDAR объекта или брать
+ * значения у исходного компонента. Текст, участники и VALARM — можно.
  */
 export function cloneComponent(c: ICAL.Component): ICAL.Component {
   return new ICAL.Component(ICAL.helpers.clone(c.jCal, true));
@@ -420,7 +435,7 @@ export interface TimePlan {
   zoneChanged: boolean;
   /** Форма сменилась между датой и временем (allDay). */
   formChanged: boolean;
-  /** TZID целевой формы zoned — для VTIMEZONE. */
+  /** TZID целевой формы zoned (VTIMEZONE `writeTimes` добавляет по TZID записанных значений). */
   tzid?: string;
 }
 
@@ -435,9 +450,12 @@ export interface TimePlan {
  *   перевода — отказ, как у сборки (build.ts, timedValue);
  * - `timeZone` без `start` сохраняет моменты: DTSTART и DTEND переписываются
  *   стенным временем нового пояса; UTC, GMT и Z — форма UTC (как build.ts);
+ *   у события в неизвестном поясе момент не определён — отказ
+ *   `unknown-timezone` (как и у `start` и `end` в этом поясе);
  * - `allDay: true` без `start` — дата начала события; конец — день после
- *   последнего затронутого дня; `allDay: false` у события на весь день
- *   требует `start` и `end`, пояс — `timeZone` или `defaultTimeZone`.
+ *   последнего затронутого дня; со `start` без `end` — столько же затронутых
+ *   дней от новой даты; `allDay: false` у события на весь день требует
+ *   `start` и `end`, пояс — `timeZone` или `defaultTimeZone`.
  * Без полей времени в патче — undefined.
  */
 export function resolveTimes(c: ICAL.Component, p: FieldPatch, ctx: PatchContext): TimePlan | undefined {
@@ -458,7 +476,12 @@ export function resolveTimes(c: ICAL.Component, p: FieldPatch, ctx: PatchContext
   const durationProperty = c.getFirstProperty("duration");
   const oldEnd = endOf(oldStart, dtendProperty, durationProperty);
 
-  // Целевая форма.
+  // Целевая форма. Время в неизвестном поясе ical.js прочёл плавающим
+  // (unknownZone): стенное время известно, момент — нет. Новое время в этом
+  // поясе не записать, а смена пояса без start угадала бы момент по поясу
+  // календаря — в обоих случаях отказ.
+  const zoneUnknown = unknownZone(startProperty);
+  const unknownTzid = String(startProperty.getParameter("tzid"));
   const allDay = p.allDay ?? current.form === "date";
   let target: Frame;
   if (allDay) {
@@ -466,15 +489,20 @@ export function resolveTimes(c: ICAL.Component, p: FieldPatch, ctx: PatchContext
     target = { form: "date" };
   } else if (p.timeZone !== undefined && !(current.form === "zoned" && current.tzid === p.timeZone)) {
     target = frameForZone(p.timeZone, c);
+    if (zoneUnknown && p.start === undefined) {
+      throw new EditRefusal(
+        "unknown-timezone",
+        `Пояс ${unknownTzid} события неизвестен: момент начала события не определён, и сменить пояс с сохранением времени нельзя.`,
+        { hint: "Передайте вместе с timeZone новое время целиком: start и end, например 2026-10-21T10:00:00 и 2026-10-21T11:00:00." },
+      );
+    }
   } else if (current.form === "date") {
     target = frameForZone(ctx.defaultTimeZone ?? env.floatingZone, c);
   } else {
-    if (unknownZone(startProperty) && (p.start !== undefined || p.end !== undefined)) {
-      throw new EditRefusal(
-        "unknown-timezone",
-        `Пояс ${String(startProperty.getParameter("tzid"))} события неизвестен: новое время в нём не записать.`,
-        { hint: "Передайте вместе со временем timeZone — пояс IANA, например Europe/Moscow." },
-      );
+    if (zoneUnknown && (p.start !== undefined || p.end !== undefined)) {
+      throw new EditRefusal("unknown-timezone", `Пояс ${unknownTzid} события неизвестен: новое время в нём не записать.`, {
+        hint: "Передайте вместе со временем timeZone — пояс IANA, например Europe/Moscow.",
+      });
     }
     target = current;
   }
@@ -495,7 +523,7 @@ export function resolveTimes(c: ICAL.Component, p: FieldPatch, ctx: PatchContext
   if (p.end !== undefined) end = parseIn(p.end, "end", target, env);
   else if (fromDate) throw needStartAndEnd();
   else if (oldEnd === undefined) end = undefined;
-  else if (toDate) end = allDayEnd(start, oldEnd, current, env);
+  else if (toDate) end = addDays(start, allDaySpan(oldStart, oldEnd, current, env));
   else end = keepDuration(oldStart, oldEnd, start, target, env);
 
   // Проверяется только сдвинутое время: патч, который ни начала, ни конца не
@@ -530,15 +558,20 @@ export function resolveTimes(c: ICAL.Component, p: FieldPatch, ctx: PatchContext
 export function writeTimes(c: ICAL.Component, plan: TimePlan, ctx: PatchContext): PatchField[] {
   const touched = ctx.touched;
   const changed = new Set<PatchField>();
+  const written: ICAL.Property[] = [];
   const startProperty = c.getFirstProperty("dtstart");
   if (!startProperty || !sameTimeValue(startProperty, plan.start)) {
-    markProperty(touched, c, setTimeProperty(c, "dtstart", plan.start));
+    const property = setTimeProperty(c, "dtstart", plan.start);
+    markProperty(touched, c, property);
+    written.push(property);
     changed.add("start");
   }
   if (plan.dtend) {
     const property = c.getFirstProperty("dtend");
     if (!property || !sameTimeValue(property, plan.dtend)) {
-      markProperty(touched, c, setTimeProperty(c, "dtend", plan.dtend));
+      const next = setTimeProperty(c, "dtend", plan.dtend);
+      markProperty(touched, c, next);
+      written.push(next);
       changed.add("end");
     }
   }
@@ -560,18 +593,34 @@ export function writeTimes(c: ICAL.Component, plan: TimePlan, ctx: PatchContext)
   }
   if (changed.size > 0 && plan.zoneChanged) changed.add("timeZone");
   if (changed.size > 0 && plan.formChanged) changed.add("allDay");
-  // VTIMEZONE — только для пояса, которого у DTSTART не было (О5: пояса
-  // только добавляются); прежний TZID объект уже как-то описывал.
-  if (changed.size > 0 && plan.tzid && (plan.zoneChanged || plan.formChanged)) {
-    const root = rootOf(c);
-    if (root) {
-      for (const tzid of ensureTimezones(root, [plan.tzid])) {
-        const added = root.getAllSubcomponents("vtimezone").find((zone) => String(zone.getFirstPropertyValue("tzid")) === tzid);
-        if (added) markComponent(touched, root, added);
-      }
-    }
-  }
+  // VTIMEZONE на TZID каждого записанного значения (О12а), в том числе
+  // прежнего TZID, если объект его не описывал; имеющиеся не трогаются (О5).
+  addTimezones(c, written, touched);
   return PATCH_FIELDS.filter((field) => changed.has(field));
+}
+
+/**
+ * Добавляет в VCALENDAR компонента VTIMEZONE для TZID записанных значений,
+ * которых в объекте нет (object.ts, ensureTimezones: копия из базы IANA).
+ * Пояс, которого нет и в базе (например, TZID=Z — синоним UTC у ical.js),
+ * описать нечем: он остаётся как был, без VTIMEZONE. У компонента без
+ * родителя VCALENDAR нет — ничего не добавляется.
+ */
+function addTimezones(c: ICAL.Component, properties: readonly ICAL.Property[], touched: Touched | undefined): void {
+  const root = rootOf(c);
+  if (!root) return;
+  const tzids = new Set(properties.filter((property) => formOf(property) === "zoned").map((property) => String(property.getParameter("tzid"))));
+  for (const tzid of tzids) {
+    let added: string[];
+    try {
+      added = ensureTimezones(root, [tzid]);
+    } catch {
+      continue;
+    }
+    if (added.length === 0) continue;
+    const zone = root.getAllSubcomponents("vtimezone").find((sub) => String(sub.getFirstPropertyValue("tzid")) === tzid);
+    if (zone) markComponent(touched, root, zone);
+  }
 }
 
 function needStartAndEnd(): EditRefusal {
@@ -761,15 +810,18 @@ function dateOfTimed(t: ICAL.Time, frame: Frame, env: IcalEnv): ICAL.Time {
   return ICAL.Time.fromData({ year, month, day, isDate: true });
 }
 
-// Конец события на весь день из конца события со временем: день после
-// последнего затронутого (конец в полночь дня не затрагивает), не меньше
-// одного дня.
-function allDayEnd(start: ICAL.Time, oldEnd: ICAL.Time, frame: Frame, env: IcalEnv): ICAL.Time {
+// Сколько дней затрагивает событие со временем при переходе на «весь день»:
+// от даты начала до дня после последнего затронутого (конец в полночь дня не
+// затрагивает), не меньше одного. Даты — в поясе события (у UTC и
+// плавающего — календаря), как у `dateOfTimed`. Новый конец — новое начало
+// плюс столько же дней (О8: start без end сохраняет длительность).
+function allDaySpan(oldStart: ICAL.Time, oldEnd: ICAL.Time, frame: Frame, env: IcalEnv): number {
+  const first = dateOfTimed(oldStart, frame, env);
   const wall =
     frame.form === "floating" ? timeInForm(oldEnd, "floating", undefined, env) : timeInForm(oldEnd, "zoned", dateZone(frame, env), env);
   let end = ICAL.Time.fromData({ year: wall.year, month: wall.month, day: wall.day, isDate: true });
   if (wall.hour !== 0 || wall.minute !== 0 || wall.second !== 0) end = addDays(end, 1);
-  return dayNumber(end) > dayNumber(start) ? end : addDays(start, 1);
+  return Math.max(1, dayNumber(end) - dayNumber(first));
 }
 
 // DURATION между началом и концом: у дат — днями (P7D, а не P1W), у времени —
@@ -804,7 +856,8 @@ const SERIES_ONLY = ["rrule", "rdate", "exdate", "exrule"] as const;
  * - без конца — без конца (у PERIOD — DURATION периода).
  * Всё прочее — участники, VALARM, X-свойства, SEQUENCE, CREATED — копируется
  * как есть; метаданные обновляет `touchMetadata` по решению планировщика.
- * Клон добавляется в VCALENDAR объекта и возвращается.
+ * Клон добавляется в VCALENDAR объекта и возвращается; VTIMEZONE для TZID
+ * его значений добавляется, если объект их не описывал (О12а).
  */
 export function overrideFromMaster(o: CalendarObject, slot: Slot, touched?: Touched): ICAL.Component {
   const master = o.master;
@@ -816,27 +869,31 @@ export function overrideFromMaster(o: CalendarObject, slot: Slot, touched?: Touc
   }
 
   const start = slot.time.clone();
-  setTimeProperty(clone, "dtstart", start);
-  setTimeProperty(clone, "recurrence-id", start);
+  const written = [setTimeProperty(clone, "dtstart", start), setTimeProperty(clone, "recurrence-id", start)];
 
+  // Значения времени читаются у основного, а не у клона: клон ещё вне
+  // дерева, и его TZID ical.js искал бы не в VTIMEZONE объекта, а в
+  // глобальном TimezoneService (см. cloneComponent).
   const masterStart = master.getFirstPropertyValue("dtstart") as ICAL.Time;
+  const masterEnd = master.getFirstProperty("dtend");
   const duration = clone.getFirstProperty("duration");
   const dtend = clone.getFirstProperty("dtend");
   if (duration) {
     if (dtend) clone.removeProperty(dtend);
     if (slot.periodEnd) duration.setValue(durationBetween(start, slot.periodEnd, env));
-  } else if (dtend) {
-    const frame = frameOfProperty(dtend, env);
+  } else if (dtend && masterEnd) {
+    const frame = frameOfProperty(masterEnd, env);
     const end = slot.periodEnd
       ? timeInForm(slot.periodEnd, frame.form, frame.zone, env)
-      : keepDuration(masterStart, dtend.getFirstValue() as ICAL.Time, start, frame, env);
-    setTimeProperty(clone, "dtend", end);
+      : keepDuration(masterStart, masterEnd.getFirstValue() as ICAL.Time, start, frame, env);
+    written.push(setTimeProperty(clone, "dtend", end));
   } else if (slot.periodEnd) {
     clone.addPropertyWithValue("duration", durationBetween(start, slot.periodEnd, env));
   }
 
   o.root.addSubcomponent(clone);
   markComponent(touched, o.root, clone);
+  addTimezones(clone, written, touched);
   return clone;
 }
 
@@ -976,6 +1033,10 @@ export function touchMetadata(
   markProperty(touched, c, sequence);
 }
 
+// Свой ORGANIZER — адрес владельца `env.ownerEmail` без учёта регистра и
+// mailto:. Сравнивается полный адрес: env собирает оркестрация (З13), и
+// ownerEmail обязан быть логином с доменом (name@yandex.ru). Логин без домена
+// здесь не совпадёт ни с одним ORGANIZER, и SEQUENCE своей встречи не вырастет.
 function ownOrganizer(c: ICAL.Component, env: IcalEnv): boolean {
   const organizers = c.getAllProperties("organizer");
   if (organizers.length === 0) return true;
@@ -1055,9 +1116,17 @@ export interface RulePatchResult {
  *   `lostParts` (подтверждение confirm требует планировщик);
  * - BYSETPOS и WKST (Ж6): ввести их патчем нельзя, а правка правила, в
  *   котором они уже есть, записала бы то, что Яндекс исказит, — отказ
- *   `unsupported-rule` с подсказкой про replace. Правило, которое патч не
- *   меняет, не проверяется и не трогается.
- * Отказ оставляет свойство нетронутым.
+ *   `unsupported-rule` с подсказкой про replace;
+ * - изменённое правило обязано остаться правилом RFC 5545 §3.3.10, которое
+ *   раскрывает ical.js: части, недопустимые при новой частоте (BYMONTHDAY
+ *   при weekly, BYYEARDAY при daily, weekly и monthly, BYWEEKNO не при
+ *   yearly, BYDAY с номером при BYWEEKNO), — отказ `invalid-rule` с
+ *   подсказкой про replace; затем пробный проход итератора, как у loadObject
+ *   (slots.ts, probeRules): ошибка итератора или ни одной позиции — тоже
+ *   `invalid-rule`, иначе объект после записи блокировался бы аномалией
+ *   bad-rrule или no-positions (О14).
+ * Правило, которое патч не меняет, не проверяется и не трогается. Отказ
+ * оставляет свойство нетронутым.
  */
 export function patchRule(p: ICAL.Property, rp: RecurrencePatch, ctx: RuleContext): RulePatchResult {
   checkRuleKeys(rp);
@@ -1080,7 +1149,11 @@ export function patchRule(p: ICAL.Property, rp: RecurrencePatch, ctx: RuleContex
     throw invalidRule("byWeekday — список дней недели.");
   }
   const byday = rp.byWeekday === undefined ? undefined : rp.byWeekday === null || rp.byWeekday.length === 0 ? null : rp.byWeekday;
-  const until = rp.until === undefined || rp.until === null ? rp.until : untilFor(rp.until, seriesOf(p, ctx), ctx.env);
+  // DTSTART серии читается, только когда нужен (UNTIL, проба изменённого
+  // правила): патч, который правила не меняет, ничего не читает и не кеширует.
+  let series: SeriesTime | undefined | null = null;
+  const seriesTime = () => (series === null ? (series = seriesOf(p, ctx)) : series);
+  const until = rp.until === undefined || rp.until === null ? rp.until : untilFor(rp.until, requireSeries(seriesTime()), ctx.env);
   const freq = rp.frequency === undefined ? undefined : FREQUENCIES[rp.frequency];
 
   let next: Array<[string, RuleValue]>;
@@ -1141,11 +1214,88 @@ export function patchRule(p: ICAL.Property, rp: RecurrencePatch, ctx: RuleContex
       );
     }
   }
+  checkRuleParts(next);
+  const probeSeries = seriesTime();
+  if (probeSeries) probeRule(next, probeSeries, ctx.env);
 
   setRuleDict(p, Object.fromEntries(next) as RuleDictInput);
   const parent = p.parent;
   if (parent) markProperty(ctx.touched, parent, p);
   return { changed: true, lostParts };
+}
+
+const REPLACE_HINT =
+  "Задайте правило заново: recurrence с replace: true и нужными frequency, interval, byWeekday, count или until; " +
+  "части прежнего правила, которых нет в патче, будут потеряны, это требует confirm.";
+
+// Частота правила для текста отказа: как в модели (weekly), прочие — как в правиле.
+function frequencyName(freq: string): string {
+  const entry = Object.entries(FREQUENCIES).find(([, value]) => value === freq);
+  return entry ? entry[0] : freq;
+}
+
+/**
+ * Совместимость частей правила с частотой по RFC 5545 §3.3.10 (те же запреты
+ * проверяет init итератора ical.js, recur_iterator.js:221-252, кроме номера
+ * BYDAY при BYWEEKNO, который ical.js молча раскрывает по-своему):
+ * - BYWEEKNO — только при YEARLY;
+ * - BYYEARDAY — не при DAILY, WEEKLY и MONTHLY;
+ * - BYMONTHDAY — не при WEEKLY;
+ * - BYDAY с номером — не при YEARLY вместе с BYWEEKNO.
+ * Патч меняет лишь FREQ, INTERVAL, BYDAY и конец, так что нарушение — это
+ * смена частоты или BYDAY при части, которую модель не показывает.
+ */
+function checkRuleParts(next: ReadonlyArray<[string, RuleValue]>): void {
+  const dict = new Map(next);
+  const freq = String(dict.get("freq")).toUpperCase();
+  const refuse = (key: string, reason: string): never => {
+    throw new EditRefusal(
+      "invalid-rule",
+      `Правило повтора: ${reason} (RFC 5545 §3.3.10), а в правиле серии есть ${partText(key, dict.get(key)!)}. ` +
+        "Правка оставляет прочие части правила как есть, поэтому такое правило не записывается.",
+      { hint: REPLACE_HINT },
+    );
+  };
+  const name = frequencyName(freq);
+  if (dict.has("byweekno") && freq !== "YEARLY") refuse("byweekno", `при частоте ${name} часть BYWEEKNO недопустима, она бывает только при yearly`);
+  if (dict.has("byyearday") && ["DAILY", "WEEKLY", "MONTHLY"].includes(freq)) {
+    refuse("byyearday", `при частоте ${name} часть BYYEARDAY недопустима`);
+  }
+  if (dict.has("bymonthday") && freq === "WEEKLY") refuse("bymonthday", "при частоте weekly часть BYMONTHDAY (числа месяца) недопустима");
+  if (dict.has("byweekno") && freq === "YEARLY") {
+    const days = dict.get("byday");
+    const list = days === undefined ? [] : Array.isArray(days) ? days : [days];
+    if (list.some((day) => /\d/.test(String(day)))) refuse("byweekno", "день недели с номером (например, 1MO) недопустим вместе с BYWEEKNO");
+  }
+}
+
+/**
+ * Пробный проход итератора по изменённому правилу — тот же, что у
+ * loadObject (slots.ts, probeRules): на отдельном VEVENT с DTSTART серии и
+ * этим правилом. DTSTART записывается значением с уже известным поясом
+ * (values.ts, setTimeProperty кеширует объект значения), так что компонент
+ * без дерева пояс по TZID не ищет. Ошибка итератора или правило без позиций —
+ * отказ `invalid-rule`.
+ */
+function probeRule(next: ReadonlyArray<[string, RuleValue]>, series: SeriesTime, env: IcalEnv): void {
+  const probe = new ICAL.Component("vevent");
+  setTimeProperty(probe, "dtstart", series.dtstart);
+  const rule = new ICAL.Property("rrule");
+  setRuleDict(rule, Object.fromEntries(next) as RuleDictInput);
+  probe.addProperty(rule);
+  const [result] = probeRules(probe, env);
+  if (!result || result.outcome === "ok") return;
+  const text = rule.toICALString().replace(/^RRULE:/, "");
+  if (result.outcome === "no-positions") {
+    throw new EditRefusal(
+      "invalid-rule",
+      `Правило повтора после правки (${text}) не даёт ни одной даты, серия свелась бы к одному началу: ${result.message ?? "позиций нет"}.`,
+      { hint: "Проверьте until, byWeekday и частоту: серия должна продолжаться хотя бы одной встречей по правилу." },
+    );
+  }
+  throw new EditRefusal("invalid-rule", `Правило повтора после правки (${text}) не раскрывается: ${result.message ?? "ошибка итератора"}.`, {
+    hint: REPLACE_HINT,
+  });
 }
 
 /**
@@ -1281,18 +1431,26 @@ interface SeriesTime {
   dtstart: ICAL.Time;
 }
 
-// Форма, пояс и начало серии: из контекста или из DTSTART компонента правила.
-function seriesOf(p: ICAL.Property, ctx: RuleContext): SeriesTime {
+/**
+ * Форма, пояс и начало серии: из контекста или из DTSTART компонента правила;
+ * без того и другого — undefined. Компонент правила должен стоять в дереве
+ * объекта (см. cloneComponent): иначе значение DTSTART с TZID ical.js прочтёт
+ * не по VTIMEZONE объекта; для такой копии передавайте form, zone и dtstart.
+ */
+function seriesOf(p: ICAL.Property, ctx: RuleContext): SeriesTime | undefined {
   const dtstart = p.parent?.getFirstProperty("dtstart");
-  if ((!ctx.form || !ctx.dtstart) && !dtstart) {
-    throw new Error("Для UNTIL нужна форма DTSTART серии: у правила нет компонента с DTSTART, передайте form и dtstart.");
-  }
+  if ((!ctx.form || !ctx.dtstart) && !dtstart) return undefined;
   const form = ctx.form ?? formOf(dtstart!);
   return {
     form,
     zone: ctx.zone ?? (dtstart ? seriesZoneOf(dtstart, ctx.env) : undefined),
     dtstart: ctx.dtstart ?? (dtstart!.getFirstValue() as ICAL.Time),
   };
+}
+
+function requireSeries(series: SeriesTime | undefined): SeriesTime {
+  if (!series) throw new Error("Для UNTIL нужна форма DTSTART серии: у правила нет компонента с DTSTART, передайте form и dtstart.");
+  return series;
 }
 
 /**

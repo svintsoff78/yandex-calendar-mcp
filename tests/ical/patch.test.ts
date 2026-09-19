@@ -14,6 +14,7 @@ import {
   touchMetadata,
 } from "../../src/ical/patch.js";
 import { findSlot } from "../../src/ical/slots.js";
+import { vtimezoneFor } from "../../src/ical/timezones.js";
 import type { IcalEnv, SlotKey } from "../../src/ical/values.js";
 
 // Точечная правка полей и правила (О5–О10, Р4 плана переделки,
@@ -32,6 +33,16 @@ const NOW = Date.parse("2026-10-05T12:34:56Z");
 const MOSCOW = [
   "BEGIN:VTIMEZONE", "TZID:Europe/Moscow", "BEGIN:STANDARD", "TZNAME:MSK", "TZOFFSETFROM:+0300",
   "TZOFFSETTO:+0300", "DTSTART:19700101T000000", "END:STANDARD", "END:VTIMEZONE",
+];
+
+/**
+ * Пояс, которого нет ни в базе IANA, ни в ICAL.TimezoneService: ical.js
+ * найдёт его только по дереву объекта (component.js, getTimeZoneByID). Тесты
+ * с ним не зависят от того, какие пояса зарегистрировали другие тесты.
+ */
+const PLUS5 = [
+  "BEGIN:VTIMEZONE", "TZID:Custom/Plus5", "BEGIN:STANDARD", "TZNAME:P5", "TZOFFSETFROM:+0500",
+  "TZOFFSETTO:+0500", "DTSTART:19700101T000000", "END:STANDARD", "END:VTIMEZONE",
 ];
 
 const UID = "patch-test@yandex.ru";
@@ -433,16 +444,62 @@ describe("время (О8)", () => {
     );
   });
 
-  it("неизвестный TZID события: новое время в нём не записать — отказ; с timeZone — момент по поясу календаря", () => {
+  it("неизвестный TZID события: новое время в нём не записать и момент не сохранить — отказ; start и end с timeZone — запись", () => {
     const unknown = calendar([], vevent(["DTSTART;TZID=Foo/Bar:20261021T100000", "DTEND;TZID=Foo/Bar:20261021T110000", "SUMMARY:Встреча"]));
-    const o = load(unknown);
-    expect(refusal(() => applyFieldPatch(o.master!, { start: "2026-10-21T12:00:00" }, { env: ENV, touched: newTouched() })).code).toBe(
-      "unknown-timezone",
-    );
-    // ical.js читает время неизвестного пояса стенным временем календаря (object.ts, unknown-tzid).
-    const { master } = patchMaster(unknown, { timeZone: "Europe/Berlin" });
+    for (const patch of [{ start: "2026-10-21T12:00:00" }, { timeZone: "Europe/Berlin" }, { timeZone: "UTC" }] as const) {
+      const o = load(unknown);
+      const before = jcalOf(o);
+      const error = refusal(() => applyFieldPatch(o.master!, patch, { env: ENV, touched: newTouched() }));
+      expect(error.code, JSON.stringify(patch)).toBe("unknown-timezone");
+      expect(error.hint, JSON.stringify(patch)).toMatch(/timeZone/);
+      expect(jcalOf(o)).toEqual(before);
+    }
+    // Момент в неизвестном поясе никто не знает: смена пояса без start его
+    // угадывала бы стенным временем календаря. С start и end — новое время целиком.
+    const { master } = patchMaster(unknown, { timeZone: "Europe/Berlin", start: "2026-10-21T09:00:00", end: "2026-10-21T10:00:00" });
     expect(lines(master, "dtstart")).toEqual(["DTSTART;TZID=Europe/Berlin:20261021T090000"]);
     expect(lines(master, "dtend")).toEqual(["DTEND;TZID=Europe/Berlin:20261021T100000"]);
+  });
+
+  it("правка времени в поясе без VTIMEZONE в объекте добавляет VTIMEZONE этого пояса (О12а)", () => {
+    const berlin = calendar([], vevent(["DTSTART;TZID=Europe/Berlin:20261021T100000", "DTEND;TZID=Europe/Berlin:20261021T110000", "SUMMARY:Встреча"]));
+    const { o, master, touched } = patchMaster(berlin, { start: "2026-10-21T12:00:00" });
+    expect(lines(master, "dtstart")).toEqual(["DTSTART;TZID=Europe/Berlin:20261021T120000"]);
+    expect(o.root.getAllSubcomponents("vtimezone").map((zone) => zone.getFirstPropertyValue("tzid"))).toEqual(["Europe/Berlin"]);
+    expect(namesOf(touched, o.root)).toEqual(["vtimezone"]);
+
+    // Только summary — время не записывается, VTIMEZONE не добавляется.
+    const { o: untouched } = patchMaster(berlin, { summary: "Другая" });
+    expect(untouched.root.getAllSubcomponents("vtimezone")).toEqual([]);
+  });
+
+  it("у события с DTEND и DURATION сразу end оставляет только DURATION (RFC 5545 §3.6.1)", () => {
+    const both = single("DTEND;TZID=Europe/Moscow:20261021T110000", "DURATION:PT1H");
+    const { master, touched } = patchMaster(both, { end: "2026-10-21T12:30:00+03:00" });
+    expect(lines(master, "duration")).toEqual(["DURATION:PT2H30M"]);
+    expect(lines(master, "dtend")).toEqual([]);
+    expect(namesOf(touched, master)).toEqual(["dtend", "duration"]);
+  });
+
+  it("start у события, где DTEND в своём поясе: конец сдвигается и остаётся в поясе DTEND", () => {
+    // 10:00 MSK – 10:00 CEST (11:00 MSK): час.
+    const mixed = calendar(MOSCOW, vevent(["DTSTART;TZID=Europe/Moscow:20261021T100000", "DTEND;TZID=Europe/Berlin:20261021T100000", "SUMMARY:Встреча"]));
+    const { master } = patchMaster(mixed, { start: "2026-10-21T12:00:00" });
+    expect(lines(master, "dtstart")).toEqual(["DTSTART;TZID=Europe/Moscow:20261021T120000"]);
+    expect(lines(master, "dtend")).toEqual(["DTEND;TZID=Europe/Berlin:20261021T120000"]);
+  });
+
+  it("timeZone на пояс, описанный в дереве объекта иначе, чем в базе IANA, — время по описанию из дерева (Ж10)", () => {
+    // В объекте Europe/Berlin описан как постоянные +05:00 (в базе — CEST +02:00 в октябре).
+    const ownBerlin = [
+      "BEGIN:VTIMEZONE", "TZID:Europe/Berlin", "BEGIN:STANDARD", "TZOFFSETFROM:+0500", "TZOFFSETTO:+0500",
+      "DTSTART:19700101T000000", "END:STANDARD", "END:VTIMEZONE",
+    ];
+    const ics = calendar([...MOSCOW, ...ownBerlin], vevent(["DTSTART;TZID=Europe/Moscow:20261021T100000", "DTEND;TZID=Europe/Moscow:20261021T110000", "SUMMARY:Встреча"]));
+    const { o, master } = patchMaster(ics, { timeZone: "Europe/Berlin" });
+    expect(lines(master, "dtstart")).toEqual(["DTSTART;TZID=Europe/Berlin:20261021T120000"]);
+    expect(lines(master, "dtend")).toEqual(["DTEND;TZID=Europe/Berlin:20261021T130000"]);
+    expect(o.root.getAllSubcomponents("vtimezone")).toHaveLength(2);
   });
 
   it("стенное время из разрыва весеннего перевода — отказ invalid-time", () => {
@@ -463,6 +520,22 @@ describe("время (О8)", () => {
     expect(lines(master, "dtstart")).toEqual(["DTSTART;VALUE=DATE:20261021"]);
     expect(lines(master, "dtend")).toEqual(["DTEND;VALUE=DATE:20261022"]);
     expect(result.changed).toEqual(["start", "end", "allDay"]);
+  });
+
+  it("allDay: true и start без end — число затронутых дней сохраняется (О8), как и без start", () => {
+    // 21.10 23:00 – 23.10 01:00 затрагивает три дня: 21, 22 и 23 октября.
+    const long = single("DTEND;TZID=Europe/Moscow:20261023T010000").replace("20261021T100000", "20261021T230000");
+    const { master: same } = patchMaster(long, { allDay: true });
+    expect(lines(same, "dtstart")).toEqual(["DTSTART;VALUE=DATE:20261021"]);
+    expect(lines(same, "dtend")).toEqual(["DTEND;VALUE=DATE:20261024"]);
+
+    const { master: moved } = patchMaster(long, { allDay: true, start: "2026-10-25" });
+    expect(lines(moved, "dtstart")).toEqual(["DTSTART;VALUE=DATE:20261025"]);
+    expect(lines(moved, "dtend")).toEqual(["DTEND;VALUE=DATE:20261028"]);
+
+    // Встреча до полуночи — один день и при переносе.
+    const { master: short } = patchMaster(withEnd, { allDay: true, start: "2026-10-25" });
+    expect(lines(short, "dtend")).toEqual(["DTEND;VALUE=DATE:20261026"]);
   });
 
   it("allDay: false у события на весь день — нужны start и end; с ними — пояс по умолчанию", () => {
@@ -542,8 +615,12 @@ describe("touchMetadata (О10)", () => {
     expect(lines(master, "last-modified")).toEqual([]);
   });
 
-  it("правка не меняла время и правило — SEQUENCE прежний", () => {
-    expect(lines(touch(event("SEQUENCE:3"), false).master, "sequence")).toEqual(["SEQUENCE:3"]);
+  it("правка не меняла время и правило — SEQUENCE прежний, DTSTAMP и LAST-MODIFIED обновлены", () => {
+    const { master, touched } = touch(event("SEQUENCE:3", "LAST-MODIFIED:20261001T090000Z", "ORGANIZER:mailto:user@yandex.ru"), false);
+    expect(lines(master, "sequence")).toEqual(["SEQUENCE:3"]);
+    expect(lines(master, "dtstamp")).toEqual(["DTSTAMP:20261005T123456Z"]);
+    expect(lines(master, "last-modified")).toEqual(["LAST-MODIFIED:20261005T123456Z"]);
+    expect(namesOf(touched, master)).toEqual(["dtstamp", "last-modified"]);
   });
 
   it("без ownerEmail любой ORGANIZER считается чужим", () => {
@@ -647,6 +724,41 @@ describe("patchRule (Р4): меняются только переданные ч
       expect(error.code, JSON.stringify(rp)).toBe("invalid-rule");
       expect(property.toICALString()).toBe(rule);
     }
+  });
+
+  it("части правила, несовместимые с новой частотой (RFC 5545 §3.3.10), — отказ invalid-rule, правило не тронуто", () => {
+    const cases: Array<[string, Parameters<typeof patchRule>[1], RegExp]> = [
+      ["RRULE:FREQ=MONTHLY;BYMONTHDAY=1,15;COUNT=6", { frequency: "weekly" }, /BYMONTHDAY/],
+      ["RRULE:FREQ=MONTHLY;BYMONTHDAY=1,15;COUNT=6", { frequency: "weekly", byWeekday: ["MO"] }, /BYMONTHDAY/],
+      ["RRULE:FREQ=YEARLY;BYYEARDAY=1,100;COUNT=6", { frequency: "monthly" }, /BYYEARDAY/],
+      ["RRULE:FREQ=YEARLY;BYYEARDAY=1,100;COUNT=6", { frequency: "daily" }, /BYYEARDAY/],
+      ["RRULE:FREQ=YEARLY;BYWEEKNO=20;BYDAY=MO;COUNT=6", { frequency: "monthly" }, /BYWEEKNO/],
+      ["RRULE:FREQ=YEARLY;BYWEEKNO=20;BYDAY=MO;COUNT=6", { byWeekday: ["1MO"] }, /BYWEEKNO/],
+    ];
+    for (const [rule, rp, part] of cases) {
+      const o = load(series(rule));
+      const property = o.master!.getFirstProperty("rrule")!;
+      const error = refusal(() => patchRule(property, rp, { env: ENV, touched: newTouched() }));
+      expect(error.code, `${rule} ${JSON.stringify(rp)}`).toBe("invalid-rule");
+      expect(error.message).toMatch(part);
+      expect(error.hint).toMatch(/replace/);
+      expect(property.toICALString()).toBe(rule);
+    }
+    // Та же смена частоты с заменой правила целиком — можно.
+    const { rule, result } = patch("RRULE:FREQ=MONTHLY;BYMONTHDAY=1,15;COUNT=6", { frequency: "weekly", byWeekday: ["MO"], replace: true });
+    expect(rule).toBe("RRULE:FREQ=WEEKLY;BYDAY=MO");
+    expect(result.lostParts).toEqual(["BYMONTHDAY=1,15", "COUNT=6"]);
+  });
+
+  it("правило, у которого после правки нет ни одной позиции, — отказ invalid-rule", () => {
+    // Серия с понедельника 19.10 по вторникам: UNTIL в тот же понедельник не
+    // оставляет правилу ни одного вторника, loadObject отметил бы no-positions.
+    const rule = "RRULE:FREQ=WEEKLY;BYDAY=TU;COUNT=6";
+    const o = load(series(rule));
+    const property = o.master!.getFirstProperty("rrule")!;
+    const error = refusal(() => patchRule(property, { until: "2026-10-19T10:00:00" }, { env: ENV }));
+    expect(error.code).toBe("invalid-rule");
+    expect(property.toICALString()).toBe(rule);
   });
 
   it("неразборчивый until — отказ invalid-time, как у сборки нового события", () => {
@@ -826,6 +938,31 @@ describe("overrideFromMaster (О6)", () => {
     const ics = calendar([], vevent(["DTSTART;TZID=Europe/Berlin:20261018T010000", "DTEND;TZID=Europe/Berlin:20261018T040000", "RRULE:FREQ=WEEKLY;COUNT=3", "SUMMARY:Ночная"]));
     const { clone } = cloneAt(ics, key("2026-10-25T01:00:00+02:00"));
     expect(lines(clone, "dtend")).toEqual(["DTEND;TZID=Europe/Berlin:20261025T030000"]);
+  });
+
+  it("пояс серии описан только в VTIMEZONE объекта: DTEND клона — в поясе основного, с его длительностью", () => {
+    // Клон до вставки в VCALENDAR ищет пояс в ICAL.TimezoneService, а не в
+    // дереве (time.js, fromDateTimeString; component.js, getTimeZoneByID):
+    // Custom/Plus5 там нет, и DTEND клона читался бы плавающим временем.
+    const ics = calendar(PLUS5, vevent([
+      "DTSTART;TZID=Custom/Plus5:20261019T100000", "DTEND;TZID=Custom/Plus5:20261019T110000",
+      "RRULE:FREQ=WEEKLY;COUNT=3", "SUMMARY:Серия",
+    ]));
+    const { clone } = cloneAt(ics, key("2026-10-26T10:00:00+05:00"));
+    expect(lines(clone, "dtstart")).toEqual(["DTSTART;TZID=Custom/Plus5:20261026T100000"]);
+    expect(lines(clone, "recurrence-id")).toEqual(["RECURRENCE-ID;TZID=Custom/Plus5:20261026T100000"]);
+    expect(lines(clone, "dtend")).toEqual(["DTEND;TZID=Custom/Plus5:20261026T110000"]);
+  });
+
+  it("серия в поясе, отличном от пояса календаря, с VTIMEZONE в объекте: DTEND клона в том же поясе", () => {
+    const newYork = vtimezoneFor("America/New_York").toString().split(CRLF);
+    const ics = calendar(newYork, vevent([
+      "DTSTART;TZID=America/New_York:20261019T100000", "DTEND;TZID=America/New_York:20261019T110000",
+      "RRULE:FREQ=WEEKLY;COUNT=3", "SUMMARY:Серия",
+    ]));
+    const { clone } = cloneAt(ics, key("2026-10-26T10:00:00-04:00"));
+    expect(lines(clone, "dtstart")).toEqual(["DTSTART;TZID=America/New_York:20261026T100000"]);
+    expect(lines(clone, "dtend")).toEqual(["DTEND;TZID=America/New_York:20261026T110000"]);
   });
 
   it("клон и затем правка summary: у клона меняется только SUMMARY", () => {
