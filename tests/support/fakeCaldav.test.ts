@@ -8,6 +8,7 @@
 // функции src/caldav/objects.ts. Утверждения о том, сколько раз транспорт
 // повторяет запрос, здесь не делаются — это свойство транспорта (З02), а не
 // стенда.
+import { readFileSync } from "node:fs";
 import ICAL from "ical.js";
 import { describe, expect, it } from "vitest";
 import {
@@ -17,16 +18,19 @@ import {
   queryEventByUid,
   queryEvents,
 } from "../../src/caldav/objects.js";
+import { buildCalendarQuery } from "../../src/caldav/xml.js";
 import { readEvents } from "../../src/domain/events.js";
 import type { CalendarEvent } from "../../src/types.js";
 import { calendarA, calendarB, makeContext, makeStand, plant, yandexPath } from "./context.js";
 import { FAKE_BASE_URL, FakeCaldav, reorderOverridesFirst, yandexNormalize } from "./fakeCaldav.js";
 import {
+  ABSOLUTE_KINDS,
   assertInvariants,
   findViolations,
   newViolations,
   parseRawComponents,
   VIOLATION_KINDS,
+  writeViolations,
   type ViolationKind,
 } from "./invariants.js";
 import {
@@ -68,6 +72,97 @@ function kinds(ics: string): ViolationKind[] {
 async function rawFetch(fake: FakeCaldav, method: string, path: string, init: RequestInit = {}) {
   return fake.fetch(`${FAKE_BASE_URL}${path}`, { ...init, method });
 }
+
+// Виды нарушений, которые newViolations считает новыми, без повторов.
+function newKinds(after: string, before?: string | readonly string[]): ViolationKind[] {
+  return [...new Set(newViolations(after, before).map((violation) => violation.kind))];
+}
+
+/** Компонент VEVENT из строк свойств, с CRLF на конце. */
+function vevent(...lines: string[]): string {
+  return ["BEGIN:VEVENT", ...lines, "END:VEVENT", ""].join(CRLF);
+}
+
+/** Добавляет компоненты перед END:VCALENDAR. */
+function addComponents(ics: string, ...components: string[]): string {
+  return ics.replace("END:VCALENDAR", `${components.join("")}END:VCALENDAR`);
+}
+
+/** Переопределение серии в поясе Москвы; end не задан — без DTEND. */
+function moscowOverride(
+  uid: string,
+  rid: string,
+  start: string,
+  end: string | undefined,
+  summary = "перенос",
+  extra: string[] = [],
+): string {
+  return vevent(
+    `UID:${uid}`,
+    "DTSTAMP:20261001T090000Z",
+    `RECURRENCE-ID;TZID=Europe/Moscow:${rid}`,
+    `DTSTART;TZID=Europe/Moscow:${start}`,
+    ...(end === undefined ? [] : [`DTEND;TZID=Europe/Moscow:${end}`]),
+    `SUMMARY:${summary}`,
+    ...extra,
+  );
+}
+
+/** Добавляет строки EXDATE в поясе Москвы сразу после RRULE. */
+function withExdate(ics: string, ...values: string[]): string {
+  return ics.replace(/(RRULE:[^\r\n]*)/, `$1${values.map((value) => `${CRLF}EXDATE;TZID=Europe/Moscow:${value}`).join("")}`);
+}
+
+const W = seeds.weeklyMoscow;
+
+/** weeklyMoscow с двумя переопределениями одного слота даты date (вида 20261021). */
+function duplicateRidAt(date: string): string {
+  return addComponents(
+    W.ics,
+    moscowOverride(W.uid, `${date}T100000`, `${date}T113000`, `${date}T123000`, "дубль 1"),
+    moscowOverride(W.uid, `${date}T100000`, `${date}T140000`, `${date}T150000`, "дубль 2"),
+  );
+}
+
+// C55: эхо — второе переопределение с RECURRENCE-ID 15:00 мимо слотов.
+const C55_ECHO = /BEGIN:VEVENT\r\n(?:(?!END:VEVENT)[\s\S])*?RECURRENCE-ID;TZID=Europe\/Moscow:20261021T150000\r\nEND:VEVENT\r\n/;
+/** C55 после верного ремонта (Р5): эхо снято, остался один компонент с RID слота 10:00. */
+const c55Repaired = seeds.c55EchoOverride.ics.replace(C55_ECHO, "");
+/** C55 после неверного ремонта: эхо снято, но RID оставшегося компонента поставлен на 10:30 мимо слота. */
+const c55RepairedOffSlot = c55Repaired.replace(
+  "RECURRENCE-ID;TZID=Europe/Moscow:20261021T100000",
+  "RECURRENCE-ID;TZID=Europe/Moscow:20261021T103000",
+);
+
+/** Два основных компонента серии weeklyMoscow. */
+const twoMastersWeekly = addComponents(
+  W.ics,
+  vevent(
+    `UID:${W.uid}`,
+    "DTSTAMP:20261001T090000Z",
+    "DTSTART;TZID=Europe/Moscow:20261020T150000",
+    "DTEND;TZID=Europe/Moscow:20261020T160000",
+    "SUMMARY:второй основной",
+  ),
+);
+
+/** Переопределение слота 21.10 с чужим UID. */
+const mixedUidsWeekly = addComponents(W.ics, moscowOverride("other@yandex.ru", "20261021T100000", "20261021T113000", "20261021T123000"));
+
+/** Календарь без VEVENT. */
+const noVevent = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Example Corp.//Other Client//EN", "END:VCALENDAR", ""].join(CRLF);
+
+// Образец на каждый вид, запрещённый в любой записи, и его правка, не
+// снимающая нарушения.
+const absoluteSamples: Record<(typeof ABSOLUTE_KINDS)[number], { ics: string; edited: string }> = {
+  unparsable: {
+    ics: seeds.c63BadFreq.ics,
+    edited: seeds.c63BadFreq.ics.replace("SUMMARY:Правило с неизвестной частотой", "SUMMARY:Переименовано"),
+  },
+  "no-vevent": { ics: noVevent, edited: noVevent.replace("Other Client", "Third Client") },
+  "multiple-masters": { ics: twoMastersWeekly, edited: twoMastersWeekly.replace("SUMMARY:второй основной", "SUMMARY:переименован") },
+  "mixed-uids": { ics: mixedUidsWeekly, edited: mixedUidsWeekly.replace("SUMMARY:перенос", "SUMMARY:переименован") },
+};
 
 describe("FakeCaldav: хранилище, ETag, REPORT", () => {
   it("находит объект по UID через настоящий клиент; ETag — голое растущее число", async () => {
@@ -139,7 +234,7 @@ describe("FakeCaldav: хранилище, ETag, REPORT", () => {
       depth: "1",
       body: `<c:prop-filter name="UID"><c:text-match collation="i;octet">abc@yandex.ru</c:text-match></c:prop-filter>`,
     });
-    expect((raw.text.match(/<d:response>/g) ?? []).length).toBe(2);
+    expect((raw.text.match(/<D:response>/g) ?? []).length).toBe(2);
     // Точного совпадения нет — настоящий клиент обязан это заметить сам.
     expect(await queryEventByUid(ctx.client, calendarA.href, "abc@yandex.ru")).toBeUndefined();
   });
@@ -180,6 +275,83 @@ describe("FakeCaldav: хранилище, ETag, REPORT", () => {
     expect(fake.log).toEqual([]);
     fake.externalDelete(path);
     expect(fake.has(path)).toBe(false);
+  });
+
+  it("REPORT отвечает со смешанными пространствами имён, как Яндекс (tests/fixtures/events-query.xml)", async () => {
+    // docs/yandex-caldav-capabilities.md, «Особенности», п. 3: href и status —
+    // без префикса с xmlns="DAV:", свойства — с префиксом D:, calendar-data —
+    // с собственным объявлением C:. Ручной разбор по именам тегов это ломает.
+    const { fake, ctx } = makeStand();
+    fake.seed(yandexPath(calendarA, "ns1@yandex.ru"), single("ns1@yandex.ru", "первая"));
+    fake.seed(yandexPath(calendarA, "ns2@yandex.ru"), single("ns2@yandex.ru", "вторая"));
+    const from = new Date("2026-10-01T00:00:00Z");
+    const to = new Date("2026-11-01T00:00:00Z");
+    const raw = await ctx.client.request({ method: "REPORT", path: calendarA.href, depth: "1", body: buildCalendarQuery(from, to) });
+
+    const fixture = readFileSync(new URL("../fixtures/events-query.xml", import.meta.url), "utf8");
+    // Скелет ответа — все теги с атрибутами, без текста: у стенда он тот же,
+    // что у снятого с Яндекса ответа с двумя объектами.
+    const skeleton = (xml: string) => [...xml.matchAll(/<[^>]+>/g)].map((match) => match[0]);
+    expect(skeleton(raw.text)).toEqual(skeleton(fixture));
+    expect(raw.text).toContain('<href xmlns="DAV:">');
+    expect(raw.text).toContain('<status xmlns="DAV:">HTTP/1.1 200 OK</status>');
+    expect(raw.text).not.toMatch(/<d:/);
+
+    // Настоящий разбор (src/caldav/xml.ts) такой ответ переживает.
+    const objects = await queryEvents(ctx.client, calendarA.href, from, to);
+    expect(objects.map((object) => [object.href, object.etag])).toEqual([
+      [yandexPath(calendarA, "ns1@yandex.ru"), fake.etag(yandexPath(calendarA, "ns1@yandex.ru"))],
+      [yandexPath(calendarA, "ns2@yandex.ru"), fake.etag(yandexPath(calendarA, "ns2@yandex.ru"))],
+    ]);
+    expect(objects[1].ics).toContain("SUMMARY:вторая");
+    expect((await queryEventByUid(ctx.client, calendarA.href, "ns1@yandex.ru"))?.href).toBe(yandexPath(calendarA, "ns1@yandex.ru"));
+  });
+});
+
+describe("FakeCaldav: история внешних версий", () => {
+  it("externalDelete очищает историю: объект, созданный заново по тому же пути, сверяется с нуля", async () => {
+    const { fake, ctx } = makeStand({ strict: false });
+    const path = plant(fake, seeds.c55EchoOverride);
+    expect(fake.externalVersions(path)).toHaveLength(1);
+    // Сирота затравки — чужое наследство, его стенд терпит.
+    expect(() => assertStoredInvariants(fake)).not.toThrow();
+
+    fake.externalDelete(path);
+    expect(fake.externalVersions(path)).toEqual([]);
+    // Клиент создаёт по тому же пути объект с той же сиротой: это уже его порча.
+    await putObject(ctx.client, path, seeds.c55EchoOverride.ics, { ifNoneMatch: true });
+    expect(fake.externalVersions(path)).toEqual([]);
+    expect(() => assertStoredInvariants(fake)).toThrow(/orphan-override/);
+  });
+
+  it("удаление клиентом тоже начинает историю заново", async () => {
+    const { fake, ctx } = makeStand({ strict: false });
+    const path = plant(fake, seeds.c55EchoOverride);
+    await deleteObject(ctx.client, path, fake.etag(path));
+    expect(fake.externalVersions(path)).toEqual([]);
+    await putObject(ctx.client, path, seeds.c55EchoOverride.ics, { ifNoneMatch: true });
+    expect(() => assertStoredInvariants(fake)).toThrow(/orphan-override/);
+  });
+
+  it("запись клиентом по пустому пути начинает историю заново, как бы путь ни опустел", async () => {
+    const { fake, ctx } = makeStand({ strict: false });
+    const path = plant(fake, seeds.c55EchoOverride);
+    // Хранилище правится напрямую (так можно только в самопроверке): история
+    // осталась, но объекта уже нет.
+    fake.objects.delete(path);
+    expect(fake.externalVersions(path)).toHaveLength(1);
+    await putObject(ctx.client, path, seeds.c55EchoOverride.ics, { ifNoneMatch: true });
+    expect(fake.externalVersions(path)).toEqual([]);
+    expect(() => assertStoredInvariants(fake)).toThrow(/orphan-override/);
+  });
+
+  it("правки другим клиентом копятся в истории; seedRaw по занятому пути начинает её заново", () => {
+    const { fake } = makeStand();
+    const path = plant(fake, seeds.weeklyMoscow);
+    fake.externalEdit(path, (ics) => ics.replace("SUMMARY:Планёрка", "SUMMARY:Чужая"));
+    expect(fake.externalVersions(path)).toHaveLength(2);
+    fake.seedRaw(path, seeds.weeklyMoscow.ics);
+    expect(fake.externalVersions(path)).toEqual([seeds.weeklyMoscow.ics]);
   });
 });
 
@@ -236,6 +408,59 @@ describe("FakeCaldav: условные заголовки", () => {
     await deleteObject(ctx.client, path, fake.etag(path));
     expect(fake.has(path)).toBe(false);
     await expect(deleteObject(ctx.client, path, "1")).rejects.toMatchObject({ status: 404 });
+  });
+
+  it("по умолчанию If-Match совпадает только с голым ETag, как его отдаёт Яндекс; кавычки — опцией acceptQuotedEtag", async () => {
+    // docs/yandex-caldav-capabilities.md, «Особенности», п. 1: ETag передаётся
+    // как есть, без добавления кавычек. Код, который их добавит, на стенде
+    // получит 412, а не молчаливое совпадение.
+    for (const conditions of ["yandex", "rfc"] as const) {
+      const fake = new FakeCaldav({ conditions });
+      expect(fake.acceptQuotedEtag).toBe(false);
+      const path = yandexPath(calendarA, "q@yandex.ru");
+      const etag0 = fake.seed(path, single("q@yandex.ru", "v0"));
+      for (const header of [`"${etag0}"`, `W/"${etag0}"`]) {
+        const response = await rawFetch(fake, "PUT", path, { headers: { "If-Match": header }, body: single("q@yandex.ru", "в кавычках") });
+        expect({ header, status: response.status }).toEqual({ header, status: 412 });
+      }
+      expect(fake.etag(path)).toBe(etag0);
+      if (conditions === "rfc") {
+        expect((await rawFetch(fake, "DELETE", path, { headers: { "If-Match": `"${etag0}"` } })).status).toBe(412);
+        expect(fake.has(path)).toBe(true);
+      }
+      expect((await rawFetch(fake, "PUT", path, { headers: { "If-Match": etag0 }, body: single("q@yandex.ru", "голый") })).status).toBe(204);
+      expect((await rawFetch(fake, "PUT", path, { headers: { "If-Match": "*" }, body: single("q@yandex.ru", "звезда") })).status).toBe(204);
+    }
+
+    const lenient = new FakeCaldav({ conditions: "rfc", acceptQuotedEtag: true });
+    const path = yandexPath(calendarA, "q@yandex.ru");
+    lenient.seed(path, single("q@yandex.ru", "v0"));
+    for (const quote of [(etag: string) => `"${etag}"`, (etag: string) => `W/"${etag}"`]) {
+      const response = await rawFetch(lenient, "PUT", path, { headers: { "If-Match": quote(lenient.etag(path)) }, body: single("q@yandex.ru", "ок") });
+      expect(response.status).toBe(204);
+    }
+    expect((await rawFetch(lenient, "DELETE", path, { headers: { "If-Match": `"${lenient.etag(path)}"` } })).status).toBe(204);
+  });
+
+  it("etagOnPut: false — ответ на PUT без ETag, новый ETag клиент узнаёт только перечитыванием", async () => {
+    const { fake, ctx } = makeStand({ etagOnPut: false });
+    expect(fake.etagOnPut).toBe(false);
+    const path = yandexPath(calendarA, "noetag@yandex.ru");
+    const etag0 = fake.seed(path, single("noetag@yandex.ru", "v0"));
+    const response = await rawFetch(fake, "PUT", path, { headers: { "If-Match": etag0 }, body: single("noetag@yandex.ru", "v1") });
+    expect(response.status).toBe(204);
+    expect(response.headers.get("etag")).toBeNull();
+    expect(await putObject(ctx.client, path, single("noetag@yandex.ru", "v2"), { ifMatch: fake.etag(path) })).toBe("");
+    expect(await putObject(ctx.client, yandexPath(calendarA, "new@yandex.ru"), single("new@yandex.ru", "n"), { ifNoneMatch: true })).toBe("");
+    const reread = await queryEventByUid(ctx.client, calendarA.href, "noetag@yandex.ru");
+    expect(reread?.etag).toBe(fake.etag(path));
+    expect(reread?.etag).not.toBe(etag0);
+    expect(reread?.ics).toContain("SUMMARY:v2");
+
+    // По умолчанию ETag в ответе на PUT есть и совпадает с хранимым.
+    const withEtag = new FakeCaldav();
+    const created = await rawFetch(withEtag, "PUT", path, { body: single("noetag@yandex.ru", "v0") });
+    expect(created.headers.get("etag")).toBe(withEtag.etag(path));
   });
 
   // Отрицательный контроль: одна и та же проверка гонки обязана поймать
@@ -427,19 +652,109 @@ describe("FakeCaldav: строгий режим (О12а)", () => {
   });
 
   it("терпит нарушение, которое уже было в прежней версии, но не новое сверх него", async () => {
+    // DTEND = DTSTART от другого клиента: правка чужого объекта вправе его сохранить.
     const fake = new FakeCaldav();
-    const path = yandexPath(calendarA, "two@yandex.ru");
-    const etag0 = fake.seed(path, twoMasters);
-    const renamed = twoMasters.replace("SUMMARY:первый", "SUMMARY:переименован");
+    const path = yandexPath(calendarA, "zero@yandex.ru");
+    const zero = single("zero@yandex.ru", "нулевая").replace("DTEND:20261019T080000Z", "DTEND:20261019T070000Z");
+    expect(kinds(zero)).toEqual(["end-not-after-start"]);
+    const etag0 = fake.seed(path, zero);
+    const renamed = zero.replace("SUMMARY:нулевая", "SUMMARY:переименована");
     const ok = await rawFetch(fake, "PUT", path, { headers: { "If-Match": etag0 }, body: renamed });
     expect(ok.status).toBe(204);
 
-    const threeMasters = renamed.replace(
-      "END:VCALENDAR",
-      ["BEGIN:VEVENT", "UID:two@yandex.ru", "DTSTAMP:20261001T090000Z", "DTSTART:20261021T070000Z", "DTEND:20261021T080000Z", "SUMMARY:третий", "END:VEVENT", "END:VCALENDAR"].join(CRLF),
-    );
-    const rejected = await rawFetch(fake, "PUT", path, { headers: { "If-Match": fake.etag(path) }, body: threeMasters });
+    const withDuration = renamed.replace("SUMMARY:переименована", "SUMMARY:переименована\r\nDURATION:PT1H");
+    const rejected = await rawFetch(fake, "PUT", path, { headers: { "If-Match": fake.etag(path) }, body: withDuration });
     expect(rejected.status).toBe(400);
+    expect(fake.rejections.at(-1)?.reasons.join("\n")).toMatch(/dtend-with-duration/);
+    expect(fake.ics(path)).toBe(renamed);
+  });
+
+  it("виды ABSOLUTE_KINDS — 400 на любой PUT, где они есть, даже если были в прежней версии (О14, Р12)", async () => {
+    expect([...ABSOLUTE_KINDS].sort()).toEqual(["mixed-uids", "multiple-masters", "no-vevent", "unparsable"]);
+    for (const kind of ABSOLUTE_KINDS) {
+      const sample = absoluteSamples[kind];
+      expect({ kind, found: kinds(sample.ics) }).toEqual({ kind, found: [kind] });
+      expect({ kind, found: kinds(sample.edited) }).toEqual({ kind, found: [kind] });
+      const fake = new FakeCaldav();
+      const path = yandexPath(calendarA, "absolute@yandex.ru");
+      const etag0 = fake.seedRaw(path, sample.ics);
+      // И правка, сохранившая нарушение, и дословный повтор прежнего текста.
+      for (const body of [sample.edited, sample.ics]) {
+        const response = await rawFetch(fake, "PUT", path, { headers: { "If-Match": fake.etag(path) }, body });
+        expect({ kind, status: response.status }).toEqual({ kind, status: 400 });
+        expect(fake.rejections.at(-1)?.reasons.join("\n")).toContain(`${kind}:`);
+      }
+      expect(fake.etag(path)).toBe(etag0);
+      expect(fake.ics(path)).toBe(sample.ics);
+    }
+  });
+
+  it("запись, снимающая абсолютное нарушение, проходит", async () => {
+    const fake = new FakeCaldav();
+    const path = yandexPath(calendarA, W.uid);
+    fake.seed(path, twoMastersWeekly);
+    expect((await rawFetch(fake, "PUT", path, { headers: { "If-Match": fake.etag(path) }, body: W.ics })).status).toBe(204);
+    fake.seed(path, mixedUidsWeekly);
+    expect((await rawFetch(fake, "PUT", path, { headers: { "If-Match": fake.etag(path) }, body: W.ics })).status).toBe(204);
+  });
+
+  it("новый дубль RECURRENCE-ID вместо исчезнувшего прежнего — 400; прежний дубль правка сохранить вправе", async () => {
+    const fake = new FakeCaldav();
+    const path = yandexPath(calendarA, W.uid);
+    const dup21 = duplicateRidAt("20261021");
+    const etag0 = fake.seed(path, dup21);
+    const rejected = await rawFetch(fake, "PUT", path, { headers: { "If-Match": etag0 }, body: duplicateRidAt("20261026") });
+    expect(rejected.status).toBe(400);
+    expect(fake.rejections.at(-1)?.reasons.join("\n")).toMatch(/duplicate-rid/);
+    expect(fake.etag(path)).toBe(etag0);
+    const renamed = dup21.replace("SUMMARY:дубль 2", "SUMMARY:дубль 2 переименован");
+    expect((await rawFetch(fake, "PUT", path, { headers: { "If-Match": etag0 }, body: renamed })).status).toBe(204);
+  });
+
+  it("новый дубль EXDATE вместо исчезнувшего прежнего — 400", async () => {
+    const fake = new FakeCaldav();
+    const path = yandexPath(calendarA, W.uid);
+    const etag0 = fake.seed(path, withExdate(W.ics, "20261021T100000", "20261021T100000"));
+    const response = await rawFetch(fake, "PUT", path, {
+      headers: { "If-Match": etag0 },
+      body: withExdate(W.ics, "20261026T100000", "20261026T100000"),
+    });
+    expect(response.status).toBe(400);
+    expect(fake.rejections.at(-1)?.reasons.join("\n")).toMatch(/duplicate-exdate/);
+  });
+
+  it("ремонт C55, оставивший RID мимо слота, — 400, хотя сирот не стало больше; верный ремонт проходит", async () => {
+    const { fake, ctx } = makeStand();
+    const path = plant(fake, seeds.c55EchoOverride);
+    const etag0 = fake.etag(path);
+    await expect(putObject(ctx.client, path, c55RepairedOffSlot, { ifMatch: etag0 })).rejects.toMatchObject({ status: 400 });
+    expect(fake.rejections.at(-1)?.reasons.join("\n")).toMatch(/orphan-override/);
+    expect(fake.ics(path)).toBe(seeds.c55EchoOverride.ics);
+    await putObject(ctx.client, path, c55Repaired, { ifMatch: etag0 });
+    expect(fake.ics(path)).toBe(c55Repaired);
+    expect(() => assertStoredInvariants(fake)).not.toThrow();
+  });
+
+  it("assertStoredInvariants ловит ту же порчу, записанную на нестрогом стенде", async () => {
+    const { fake, ctx } = makeStand({ strict: false });
+    const c55 = plant(fake, seeds.c55EchoOverride);
+    const dup = yandexPath(calendarA, W.uid);
+    fake.seed(dup, duplicateRidAt("20261021"));
+    const masters = yandexPath(calendarB, "two-masters@yandex.ru");
+    fake.seedRaw(masters, twoMastersWeekly);
+    // Затравки со своими нарушениями стенд терпит, пока их не переписал клиент.
+    expect(() => assertStoredInvariants(fake)).not.toThrow();
+
+    await putObject(ctx.client, c55, c55RepairedOffSlot, { ifMatch: fake.etag(c55) });
+    expect(() => assertStoredInvariants(fake)).toThrow(/orphan-override/);
+    fake.seedRaw(c55, seeds.c55EchoOverride.ics);
+
+    await putObject(ctx.client, dup, duplicateRidAt("20261026"), { ifMatch: fake.etag(dup) });
+    expect(() => assertStoredInvariants(fake)).toThrow(/duplicate-rid/);
+    fake.seed(dup, duplicateRidAt("20261021"));
+
+    await putObject(ctx.client, masters, absoluteSamples["multiple-masters"].edited, { ifMatch: fake.etag(masters) });
+    expect(() => assertStoredInvariants(fake)).toThrow(/multiple-masters/);
   });
 
   it("с strict = false принимает что угодно", async () => {
@@ -717,6 +1032,148 @@ describe("инварианты: каждый ловит свой образец 
     expect(() => assertInvariants(broken, broken)).not.toThrow();
     expect(() => assertInvariants(base)).not.toThrow();
   });
+
+  // Замечание 3 ревью З01: проверки, которые держались без тестов.
+
+  it("переопределение с DTEND вместе с DURATION — dtend-with-duration (M27 в клоне основного)", () => {
+    const ics = addComponents(
+      seeds.c62DurationMaster.ics,
+      moscowOverride(seeds.c62DurationMaster.uid, "20261021T100000", "20261021T120000", "20261021T124500", "Разбор задач", ["DURATION:PT45M"]),
+    );
+    expect(findViolations(ics)).toEqual([{ kind: "dtend-with-duration", detail: expect.stringMatching(/^переопределение /) }]);
+  });
+
+  it("переопределение с DTEND раньше DTSTART — как прежний код писал клон в C62 (AE16)", () => {
+    const ics = addComponents(
+      seeds.c62DurationMaster.ics,
+      moscowOverride(seeds.c62DurationMaster.uid, "20261021T100000", "20261021T120000", "20261021T104500", "Разбор задач"),
+    );
+    expect(findViolations(ics)).toEqual([{ kind: "end-not-after-start", detail: expect.stringMatching(/^переопределение .*DTEND/) }]);
+    const equal = addComponents(base, moscowOverride(W.uid, "20261021T100000", "20261021T120000", "20261021T120000"));
+    expect(kinds(equal)).toEqual(["end-not-after-start"]);
+  });
+
+  it("переопределение с нулевой DURATION — end-not-after-start", () => {
+    const ics = addComponents(
+      seeds.c62DurationMaster.ics,
+      moscowOverride(seeds.c62DurationMaster.uid, "20261021T100000", "20261021T120000", undefined, "Разбор задач", ["DURATION:PT0S"]),
+    );
+    expect(findViolations(ics)).toEqual([{ kind: "end-not-after-start", detail: expect.stringMatching(/^переопределение .*DURATION/) }]);
+  });
+
+  it("RDATE в чужой форме — form-mismatch (О4); в своей, в том числе PERIOD, — нарушений нет", () => {
+    const rich = seeds.richMoscow.ics;
+    const rdate = "RDATE;TZID=Europe/Moscow:20261030T120000";
+    expect(rich).toContain(rdate);
+    for (const foreign of ["RDATE:20261030T090000Z", "RDATE;VALUE=DATE:20261030", "RDATE:20261030T120000"]) {
+      expect({ foreign, found: findViolations(rich.replace(rdate, foreign)) }).toEqual({
+        foreign,
+        found: [{ kind: "form-mismatch", detail: expect.stringMatching(/^RDATE /) }],
+      });
+    }
+    expect(findViolations(rich.replace(rdate, "RDATE;VALUE=PERIOD;TZID=Europe/Moscow:20261030T120000/PT1H"))).toEqual([]);
+  });
+
+  it("переопределение на слоте RDATE — не сирота; на слоте под EXDATE — скрытое", () => {
+    const rich = seeds.richMoscow.ics;
+    const onRdate = addComponents(rich, moscowOverride(seeds.richMoscow.uid, "20261030T120000", "20261030T150000", "20261030T160000"));
+    expect(findViolations(onRdate)).toEqual([]);
+    const onExdate = addComponents(rich, moscowOverride(seeds.richMoscow.uid, "20261028T120000", "20261028T150000", "20261028T160000"));
+    expect(kinds(onExdate)).toEqual(["excluded-override"]);
+  });
+});
+
+describe("инварианты: новые дубли и сироты — по составу ключей, а не по числу нарушений", () => {
+  const base = W.ics;
+
+  it("новый дубль RECURRENCE-ID на другом слоте — новый, даже если прежний дубль исчез", () => {
+    const dup21 = duplicateRidAt("20261021");
+    const dup26 = duplicateRidAt("20261026");
+    expect(kinds(dup21)).toEqual(["duplicate-rid"]);
+    expect(kinds(dup26)).toEqual(["duplicate-rid"]);
+    expect(newKinds(dup26, dup21)).toEqual(["duplicate-rid"]);
+    // Прежний дубль правка вправе сохранить, поменяв поля.
+    expect(newViolations(dup21.replace("SUMMARY:дубль 1", "SUMMARY:переименован"), dup21)).toEqual([]);
+    // Третий компонент того же слота — новый дубль.
+    const triple = addComponents(dup21, moscowOverride(W.uid, "20261021T100000", "20261021T160000", "20261021T170000", "дубль 3"));
+    expect(newKinds(triple, dup21)).toEqual(["duplicate-rid"]);
+    // Прежний дубль и новый рядом.
+    const both = addComponents(
+      dup21,
+      moscowOverride(W.uid, "20261026T100000", "20261026T113000", "20261026T123000"),
+      moscowOverride(W.uid, "20261026T100000", "20261026T140000", "20261026T150000"),
+    );
+    expect(newKinds(both, dup21)).toEqual(["duplicate-rid"]);
+  });
+
+  it("новый дубль EXDATE на другом слоте — новый, даже если прежний дубль исчез", () => {
+    const ex21 = withExdate(base, "20261021T100000", "20261021T100000");
+    expect(kinds(ex21)).toEqual(["duplicate-exdate"]);
+    expect(newKinds(withExdate(base, "20261026T100000", "20261026T100000"), ex21)).toEqual(["duplicate-exdate"]);
+    expect(newViolations(ex21.replace("SUMMARY:Планёрка", "SUMMARY:Другая"), ex21)).toEqual([]);
+    expect(newKinds(withExdate(base, "20261021T100000", "20261021T100000", "20261021T100000"), ex21)).toEqual(["duplicate-exdate"]);
+    // Ключ — момент (О3): тот же слот, записанный списком в одной строке, — прежний дубль.
+    const listed = base.replace(/(RRULE:[^\r\n]*)/, "$1\r\nEXDATE;TZID=Europe/Moscow:20261021T100000,20261021T100000");
+    expect(kinds(listed)).toEqual(["duplicate-exdate"]);
+    expect(newViolations(listed, ex21)).toEqual([]);
+  });
+
+  it("сирота на новом ключе — новая, даже если число сирот не выросло (C55: ремонт мимо слота)", () => {
+    const c55 = seeds.c55EchoOverride.ics;
+    expect(c55Repaired).not.toContain("RECURRENCE-ID;TZID=Europe/Moscow:20261021T150000");
+    expect(findViolations(c55Repaired)).toEqual([]);
+    expect(kinds(c55RepairedOffSlot)).toEqual(["orphan-override"]);
+    expect(newKinds(c55RepairedOffSlot, c55)).toEqual(["orphan-override"]);
+    // Сирота на прежнем ключе остаётся прежней, как бы её ни правили.
+    expect(newViolations(c55.replace("SUMMARY:Планёрка (перенесена)", "SUMMARY:Эхо"), c55)).toEqual([]);
+  });
+
+  it("сирота ↔ скрытое на том же ключе и сдвиг скрытого вместе с EXDATE — не новые («аномалий не больше»)", () => {
+    const excluded = withExdate(addComponents(base, moscowOverride(W.uid, "20261021T100000", "20261021T113000", "20261021T123000")), "20261021T100000");
+    expect(kinds(excluded)).toEqual(["excluded-override"]);
+    // all_series 10:00 → 11:00.
+    const shifted = excluded
+      .replace("DTSTART;TZID=Europe/Moscow:20261019T100000", "DTSTART;TZID=Europe/Moscow:20261019T110000")
+      .replace("DTEND;TZID=Europe/Moscow:20261019T110000", "DTEND;TZID=Europe/Moscow:20261019T120000");
+    // EXDATE и RID сдвинуты по позиции: скрытое на новом ключе.
+    const bothShifted = shifted
+      .replace("EXDATE;TZID=Europe/Moscow:20261021T100000", "EXDATE;TZID=Europe/Moscow:20261021T110000")
+      .replace("RECURRENCE-ID;TZID=Europe/Moscow:20261021T100000", "RECURRENCE-ID;TZID=Europe/Moscow:20261021T110000");
+    expect(kinds(bothShifted)).toEqual(["excluded-override"]);
+    expect(newViolations(bothShifted, excluded)).toEqual([]);
+    // EXDATE сдвинут, RID нет: скрытое стало сиротой на прежнем ключе.
+    const ridStayed = shifted.replace("EXDATE;TZID=Europe/Moscow:20261021T100000", "EXDATE;TZID=Europe/Moscow:20261021T110000");
+    expect(kinds(ridStayed)).toEqual(["orphan-override"]);
+    expect(newViolations(ridStayed, excluded)).toEqual([]);
+  });
+
+  it("newViolations берёт максимум по всем прежним версиям, а не только по последней", () => {
+    const orphan = addComponents(base, moscowOverride(W.uid, "20261021T150000", "20261021T150000", "20261021T160000"));
+    const renamedOrphan = orphan.replace("SUMMARY:перенос", "SUMMARY:переименован");
+    expect(newKinds(renamedOrphan, [base])).toEqual(["orphan-override"]);
+    expect(newViolations(renamedOrphan, [orphan, base])).toEqual([]);
+    expect(newViolations(renamedOrphan, [base, orphan])).toEqual([]);
+    const dup21 = duplicateRidAt("20261021");
+    const renamedDup = dup21.replace("SUMMARY:дубль 1", "SUMMARY:x");
+    expect(newViolations(renamedDup, [dup21, base])).toEqual([]);
+    expect(newViolations(renamedDup, [base, dup21])).toEqual([]);
+    const zero = base.replace("DTEND;TZID=Europe/Moscow:20261019T110000", "DTEND;TZID=Europe/Moscow:20261019T100000");
+    expect(newViolations(zero.replace("SUMMARY:Планёрка", "SUMMARY:x"), [zero, base])).toEqual([]);
+  });
+
+  it("абсолютные виды newViolations прощает только дословной прежней версии, writeViolations — никогда", () => {
+    for (const kind of ABSOLUTE_KINDS) {
+      const sample = absoluteSamples[kind];
+      expect({ kind, found: newViolations(sample.ics, sample.ics) }).toEqual({ kind, found: [] });
+      expect({ kind, found: newKinds(sample.edited, sample.ics) }).toEqual({ kind, found: [kind] });
+      expect({ kind, found: writeViolations(sample.ics, sample.ics).map((v) => v.kind) }).toEqual({ kind, found: [kind] });
+    }
+    // Прочие виды writeViolations сверяет с прежней версией, как newViolations.
+    const orphan = seeds.c55EchoOverride.ics;
+    expect(writeViolations(orphan, orphan)).toEqual([]);
+    expect(writeViolations(c55RepairedOffSlot, orphan).map((v) => v.kind)).toEqual(["orphan-override"]);
+    expect(writeViolations(W.ics).map((v) => v.kind)).toEqual([]);
+  });
 });
 
 describe("затравки", () => {
@@ -875,6 +1332,20 @@ describe("наблюдение: assertPropsPreserved, assertStoredInvariants, de
     const alarm = seed.replace("ACTION:AUDIO", "ACTION:DISPLAY");
     expect(() => assertPropsPreserved(seed, alarm)).toThrow(/VALARM/);
     expect(() => assertPropsPreserved(seed, alarm, { except: ["VALARM"] })).not.toThrow();
+  });
+
+  it("учитывает кратность: пропажа одной из двух одинаковых строк или одного из двух одинаковых VALARM — ошибка", () => {
+    const attendee = "ATTENDEE;CN=Пётр Петров;PARTSTAT=ACCEPTED;ROLE=REQ-PARTICIPANT:mailto:petrov@example.com";
+    const exdate = "EXDATE;TZID=Europe/Moscow:20261028T120000";
+    const alarm = ["BEGIN:VALARM", "ACTION:AUDIO", "TRIGGER:-PT10M", "END:VALARM", ""].join(CRLF);
+    for (const [name, piece] of [["ATTENDEE", `${attendee}\r\n`], ["EXDATE", `${exdate}\r\n`], ["VALARM", alarm]] as const) {
+      expect(seed).toContain(piece);
+      const twice = seed.replace(piece, piece + piece);
+      expect(() => assertPropsPreserved(twice, twice)).not.toThrow();
+      expect(() => assertPropsPreserved(twice, seed)).toThrow(new RegExp(name));
+      // Обратное направление — добавленная копия — не потеря.
+      expect(() => assertPropsPreserved(seed, twice)).not.toThrow();
+    }
   });
 
   it("only сужает проверку; except разрешает названным свойствам меняться", () => {

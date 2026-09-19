@@ -141,7 +141,9 @@ export function lastPutBody(fake: FakeCaldav, path?: string): string | undefined
 
 /**
  * Инварианты О12а у каждого объекта стенда: нарушения сверх тех, что уже
- * были в затравке или в чужих правках этого пути, — ошибка.
+ * были в затравке или в чужих правках этого пути, — ошибка (правила сверки —
+ * newViolations в invariants.ts). История пути кончается с удалением
+ * объекта: созданный потом по тому же пути объект наследства не имеет.
  */
 export function assertStoredInvariants(fake: FakeCaldav): void {
   const problems: string[] = [];

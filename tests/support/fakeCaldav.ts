@@ -18,15 +18,31 @@
 // - REPORT: calendar-query по окну отдаёт надмножество — все объекты
 //   календаря; по UID — подстроковое совпадение без учёта регистра (худший
 //   случай RFC 4791 §9.7.5); calendar-multiget — ровно запрошенные пути;
+//   ответ — со смешанными пространствами имён, как у Яндекса: href и status
+//   без префикса с xmlns="DAV:", свойства с префиксом D:
+//   (tests/fixtures/events-query.xml; docs/yandex-caldav-capabilities.md,
+//   «Особенности», п. 3);
 // - условные заголовки в двух режимах (`conditions`):
 //   "yandex" (по умолчанию) — как на живом Яндексе: If-Match на PUT
 //   соблюдается (Ж14), If-None-Match: * не соблюдается (Ж13), If-Match на
 //   DELETE не соблюдается (Ж15), PUT с If-Match по отсутствующему пути
 //   создаёт объект (Ж16); "rfc" — всё соблюдается и даёт 412;
 //   DELETE отсутствующего — 404 в обоих режимах;
+// - If-Match совпадает только с голым ETag, как его отдаёт Яндекс («ETag
+//   передавать как есть, не добавляя кавычек»); "…" и W/"…" — только при
+//   `acceptQuotedEtag`;
+// - ETag в ответе на PUT — по умолчанию есть (`etagOnPut`); живая сверка
+//   этого не подтверждала, код не вправе на него полагаться: `etagOnPut:
+//   false` отвечает без ETag;
 // - строгий режим (`strict`, по умолчанию включён): PUT, добавляющий
 //   нарушение инвариантов О12а сверх прежней версии объекта, получает 400 и
-//   не применяется; причины — в `rejections` и в записи журнала;
+//   не применяется; два основных компонента, чужой UID, неразбираемый текст
+//   и календарь без VEVENT — 400 на любой PUT, даже если они были в прежней
+//   версии (ABSOLUTE_KINDS, writeViolations в invariants.ts); причины — в
+//   `rejections` и в записи журнала;
+// - история внешних версий (`externalVersions`): затравка и правки другим
+//   клиентом, с которыми сверяются инварианты; удаление объекта (клиентом
+//   или externalDelete) начинает её заново;
 // - крючки: `beforeRequest`, `externalEdit`, `externalDelete`, `loseResponse`,
 //   `dropRequest`, `rejectBeforeApply`, `reorderComponents`,
 //   `normalizeOnStore`, `seed`, `seedRaw`;
@@ -34,7 +50,7 @@
 //   статус, тело PUT, применён ли запрос, какой крючок сработал.
 import ICAL from "ical.js";
 import tzdb from "@touch4it/ical-timezones";
-import { dateString, instantOfWall, newViolations, unfold, wallString, type Wall } from "./invariants.js";
+import { dateString, instantOfWall, unfold, wallString, writeViolations, type Wall } from "./invariants.js";
 
 export const FAKE_BASE_URL = "https://caldav.fake.test";
 
@@ -124,6 +140,11 @@ export interface FakeCaldavOptions {
   conditions?: ConditionMode;
   ignoreIfMatch?: boolean;
   caseInsensitiveTextMatch?: boolean;
+  /**
+   * Считать совпадением с ETag и значение в кавычках ("…", W/"…"). По
+   * умолчанию нет: Яндекс отдаёт голый ETag, и код обязан вернуть его как есть.
+   */
+  acceptQuotedEtag?: boolean;
   etagOnPut?: boolean;
   reorderComponents?: boolean;
   normalizeOnStore?: boolean | ((ics: string, path: string) => string);
@@ -175,6 +196,8 @@ export class FakeCaldav {
   /** Отрицательный контроль: сервер, который не смотрит на If-Match. */
   ignoreIfMatch: boolean;
   caseInsensitiveTextMatch: boolean;
+  /** Совпадает ли If-Match в кавычках ("…", W/"…") с голым ETag. */
+  acceptQuotedEtag: boolean;
   /** Присылать ли ETag в ответе на PUT. */
   etagOnPut: boolean;
   /** Отдавать переопределения раньше основного компонента (REPORT и GET). */
@@ -190,6 +213,8 @@ export class FakeCaldav {
   private faults: Fault[] = [];
   // Версии, пришедшие извне (затравка, правка другим клиентом): с ними
   // сверяются инварианты — чужие нарушения стенд терпит, новые — нет.
+  // С удалением объекта история кончается: объект, созданный потом по тому
+  // же пути, наследства не имеет.
   private readonly external = new Map<string, string[]>();
 
   constructor(options: FakeCaldavOptions = {}) {
@@ -198,6 +223,7 @@ export class FakeCaldav {
     this.conditions = options.conditions ?? "yandex";
     this.ignoreIfMatch = options.ignoreIfMatch ?? false;
     this.caseInsensitiveTextMatch = options.caseInsensitiveTextMatch ?? true;
+    this.acceptQuotedEtag = options.acceptQuotedEtag ?? false;
     this.etagOnPut = options.etagOnPut ?? true;
     this.reorderComponents = options.reorderComponents ?? false;
     this.normalizeOnStore = options.normalizeOnStore ?? false;
@@ -243,9 +269,10 @@ export class FakeCaldav {
     return etag;
   }
 
-  /** Удаление «другим клиентом». */
+  /** Удаление «другим клиентом»; история внешних версий пути очищается. */
   externalDelete(path: string): void {
     if (!this.objects.delete(path)) throw new Error(`externalDelete: по пути ${path} объекта нет`);
+    this.external.delete(path);
   }
 
   has(path: string): boolean {
@@ -271,7 +298,10 @@ export class FakeCaldav {
       .map(([path, object]) => ({ path, ...object }));
   }
 
-  /** Версии объекта, пришедшие извне: затравка и правки другим клиентом. */
+  /**
+   * Версии объекта, пришедшие извне: затравка и правки другим клиентом. После
+   * удаления объекта (клиентом или externalDelete) — пусто.
+   */
   externalVersions(path: string): string[] {
     return [...(this.external.get(path) ?? [])];
   }
@@ -451,7 +481,8 @@ export class FakeCaldav {
   }
 
   private etagMatches(object: StoredObject, header: string): boolean {
-    return header === "*" || header === object.etag || header === `"${object.etag}"` || header === `W/"${object.etag}"`;
+    if (header === "*" || header === object.etag) return true;
+    return this.acceptQuotedEtag && (header === `"${object.etag}"` || header === `W/"${object.etag}"`);
   }
 
   private put(request: FakeRequest, entry: LogEntry) {
@@ -465,7 +496,7 @@ export class FakeCaldav {
       }
     }
     if (this.strict) {
-      const reasons = newViolations(request.body, existing ? [existing.ics] : []).map((v) => `${v.kind}: ${v.detail}`);
+      const reasons = writeViolations(request.body, existing ? [existing.ics] : []).map((v) => `${v.kind}: ${v.detail}`);
       if (reasons.length > 0) {
         entry.rejected = reasons;
         this.rejections.push({ path: request.path, reasons });
@@ -473,6 +504,8 @@ export class FakeCaldav {
       }
     }
     const etag = this.nextEtag();
+    // Новый объект по пустому пути наследства прежнего не имеет.
+    if (!existing) this.external.delete(request.path);
     this.objects.set(request.path, { etag, ics: this.storedText(request.body, request.path) });
     entry.applied = true;
     // Ж13: запись поверх существующего объекта с If-None-Match: * Яндекс
@@ -493,6 +526,7 @@ export class FakeCaldav {
       return { status: 412 };
     }
     this.objects.delete(request.path);
+    this.external.delete(request.path);
     entry.applied = true;
     return { status: 204 };
   }
@@ -546,23 +580,21 @@ export class FakeCaldav {
       // Окно времени не проверяется: отдаётся надмножество, раскрытие и
       // отбор по окну — дело клиента.
     }
+    // Разметка — как у Яндекса (tests/fixtures/events-query.xml): href и
+    // status без префикса с xmlns="DAV:", остальное с префиксом D:,
+    // calendar-data с собственным объявлением C:, всё одной строкой.
     const responses = selected
       .map(
-        ([href, object]) => `  <d:response>
-    <d:href>${xmlEscape(href)}</d:href>
-    <d:propstat><d:prop>
-      <d:getetag>${object.etag}</d:getetag>
-      <c:calendar-data>${xmlEscape(this.serve(object.ics))}</c:calendar-data>
-    </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
-  </d:response>`,
+        ([href, object]) =>
+          `<D:response><href xmlns="DAV:">${xmlEscape(href)}</href><D:propstat><D:prop>` +
+          `<D:getetag>${object.etag}</D:getetag>` +
+          `<C:calendar-data xmlns:C="urn:ietf:params:xml:ns:caldav">${xmlEscape(this.serve(object.ics))}</C:calendar-data>` +
+          `</D:prop><status xmlns="DAV:">HTTP/1.1 200 OK</status></D:propstat></D:response>`,
       )
-      .join("\n");
+      .join("");
     return {
       status: 207,
-      body: `<?xml version="1.0" encoding="utf-8"?>
-<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
-${responses}
-</d:multistatus>`,
+      body: `<?xml version='1.0' encoding='utf-8'?>\n<D:multistatus xmlns:D="DAV:">${responses}</D:multistatus>`,
       headers: { "Content-Type": "application/xml; charset=utf-8" },
     };
   }

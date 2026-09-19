@@ -10,6 +10,18 @@
 // - DTEND и DURATION не вместе (RFC 5545 §3.6.1);
 // - аномалий (переопределений мимо слотов и под EXDATE) не больше, чем было.
 //
+// Что считается новым нарушением относительно прежних версий (newViolations,
+// writeViolations):
+// - два основных компонента, чужой UID, неразбираемый текст и календарь без
+//   VEVENT (ABSOLUTE_KINDS) — в любой записи, какой бы ни была прежняя версия;
+// - дубли RECURRENCE-ID и EXDATE — по ключам слотов: новый дубль — ключ, у
+//   которого лишних компонентов (значений) больше, чем в любой прежней
+//   версии; дубль на другом слоте вместо исчезнувшего прежнего — новый;
+// - переопределения мимо слотов и под EXDATE — по числу (О12а: «аномалий не
+//   больше, чем было»), а сирота на ключе, которого не было среди аномалий
+//   ни одной прежней версии, — новая, даже если число не выросло;
+// - прочее — по числу нарушений каждого вида.
+//
 // Проверка намеренно написана заново, а не через src/ical: стенд — оракул,
 // и он не должен ошибаться заодно с проверяемым кодом. Из ical.js берутся
 // только разбор текста и итератор правила; ключи слотов считаются здесь же,
@@ -38,9 +50,26 @@ export const VIOLATION_KINDS = [
 
 export type ViolationKind = (typeof VIOLATION_KINDS)[number];
 
+/**
+ * Виды, недопустимые в любой записи клиента, какой бы ни была прежняя версия
+ * объекта. Два основных компонента и чужой UID новый код не чинит и не
+ * правит: такой объект только удаляется целиком (О14, Р12). Неразбираемый
+ * текст и календарь без VEVENT записью не бывают вовсе (Р4: неразбираемый
+ * объект правка отклоняет, удаление идёт без дерева).
+ */
+export const ABSOLUTE_KINDS = ["unparsable", "no-vevent", "multiple-masters", "mixed-uids"] as const satisfies readonly ViolationKind[];
+
 export interface Violation {
   kind: ViolationKind;
   detail: string;
+}
+
+// Нарушение с ключом слота (О3), к которому оно относится: у дублей
+// RECURRENCE-ID и EXDATE и у аномалий переопределений. По ключам
+// newViolations отличает новый дубль или новую сироту от прежних. Наружу
+// findViolations отдаёт нарушения без ключа.
+interface Finding extends Violation {
+  key?: string;
 }
 
 export class InvariantError extends Error {
@@ -386,12 +415,17 @@ function compareTimes(
 
 /** Все нарушения инвариантов в тексте объекта. Пустой список — объект чист. */
 export function findViolations(ics: string): Violation[] {
+  return analyze(ics).map(({ kind, detail }) => ({ kind, detail }));
+}
+
+// Нарушения вместе с ключами слотов, к которым они относятся.
+function analyze(ics: string): Finding[] {
   const parsed = parseRoot(ics);
   if ("error" in parsed) return [{ kind: "unparsable", detail: parsed.error }];
   const jcal = parsed.jcal;
   const root = new ICAL.Component(jcal);
-  const out: Violation[] = [];
-  const add = (kind: ViolationKind, detail: string) => out.push({ kind, detail });
+  const out: Finding[] = [];
+  const add = (kind: ViolationKind, detail: string, key?: Key) => out.push(key === undefined ? { kind, detail } : { kind, detail, key });
 
   const events = jcal[2].filter((component) => component[0] === "vevent");
   if (events.length === 0) return [{ kind: "no-vevent", detail: "в объекте нет ни одного VEVENT" }];
@@ -516,7 +550,7 @@ export function findViolations(ics: string): Violation[] {
   }
   const seenRid = new Set<Key>();
   for (const { key, event } of ridKeys) {
-    if (seenRid.has(key)) add("duplicate-rid", `второй компонент того же слота: ${eventLabel(event)}`);
+    if (seenRid.has(key)) add("duplicate-rid", `второй компонент того же слота: ${eventLabel(event)}`, key);
     seenRid.add(key);
   }
   const exdateKeys = new Set<Key>();
@@ -525,7 +559,7 @@ export function findViolations(ics: string): Violation[] {
       for (const value of valuesOf(prop)) {
         const key = keyOf(prop, value, seriesIsDate, root);
         if (!key) continue;
-        if (exdateKeys.has(key)) add("duplicate-exdate", `EXDATE ${String(timeString(prop, value))} повторяется`);
+        if (exdateKeys.has(key)) add("duplicate-exdate", `EXDATE ${String(timeString(prop, value))} повторяется`, key);
         exdateKeys.add(key);
       }
     }
@@ -537,8 +571,8 @@ export function findViolations(ics: string): Violation[] {
     const slots = slotsOf(masterJ, master, dtstart, seriesIsDate, root, ridKeys.map((entry) => entry.key));
     if (slots) {
       for (const { key, event } of ridKeys) {
-        if (!slots.has(key)) add("orphan-override", `${eventLabel(event)}: RECURRENCE-ID не совпадает ни с одним слотом серии`);
-        else if (exdateKeys.has(key)) add("excluded-override", `${eventLabel(event)}: слот закрыт EXDATE`);
+        if (!slots.has(key)) add("orphan-override", `${eventLabel(event)}: RECURRENCE-ID не совпадает ни с одним слотом серии`, key);
+        else if (exdateKeys.has(key)) add("excluded-override", `${eventLabel(event)}: слот закрыт EXDATE`, key);
       }
     }
   }
@@ -546,32 +580,72 @@ export function findViolations(ics: string): Violation[] {
   return out;
 }
 
-// Сирота и скрытое переопределение — одна группа: сдвиг серии может
+const ABSOLUTE = new Set<ViolationKind>(ABSOLUTE_KINDS);
+const DUPLICATES = new Set<ViolationKind>(["duplicate-rid", "duplicate-exdate"]);
+
+// Сирота и скрытое переопределение — одна группа аномалий: сдвиг серии может
 // превратить одно в другое, не добавив аномалий («аномалий не больше, чем было»).
-function groupOf(kind: ViolationKind): string {
-  return kind === "orphan-override" || kind === "excluded-override" ? "override-anomaly" : kind;
+function isAnomaly(kind: ViolationKind): boolean {
+  return kind === "orphan-override" || kind === "excluded-override";
 }
 
-function countByGroup(violations: Violation[]): Map<string, number> {
-  const counts = new Map<string, number>();
-  for (const violation of violations) counts.set(groupOf(violation.kind), (counts.get(groupOf(violation.kind)) ?? 0) + 1);
-  return counts;
+function baselinesOf(before: string | readonly string[] | null | undefined): readonly string[] {
+  return before === undefined || before === null ? [] : typeof before === "string" ? [before] : before;
+}
+
+// Нарушения `after`, новые относительно прежних версий (правила — в шапке
+// файла). verbatimExempt: текст, дословно совпавший с прежней версией, —
+// это не запись клиента, а сама прежняя версия, и в нём нового нет.
+function freshViolations(after: string, baselines: readonly string[], verbatimExempt: boolean): Violation[] {
+  if (verbatimExempt && baselines.includes(after)) return [];
+  const previous = baselines.map(analyze);
+  const current = analyze(after);
+  // Наибольшее значение счётчика по всем прежним версиям (0, если их нет).
+  const mostBefore = (count: (findings: Finding[]) => number) => Math.max(0, ...previous.map(count));
+
+  const fresh = current.filter((finding) => {
+    const { kind, key } = finding;
+    if (ABSOLUTE.has(kind)) return true;
+    if (DUPLICATES.has(kind)) {
+      // Лишних компонентов (значений) у этого ключа больше, чем было: дубль
+      // на другом слоте вместо исчезнувшего прежнего и третий компонент
+      // прежнего дубля — новые.
+      const extraAtKey = (findings: Finding[]) => findings.filter((f) => f.kind === kind && f.key === key).length;
+      return extraAtKey(current) > mostBefore(extraAtKey);
+    }
+    if (isAnomaly(kind)) {
+      const anomalies = (findings: Finding[]) => findings.filter((f) => isAnomaly(f.kind)).length;
+      if (anomalies(current) > mostBefore(anomalies)) return true;
+      // Сирота на ключе, которого не было среди аномалий ни одной прежней
+      // версии, — новая, даже если сирот не больше: так выглядит ремонт,
+      // поставивший RECURRENCE-ID мимо слота (C55, C56). Скрытое под EXDATE
+      // на новом ключе — след сдвига серии вместе с EXDATE, оно по числу.
+      return kind === "orphan-override" && !previous.some((findings) => findings.some((f) => isAnomaly(f.kind) && f.key === key));
+    }
+    const ofKind = (findings: Finding[]) => findings.filter((f) => f.kind === kind).length;
+    return ofKind(current) > mostBefore(ofKind);
+  });
+  return fresh.map(({ kind, detail }) => ({ kind, detail }));
 }
 
 /**
- * Нарушения `after`, которых больше, чем в любой из прежних версий `before`
- * (по группам). Прежние нарушения чужого объекта правка вправе сохранить,
- * новых добавлять — нет. Без `before` любое нарушение новое.
+ * Нарушения `after`, новые относительно всех прежних версий `before` (правила
+ * — в шапке файла). Прежние нарушения чужого объекта правка вправе сохранить,
+ * новых добавлять — нет. Без `before` любое нарушение новое. Виды
+ * ABSOLUTE_KINDS прощаются, только если `after` дословно совпадает с одной из
+ * прежних версий: так assertStoredInvariants терпит нетронутую затравку.
  */
 export function newViolations(after: string, before?: string | readonly string[] | null): Violation[] {
-  const baselines = before === undefined || before === null ? [] : typeof before === "string" ? [before] : before;
-  const allowed = new Map<string, number>();
-  for (const text of baselines) {
-    for (const [group, n] of countByGroup(findViolations(text))) allowed.set(group, Math.max(allowed.get(group) ?? 0, n));
-  }
-  const current = findViolations(after);
-  const counts = countByGroup(current);
-  return current.filter((violation) => (counts.get(groupOf(violation.kind)) ?? 0) > (allowed.get(groupOf(violation.kind)) ?? 0));
+  return freshViolations(after, baselinesOf(before), true);
+}
+
+/**
+ * Нарушения, из-за которых строгий стенд отклоняет PUT с телом `body` поверх
+ * прежней версии `before`: как newViolations, но виды ABSOLUTE_KINDS
+ * запрещены в любой записи, даже дословно повторяющей прежнюю версию.
+ */
+export function writeViolations(body: string, before?: string | readonly string[] | null): Violation[] {
+  return freshViolations(body, baselinesOf(before), false);
 }
 
 /** Бросает InvariantError, если в `after` есть нарушения сверх `before`. */
