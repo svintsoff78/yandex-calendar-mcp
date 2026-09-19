@@ -9,17 +9,24 @@
 // Цепочка — последовательность публичных вызовов deleteEvent, updateEvent,
 // readEvents на FakeCaldav из tests/support: что записал шаг, то следующий
 // шаг читает с сервера. instanceStart и etag берутся только из выдачи
-// readEvents (кроме цепочек, где адрес нарочно чужой: C18, C46). После
-// каждого шага: точный видимый список, инварианты О12а всех объектов стенда
-// (строгий стенд к тому же отвергает запись, добавляющую нарушение, кодом
-// 400) и форма хранимого объекта. Отказы сверяются по `code` и обязаны
-// ничего не записать.
+// readEvents (кроме цепочек, где адрес нарочно чужой: C18, C46).
+//
+// После каждого пишущего шага, пока объект жив:
+// - точный видимый список readEvents;
+// - инварианты О12а всех объектов стенда (строгий стенд к тому же отвергает
+//   запись, добавляющую нарушение, кодом 400);
+// - сохранность (assertPropsPreserved, §6 плана) через expectKept: у шага
+//   названо, что он вправе менять (основному компоненту при delete this —
+//   EXDATE, при усечении — RRULE; снятые переопределения), всё
+//   прочее — свойства и вложенные компоненты основного VEVENT, каждого
+//   оставшегося переопределения и VTIMEZONE — сверяется с состоянием до шага;
+// - форма хранимого объекта (RECURRENCE-ID, EXDATE, части RRULE).
+// Отказ сверяется по `code` и обязан ничего не записать.
 //
 // Цепочки помечены it.fails: на прежнем коде (dd99d80; домен
 // src/domain/events.ts не менялся до З13) каждая падает на утверждении о
 // порче данных — какое именно, записано в строке «Прежний код» у цепочки и
 // в отчёте З05a (.superpowers/sdd/2026-09-18-yandex-calendar-mcp/rework-З05a-report.md).
-// C57 на прежнем коде зелёная — она охранная (§6 плана), без .fails.
 // Задача З13 снимает .fails, когда цепочки станут зелёными.
 //
 // Помощники повторяют помощники edit.test.ts: общий модуль в tests/chains
@@ -29,8 +36,16 @@ import { describe, expect, it } from "vitest";
 import { deleteEvent, readEvents, updateEvent } from "../../src/domain/events.js";
 import type { CalendarEvent, EditScope } from "../../src/types.js";
 import { makeStand, plant, type Stand } from "../support/context.js";
-import { lineName, parseRawComponents, type RawComponent } from "../support/invariants.js";
-import { assertStoredInvariants, DEFAULT_WINDOW, describeStand, formatEvent, visible, wallTime } from "../support/observe.js";
+import { lineName, parseRawComponents, unfold, type RawComponent } from "../support/invariants.js";
+import {
+  assertPropsPreserved,
+  assertStoredInvariants,
+  DEFAULT_WINDOW,
+  describeStand,
+  formatEvent,
+  visible,
+  wallTime,
+} from "../support/observe.js";
 import { singleMoscow, weeklyMoscow, type Seed } from "../support/seeds.js";
 
 // ---------------------------------------------------------------------------
@@ -128,10 +143,59 @@ interface Refusal {
 
 type CodeCheck = readonly string[] | { test: (code: unknown) => boolean; what: string };
 
+/**
+ * Коды отказов, названные планом для других причин: адрес (Р10, AddressError
+ * в §2), время (О8), аномалии и блокировки (О14, Р3, Р5), разрез (Р9) и
+ * пределы (Р1, О12д). Коды отказа по устаревшему etag (Р11) и по потере
+ * данных (О11, needsConfirm) план не называет; пока их проверяет
+ * `refusalFor`: код — строка и ни один из этих. Когда З10 или З13 назовут
+ * коды, проверки сузить до точных.
+ */
+const OTHER_REASONS = [
+  "invalid",
+  "not-found",
+  "excluded",
+  "actual-start",
+  "ambiguous",
+  "mismatch",
+  "invalid-time",
+  "unparsable",
+  "bad-rrule",
+  "no-positions",
+  "multiple-masters",
+  "mixed-uids",
+  "unknown-tzid",
+  "range-override",
+  "duplicate-override",
+  "legacy-override",
+  "empty-series",
+  "series-too-long",
+  "unsynced-rule",
+  "until-too-far",
+  "split-mismatch",
+  "split-stale-continuation",
+  "split-already-done",
+];
+
+function refusalFor(what: string): CodeCheck {
+  return {
+    test: (code) => typeof code === "string" && !OTHER_REASONS.includes(code),
+    what: `${what}: код — строка и не код другой причины из OTHER_REASONS`,
+  };
+}
+
+function codeMatches(codes: CodeCheck, code: unknown): boolean {
+  return Array.isArray(codes) ? codes.includes(code as string) : (codes as { test: (c: unknown) => boolean }).test(code);
+}
+
+function codesText(codes: CodeCheck): string {
+  return Array.isArray(codes) ? codes.join(" или ") : (codes as { what: string }).what;
+}
+
 /** Шаг, который обязан кончиться отказом с кодом и ничего не записать. */
 async function expectRefused(chain: Chain, label: string, run: () => Promise<unknown>, codes: CodeCheck): Promise<Refusal> {
   const mark = chain.fake.mark();
-  const what = Array.isArray(codes) ? codes.join(" или ") : (codes as { what: string }).what;
+  const what = codesText(codes);
   let error: unknown;
   let resolved = false;
   try {
@@ -148,14 +212,15 @@ async function expectRefused(chain: Chain, label: string, run: () => Promise<unk
     throw failure(chain, label, `отказ обязан ничего не писать, а в журнале: ${writes}; ошибка: ${messageOf(error)}`, mark);
   }
   const code = (error as Refusal | undefined)?.code;
-  const ok = Array.isArray(codes) ? codes.includes(code as string) : (codes as { test: (c: unknown) => boolean }).test(code);
-  if (!ok) {
+  if (!codeMatches(codes, code)) {
     throw failure(chain, label, `ожидался отказ с кодом ${what}, а пришёл ${code === undefined ? "отказ без кода" : `код ${String(code)}`}: ${messageOf(error)}`, mark);
   }
   return error as Refusal;
 }
 
-async function expectVisible(chain: Chain, label: string, expected: string[], options: { unordered?: boolean; from?: string; to?: string } = {}): Promise<void> {
+type Window = { from?: string; to?: string };
+
+async function expectVisible(chain: Chain, label: string, expected: string[], options: { unordered?: boolean } & Window = {}): Promise<void> {
   const got = await visible(chain.ctx, { from: options.from, to: options.to });
   const [actual, wanted] = options.unordered ? [[...got].sort(), [...expected].sort()] : [got, expected];
   expect(actual, `${label}: видимый список readEvents не совпал\n${describeStand(chain.fake)}`).toEqual(wanted);
@@ -182,8 +247,8 @@ function slotOf(event: CalendarEvent): string {
 }
 
 /** Встреча серии по её слоту — ровно одна, из настоящей выдачи readEvents. */
-async function occurrence(chain: Chain, slot: string): Promise<CalendarEvent> {
-  const list = await readEvents(chain.ctx, DEFAULT_WINDOW);
+async function occurrence(chain: Chain, slot: string, window: Window = DEFAULT_WINDOW): Promise<CalendarEvent> {
+  const list = await readEvents(chain.ctx, { from: window.from ?? DEFAULT_WINDOW.from, to: window.to ?? DEFAULT_WINDOW.to });
   const hits = list.filter((event) => (event.id === chain.uid || event.seriesId === chain.uid) && slotOf(event) === slot);
   if (hits.length !== 1) {
     throw new Error(
@@ -218,17 +283,18 @@ function stored(chain: Chain): Stored {
   };
 }
 
+/** Значения времени строки свойства: «TZID значение» или просто «значение», по одному на значение списка. */
+function timeKeys(line: string): string[] {
+  const colon = line.indexOf(":");
+  const tzid = /;TZID=([^;]+)/i.exec(line.slice(0, colon))?.[1];
+  return line
+    .slice(colon + 1)
+    .split(",")
+    .map((value) => (tzid ? `${tzid} ${value}` : value));
+}
+
 function timesOf(component: RawComponent, name: string): string[] {
-  return component.lines
-    .filter((line) => lineName(line) === name)
-    .flatMap((line) => {
-      const colon = line.indexOf(":");
-      const tzid = /;TZID=([^;]+)/i.exec(line.slice(0, colon))?.[1];
-      return line
-        .slice(colon + 1)
-        .split(",")
-        .map((value) => (tzid ? `${tzid} ${value}` : value));
-    });
+  return component.lines.filter((line) => lineName(line) === name).flatMap(timeKeys);
 }
 
 function ruleOf(master: RawComponent): Record<string, string> {
@@ -252,6 +318,84 @@ function expectShape(chain: Chain, label: string, shape: { rids: string[]; exdat
   );
   expect(timesOf(now.masters[0], "EXDATE").sort(), `${label}: EXDATE основного компонента${context}`).toEqual([...shape.exdates].sort());
   return now;
+}
+
+// ---------------------------------------------------------------------------
+// Сохранность: шаг меняет только то, что называет (§6 плана, assertPropsPreserved)
+// ---------------------------------------------------------------------------
+
+/**
+ * Что пишущему шагу можно менять в объекте. Всё прочее сверяется с текстом
+ * до шага: свойства и вложенные компоненты основного VEVENT, каждого
+ * оставшегося переопределения и VTIMEZONE (О5: VTIMEZONE только
+ * добавляются). Метаданные О10 (DTSTAMP, LAST-MODIFIED, SEQUENCE)
+ * assertPropsPreserved по умолчанию не сверяет. Компоненты, которых до шага
+ * не было (новое переопределение), не сверяются — их проверяют видимый
+ * список и форма объекта.
+ */
+interface Allowed {
+  /** Свойства и вложенные компоненты основного VEVENT, которые шаг меняет. */
+  master?: readonly string[];
+  /** То же у переопределений. */
+  overrides?: readonly string[];
+  /** Переопределения, которые шаг снимает: RECURRENCE-ID как «TZID значение». */
+  dropped?: readonly string[];
+  /** Сдвиг серии: RECURRENCE-ID переопределения до шага → после, как «TZID значение». */
+  moved?: Readonly<Record<string, string>>;
+}
+
+/** Текст «до» с RECURRENCE-ID, переписанными по `moved`: так assertPropsPreserved сопоставит переопределение с новым RID. */
+function remapRids(ics: string, moved: Readonly<Record<string, string>>): string {
+  return unfold(ics)
+    .split("\n")
+    .map((line) => {
+      if (lineName(line) !== "RECURRENCE-ID") return line;
+      const target = moved[timeKeys(line)[0]];
+      if (target === undefined) return line;
+      const [tzid, value] = target.includes(" ") ? target.split(" ") : [undefined, target];
+      const params = line
+        .slice(0, line.indexOf(":"))
+        .split(";")
+        .slice(1)
+        .filter((param) => !/^TZID=/i.test(param));
+      return `${["RECURRENCE-ID", ...params, ...(tzid ? [`TZID=${tzid}`] : [])].join(";")}:${value}`;
+    })
+    .join("\n");
+}
+
+function allowedText(allowed: Allowed): string {
+  const parts = [
+    allowed.master?.length ? `основному компоненту — ${allowed.master.join(", ")}` : "",
+    allowed.overrides?.length ? `переопределениям — ${allowed.overrides.join(", ")}` : "",
+    allowed.dropped?.length ? `снять переопределения ${allowed.dropped.join(", ")}` : "",
+    allowed.moved ? `сдвинуть RECURRENCE-ID ${Object.entries(allowed.moved).map(([a, b]) => `${a} → ${b}`).join(", ")}` : "",
+  ].filter(Boolean);
+  return parts.length ? `можно было: ${parts.join("; ")}` : "шаг не вправе был менять ничего из прежнего";
+}
+
+function expectKept(chain: Chain, label: string, before: string, allowed: Allowed = {}): void {
+  const was = remapRids(before, allowed.moved ?? {});
+  const now = chain.fake.ics(chain.path);
+  const rid = (component: RawComponent) => timesOf(component, "RECURRENCE-ID")[0];
+  const dropped = new Set(allowed.dropped ?? []);
+  const parts: Array<[string, (component: RawComponent) => boolean, readonly string[]]> = [
+    ["основной компонент", (c) => c.name === "VEVENT" && rid(c) === undefined, allowed.master ?? []],
+    ["переопределения", (c) => c.name === "VEVENT" && rid(c) !== undefined && !dropped.has(rid(c)), allowed.overrides ?? []],
+    ["прочие компоненты", (c) => c.name !== "VEVENT", []],
+  ];
+  const problems: string[] = [];
+  for (const [what, scope, except] of parts) {
+    try {
+      assertPropsPreserved(was, now, { scope, except: [...except] });
+    } catch (error) {
+      problems.push(`${what}: ${messageOf(error)}`);
+    }
+  }
+  if (problems.length > 0) {
+    throw new Error(
+      `${label}: шаг тронул то, чего не называл (${allowedText(allowed)}):\n${problems.join("\n")}\nСостояние стенда:\n${describeStand(chain.fake)}`,
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -326,14 +470,21 @@ const withHidden = seedOf(
   ],
 );
 
-/** C57: раз в два года 19.10 10:00 МСК — шаг между встречами больше 400 дней. */
+/** C57 (а): раз в два года 19.10 10:00 МСК, без конца — шаг между встречами 731 день. */
 const everyTwoYears = seedOf("c57yearly2x@yandex.ru", "Раз в два года 19.10 10:00–11:00 МСК, без конца", masterLines("FREQ=YEARLY;INTERVAL=2"));
 
-/** C57: ежегодно 29.02 10:00 МСК с 2028 года. */
-const leapDay = seedOf(
+/** C57 (б): раз в два года, две встречи — 19.10.2026 и 19.10.2028. */
+const everyTwoYearsTwice = seedOf(
+  "c57yearly2c2@yandex.ru",
+  "Раз в два года 19.10 10:00–11:00 МСК, COUNT=2: 19.10.2026 и 19.10.2028",
+  masterLines("FREQ=YEARLY;INTERVAL=2;COUNT=2"),
+);
+
+/** C57 (в): 29.02 10:00 МСК с явными BYMONTH и BYMONTHDAY, две встречи — 29.02.2028 и 29.02.2032. */
+const leapDayTwice = seedOf(
   "c57leapday29@yandex.ru",
-  "Ежегодно 29.02 10:00–11:00 МСК с 29.02.2028, без конца",
-  masterLines("FREQ=YEARLY", "20280229T100000", "20280229T110000"),
+  "Ежегодно 29.02 10:00–11:00 МСК, BYMONTH=2;BYMONTHDAY=29;COUNT=2: 29.02.2028 и 29.02.2032",
+  masterLines("FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=29;COUNT=2", "20280229T100000", "20280229T110000"),
 );
 
 // ---------------------------------------------------------------------------
@@ -348,8 +499,10 @@ function rows(text: string, replace: Record<string, string | null> = {}, time = 
 }
 
 const MOVED_21 = "2026-10-21 11:30–12:30 Планёрка [слот 2026-10-21 10:00]";
+const RID_21 = "Europe/Moscow 20261021T100000";
 
 async function move21(chain: Chain, label: string): Promise<void> {
+  const before = chain.fake.ics(chain.path);
   const slot21 = await occurrence(chain, "2026-10-21 10:00");
   await act(chain, `${label} (перенос 21.10 на 11:30)`, () =>
     update(chain, {
@@ -359,6 +512,9 @@ async function move21(chain: Chain, label: string): Promise<void> {
     }),
   );
   await expectVisible(chain, label, rows("Планёрка", { "2026-10-21": MOVED_21 }));
+  expectInvariants(chain, label);
+  expectKept(chain, label, before);
+  expectShape(chain, label, { rids: [RID_21], exdates: [] });
 }
 
 // ---------------------------------------------------------------------------
@@ -366,23 +522,14 @@ async function move21(chain: Chain, label: string): Promise<void> {
 // ---------------------------------------------------------------------------
 
 describe("Цепочки удаления (З05a)", () => {
-  // Поломки: AD3, AE12, R13-N4 — перенесённую нельзя удалить по
-  // instanceStart из выдачи; по фактическому времени delete ставит EXDATE
-  // «в пустоту» и рапортует успех (AD5).
-  // Прежний код: падает на (а) шаге 2 — отказ «не совпадает ни с одним экземпляром».
-  it.fails("C07: перенос 21.10 → удаление по слоту; отдельно — по фактическому времени (actual-start)", async () => {
-    // (а) По слоту из выдачи.
-    const bySlot = standWith(weeklyMoscow);
-    await move21(bySlot, "C07 (а) шаг 1");
-    const moved = await occurrence(bySlot, "2026-10-21 10:00");
-    await act(bySlot, "C07 (а) шаг 2 (удаление перенесённой по её instanceStart)", () =>
-      remove(bySlot, { scope: "this", instanceStart: moved.instanceStart, etag: moved.etag }),
-    );
-    await expectVisible(bySlot, "C07 (а) шаг 2", rows("Планёрка", { "2026-10-21": null }));
-    expectInvariants(bySlot, "C07 (а) шаг 2");
-    expectAlive(bySlot, "C07 (а) шаг 2", true);
-    expectShape(bySlot, "C07 (а) шаг 2", { rids: [], exdates: ["Europe/Moscow 20261021T100000"] });
-
+  // Поломки: AD3, AE12, R13-N4 — по фактическому времени перенесённой
+  // delete ставит EXDATE «в пустоту» и рапортует успех (AD5); по instanceStart
+  // из выдачи перенесённую удалить нельзя.
+  // (б) идёт первой: на прежнем коде она показывает саму порчу — запись
+  // EXDATE мимо слотов вместо отказа; (а) падает раньше порчи, на отказе
+  // прежней проверки адреса.
+  // Прежний код: падает на (б) шаге 2 — вместо отказа actual-start PUT → 204.
+  it.fails("C07: перенос 21.10 → удаление по фактическому времени (actual-start); отдельно — по слоту", async () => {
     // (б) По фактическому времени — отказ с подсказкой адреса.
     const byStart = standWith(weeklyMoscow);
     await move21(byStart, "C07 (б) шаг 1");
@@ -398,6 +545,20 @@ describe("Цепочки удаления (З05a)", () => {
       "C07 (б) шаг 2: подсказка называет адрес перенесённой встречи (её слот)",
     ).toContain("2026-10-21T10:00");
     await expectVisible(byStart, "C07 (б) шаг 2", rows("Планёрка", { "2026-10-21": MOVED_21 }));
+
+    // (а) По слоту из выдачи.
+    const bySlot = standWith(weeklyMoscow);
+    await move21(bySlot, "C07 (а) шаг 1");
+    const moved = await occurrence(bySlot, "2026-10-21 10:00");
+    const before = bySlot.fake.ics(bySlot.path);
+    await act(bySlot, "C07 (а) шаг 2 (удаление перенесённой по её instanceStart)", () =>
+      remove(bySlot, { scope: "this", instanceStart: moved.instanceStart, etag: moved.etag }),
+    );
+    await expectVisible(bySlot, "C07 (а) шаг 2", rows("Планёрка", { "2026-10-21": null }));
+    expectInvariants(bySlot, "C07 (а) шаг 2");
+    expectAlive(bySlot, "C07 (а) шаг 2", true);
+    expectKept(bySlot, "C07 (а) шаг 2", before, { master: ["EXDATE"], dropped: [RID_21] });
+    expectShape(bySlot, "C07 (а) шаг 2", { rids: [], exdates: [RID_21] });
   });
 
   // Поломка: AD3 — перенос на время другого экземпляра: EXDATE гасит не ту встречу.
@@ -405,7 +566,9 @@ describe("Цепочки удаления (З05a)", () => {
   it.fails("C08: перенос 26.10 на 28.10 10:00 → удаление 28.10 — ambiguous; с confirm — обычная 28.10; по слоту 26.10 — перенесённая", async () => {
     const chain = standWith(weeklyMoscow);
     const moved = "2026-10-28 10:00–11:00 Планёрка [слот 2026-10-26 10:00]";
+    const rid26 = "Europe/Moscow 20261026T100000";
 
+    const initial = chain.fake.ics(chain.path);
     const slot26 = await occurrence(chain, "2026-10-26 10:00");
     await act(chain, "C08 шаг 1 (перенос 26.10 на 28.10 10:00)", () =>
       update(chain, {
@@ -415,6 +578,9 @@ describe("Цепочки удаления (З05a)", () => {
       }),
     );
     await expectVisible(chain, "C08 шаг 1", [...rows("Планёрка", { "2026-10-26": null }), moved], { unordered: true });
+    expectInvariants(chain, "C08 шаг 1");
+    expectKept(chain, "C08 шаг 1", initial);
+    expectShape(chain, "C08 шаг 1", { rids: [rid26], exdates: [] });
 
     const slot28 = await occurrence(chain, "2026-10-28 10:00");
     await expectRefused(
@@ -425,13 +591,16 @@ describe("Цепочки удаления (З05a)", () => {
     );
     await expectVisible(chain, "C08 шаг 2", [...rows("Планёрка", { "2026-10-26": null }), moved], { unordered: true });
 
+    const afterMove = chain.fake.ics(chain.path);
     await act(chain, "C08 шаг 3 (то же с confirm)", () =>
       remove(chain, { scope: "this", instanceStart: slot28.instanceStart, etag: slot28.etag, confirm: true }),
     );
     await expectVisible(chain, "C08 шаг 3", rows("Планёрка", { "2026-10-26": null, "2026-10-28": moved }));
     expectInvariants(chain, "C08 шаг 3");
-    expectShape(chain, "C08 шаг 3", { rids: ["Europe/Moscow 20261026T100000"], exdates: ["Europe/Moscow 20261028T100000"] });
+    expectKept(chain, "C08 шаг 3", afterMove, { master: ["EXDATE"] });
+    expectShape(chain, "C08 шаг 3", { rids: [rid26], exdates: ["Europe/Moscow 20261028T100000"] });
 
+    const afterSlot = chain.fake.ics(chain.path);
     const movedNow = await occurrence(chain, "2026-10-26 10:00");
     await act(chain, "C08 шаг 4 (удаление перенесённой по слоту 26.10)", () =>
       remove(chain, { scope: "this", instanceStart: movedNow.instanceStart, etag: movedNow.etag }),
@@ -439,21 +608,28 @@ describe("Цепочки удаления (З05a)", () => {
     await expectVisible(chain, "C08 шаг 4", rows("Планёрка", { "2026-10-26": null, "2026-10-28": null }));
     expectInvariants(chain, "C08 шаг 4");
     expectAlive(chain, "C08 шаг 4", true);
-    expectShape(chain, "C08 шаг 4", { rids: [], exdates: ["Europe/Moscow 20261026T100000", "Europe/Moscow 20261028T100000"] });
+    expectKept(chain, "C08 шаг 4", afterSlot, { master: ["EXDATE"], dropped: [rid26] });
+    expectShape(chain, "C08 шаг 4", { rids: [], exdates: [rid26, "Europe/Moscow 20261028T100000"] });
   });
 
   // Поломки: AE13, AD5 — delete this не снимает переопределение: встреча
   // остаётся, повтор копит дубли EXDATE.
-  // Прежний код: падает на шаге 2 — «Особая» 21.10 по-прежнему в выдаче.
+  // Прежний код: падает на шаге 2 — строгий стенд отвергает PUT
+  // (excluded-override: EXDATE поставлен, переопределение не снято).
   it.fails("C09: имя 21.10 → удаление 21.10 дважды — встречи нет, EXDATE один, второй вызов ничего не пишет", async () => {
     const chain = standWith(weeklyMoscow);
 
+    const initial = chain.fake.ics(chain.path);
     const slot21 = await occurrence(chain, "2026-10-21 10:00");
     await act(chain, "C09 шаг 1 (21.10: имя)", () =>
       update(chain, { scope: "this", instanceStart: slot21.instanceStart, patch: { summary: "Особая" } }),
     );
     await expectVisible(chain, "C09 шаг 1", rows("Планёрка", { "2026-10-21": "2026-10-21 10:00–11:00 Особая" }));
+    expectInvariants(chain, "C09 шаг 1");
+    expectKept(chain, "C09 шаг 1", initial);
+    expectShape(chain, "C09 шаг 1", { rids: [RID_21], exdates: [] });
 
+    const afterName = chain.fake.ics(chain.path);
     const renamed = await occurrence(chain, "2026-10-21 10:00");
     const mark = chain.fake.mark();
     await act(chain, "C09 шаг 2 (удаление 21.10)", () =>
@@ -461,7 +637,8 @@ describe("Цепочки удаления (З05a)", () => {
     );
     await expectVisible(chain, "C09 шаг 2", rows("Планёрка", { "2026-10-21": null }));
     expectInvariants(chain, "C09 шаг 2");
-    expectShape(chain, "C09 шаг 2", { rids: [], exdates: ["Europe/Moscow 20261021T100000"] });
+    expectKept(chain, "C09 шаг 2", afterName, { master: ["EXDATE"], dropped: [RID_21] });
+    expectShape(chain, "C09 шаг 2", { rids: [], exdates: [RID_21] });
     expect(chain.fake.writes(mark).length, `C09 шаг 2: запись ровно одна: ${writesAfter(chain, mark)}`).toBe(1);
 
     // Повтор: «уже удалено» — либо без ошибки, либо отказ excluded; записей нет.
@@ -486,13 +663,19 @@ describe("Цепочки удаления (З05a)", () => {
   // Прежний код: падает на шаге 2 — строгий стенд отвергает PUT (orphan-override).
   it.fails("C10: имя 04.11 → удаление хвоста с 28.10 — 3 встречи, переопределения нет, COUNT=3", async () => {
     const chain = standWith(weeklyMoscow);
+    const rid04 = "Europe/Moscow 20261104T100000";
 
+    const initial = chain.fake.ics(chain.path);
     const slot04 = await occurrence(chain, "2026-11-04 10:00");
     await act(chain, "C10 шаг 1 (04.11: имя)", () =>
       update(chain, { scope: "this", instanceStart: slot04.instanceStart, patch: { summary: "Итоговая" } }),
     );
     await expectVisible(chain, "C10 шаг 1", rows("Планёрка", { "2026-11-04": "2026-11-04 10:00–11:00 Итоговая" }));
+    expectInvariants(chain, "C10 шаг 1");
+    expectKept(chain, "C10 шаг 1", initial);
+    expectShape(chain, "C10 шаг 1", { rids: [rid04], exdates: [] });
 
+    const afterName = chain.fake.ics(chain.path);
     const slot28 = await occurrence(chain, "2026-10-28 10:00");
     await act(chain, "C10 шаг 2 (удаление хвоста с 28.10)", () =>
       remove(chain, { scope: "this_and_following", instanceStart: slot28.instanceStart, etag: slot28.etag }),
@@ -500,13 +683,18 @@ describe("Цепочки удаления (З05a)", () => {
     await expectVisible(chain, "C10 шаг 2", rows("Планёрка", { "2026-10-28": null, "2026-11-02": null, "2026-11-04": null }));
     expectInvariants(chain, "C10 шаг 2");
     expectAlive(chain, "C10 шаг 2", true);
+    expectKept(chain, "C10 шаг 2", afterName, { master: ["RRULE"], dropped: [rid04] });
     const after = expectShape(chain, "C10 шаг 2", { rids: [], exdates: [] });
     const rule = ruleOf(after.masters[0]);
     expect({ COUNT: rule.COUNT, UNTIL: rule.UNTIL }, "C10 шаг 2: COUNT по позициям до границы, без UNTIL").toEqual({ COUNT: "3", UNTIL: undefined });
+    expect({ FREQ: rule.FREQ, BYDAY: rule.BYDAY }, "C10 шаг 2: прочие части правила прежние").toEqual({ FREQ: "WEEKLY", BYDAY: "MO,WE" });
   });
 
   // Поломка: AD2 — явный scope this у одиночного события с чужим
   // instanceStart удалял весь объект без отказа.
+  // Коды: план (таблица §3: «instanceStart ≠ DTSTART — отказ») код не
+  // называет; из AddressError (§2) подходят оба — mismatch (адрес не того
+  // вида) и not-found (слота нет). Сузить, когда З07 или З10 выберут.
   // Прежний код: падает на шаге 1 — вместо отказа DELETE всего объекта.
   it.fails("C18: одиночное событие — delete и update this с чужим instanceStart: отказ, объект цел", async () => {
     const chain = standWith(singleMoscow);
@@ -538,6 +726,7 @@ describe("Цепочки удаления (З05a)", () => {
   it.fails("C20: this_and_following с первой встречи: правка — та же серия и UID; удаление — объект удалён", async () => {
     // (а) Правка.
     const edited = standWith(weeklyMoscow);
+    const initial = edited.fake.ics(edited.path);
     const first = await occurrence(edited, "2026-10-19 10:00");
     await act(edited, "C20 (а) шаг 1 (правка с 19.10 и далее)", () =>
       update(edited, { scope: "this_and_following", instanceStart: first.instanceStart, patch: { summary: "Новая планёрка" } }),
@@ -545,6 +734,8 @@ describe("Цепочки удаления (З05a)", () => {
     await expectVisible(edited, "C20 (а) шаг 1", rows("Новая планёрка"));
     expectInvariants(edited, "C20 (а) шаг 1");
     expect([...edited.fake.objects.keys()], "C20 (а) шаг 1: объект один — прежний, второй серии нет").toEqual([edited.path]);
+    // Р2: это all_series с тем же UID — меняется только имя.
+    expectKept(edited, "C20 (а) шаг 1", initial, { master: ["SUMMARY"] });
     const after = expectShape(edited, "C20 (а) шаг 1", { rids: [], exdates: [] });
     expect(ruleOf(after.masters[0]), "C20 (а) шаг 1: правило прежнее").toMatchObject({ FREQ: "WEEKLY", BYDAY: "MO,WE", COUNT: "6" });
 
@@ -563,11 +754,14 @@ describe("Цепочки удаления (З05a)", () => {
   it.fails("C21: COUNT=2 — удаление обеих встреч по одной удаляет объект", async () => {
     const chain = standWith(twoMeetings);
 
+    const initial = chain.fake.ics(chain.path);
     const slot19 = await occurrence(chain, "2026-10-19 10:00");
     await act(chain, "C21 шаг 1 (удаление 19.10)", () => remove(chain, { scope: "this", instanceStart: slot19.instanceStart, etag: slot19.etag }));
     await expectVisible(chain, "C21 шаг 1", ["2026-10-21 10:00–11:00 Планёрка"]);
     expectInvariants(chain, "C21 шаг 1");
     expectAlive(chain, "C21 шаг 1", true);
+    expectKept(chain, "C21 шаг 1", initial, { master: ["EXDATE"] });
+    expectShape(chain, "C21 шаг 1", { rids: [], exdates: ["Europe/Moscow 20261019T100000"] });
 
     const slot21 = await occurrence(chain, "2026-10-21 10:00");
     const result = await act(chain, "C21 шаг 2 (удаление 21.10)", () =>
@@ -588,26 +782,35 @@ describe("Цепочки удаления (З05a)", () => {
     const detached = standWith(withDetached);
     const separate = "2026-10-20 14:00–15:00 Разбор инцидента [слот 2026-10-20 10:00]";
     await expectVisible(detached, "C42 (а) шаг 0", ["2026-10-19 10:00–11:00 Планёрка", separate, "2026-10-21 10:00–11:00 Планёрка"]);
-    for (const [step, slot] of [
-      [1, "2026-10-19 10:00"],
-      [2, "2026-10-21 10:00"],
-    ] as const) {
+    const steps = [
+      { step: 1, slot: "2026-10-19 10:00", exdates: ["Europe/Moscow 20261019T100000"], left: [separate, "2026-10-21 10:00–11:00 Планёрка"] },
+      { step: 2, slot: "2026-10-21 10:00", exdates: ["Europe/Moscow 20261019T100000", RID_21], left: [separate] },
+    ];
+    for (const { step, slot, exdates, left } of steps) {
+      const label = `C42 (а) шаг ${step}`;
+      const before = detached.fake.ics(detached.path);
       const target = await occurrence(detached, slot);
-      await act(detached, `C42 (а) шаг ${step} (удаление ${slot})`, () =>
+      await act(detached, `${label} (удаление ${slot})`, () =>
         remove(detached, { scope: "this", instanceStart: target.instanceStart, etag: target.etag }),
       );
-      expectInvariants(detached, `C42 (а) шаг ${step}`);
+      await expectVisible(detached, label, left);
+      expectInvariants(detached, label);
+      expectAlive(detached, label, true);
+      // Отдельная встреча 20.10 цела целиком: её компонент шаг не называл.
+      expectKept(detached, label, before, { master: ["EXDATE"] });
+      expectShape(detached, label, { rids: ["Europe/Moscow 20261020T100000"], exdates });
     }
-    expectAlive(detached, "C42 (а) шаг 2", true);
-    await expectVisible(detached, "C42 (а) шаг 2", [separate]);
 
     // (б) Скрытое переопределение.
     const hidden = standWith(withHidden);
     await expectVisible(hidden, "C42 (б) шаг 0", ["2026-10-19 10:00–11:00 Планёрка", "2026-10-21 10:00–11:00 Планёрка"]);
+    const initial = hidden.fake.ics(hidden.path);
     const slot19 = await occurrence(hidden, "2026-10-19 10:00");
     await act(hidden, "C42 (б) шаг 1 (удаление 19.10)", () => remove(hidden, { scope: "this", instanceStart: slot19.instanceStart, etag: slot19.etag }));
     expectAlive(hidden, "C42 (б) шаг 1", true);
     await expectVisible(hidden, "C42 (б) шаг 1", ["2026-10-21 10:00–11:00 Планёрка"]);
+    expectInvariants(hidden, "C42 (б) шаг 1");
+    expectKept(hidden, "C42 (б) шаг 1", initial, { master: ["EXDATE"] });
     const slot21 = await occurrence(hidden, "2026-10-21 10:00");
     const result = await act(hidden, "C42 (б) шаг 2 (удаление 21.10)", () =>
       remove(hidden, { scope: "this", instanceStart: slot21.instanceStart, etag: slot21.etag }),
@@ -622,6 +825,7 @@ describe("Цепочки удаления (З05a)", () => {
 
   // Поломки: AD2, AD9 — delete all_series не проверял переданный
   // instanceStart: адрес, не указывающий ни на одну встречу, удалял серию.
+  // Коды: как в C18 — mismatch или not-found из AddressError.
   // Прежний код: падает на шаге 1 — вместо отказа DELETE всего объекта.
   it.fails("C46: удаление всей серии с неразрешимым instanceStart — отказ, объект цел", async () => {
     const chain = standWith(weeklyMoscow);
@@ -645,7 +849,9 @@ describe("Цепочки удаления (З05a)", () => {
   // стендом (orphan-override).
   it.fails("C50: перенос 04.11 на 27.10 → удаление хвоста с 28.10 — needsConfirm; с confirm — 3 встречи, COUNT=3", async () => {
     const chain = standWith(weeklyMoscow);
+    const rid04 = "Europe/Moscow 20261104T100000";
 
+    const initial = chain.fake.ics(chain.path);
     const slot04 = await occurrence(chain, "2026-11-04 10:00");
     await act(chain, "C50 шаг 1 (перенос 04.11 на 27.10)", () =>
       update(chain, {
@@ -663,13 +869,16 @@ describe("Цепочки удаления (З05a)", () => {
       "2026-10-28 10:00–11:00 Планёрка",
       "2026-11-02 10:00–11:00 Планёрка",
     ]);
+    expectInvariants(chain, "C50 шаг 1");
+    expectKept(chain, "C50 шаг 1", initial);
+    expectShape(chain, "C50 шаг 1", { rids: [rid04], exdates: [] });
 
     const slot28 = await occurrence(chain, "2026-10-28 10:00");
     const refusal = await expectRefused(
       chain,
       "C50 шаг 2 (удаление хвоста с 28.10 без confirm)",
       () => remove(chain, { scope: "this_and_following", instanceStart: slot28.instanceStart, etag: slot28.etag }),
-      { test: () => true, what: "с needsConfirm" },
+      refusalFor("отказа с просьбой confirm (потеря сверх названного, О11)"),
     );
     expect(refusal.needsConfirm, `C50 шаг 2: отказ обязан просить confirm: ${refusal.message}`).toBe(true);
     expect(
@@ -677,67 +886,131 @@ describe("Цепочки удаления (З05a)", () => {
       `C50 шаг 2: в перечне потерь — встреча слота 04.11, перенесённая на 27.10: ${JSON.stringify(refusal.losses)}`,
     ).toBe(true);
 
+    const afterMove = chain.fake.ics(chain.path);
     await act(chain, "C50 шаг 3 (то же с confirm)", () =>
       remove(chain, { scope: "this_and_following", instanceStart: slot28.instanceStart, etag: slot28.etag, confirm: true }),
     );
     await expectVisible(chain, "C50 шаг 3", rows("Планёрка", { "2026-10-28": null, "2026-11-02": null, "2026-11-04": null }));
     expectInvariants(chain, "C50 шаг 3");
+    expectKept(chain, "C50 шаг 3", afterMove, { master: ["RRULE"], dropped: [rid04] });
     const after = expectShape(chain, "C50 шаг 3", { rids: [], exdates: [] });
     expect(ruleOf(after.masters[0]).COUNT, "C50 шаг 3: COUNT по позициям до границы").toBe("3");
   });
 
   // Поломка: AD9 — удаление не принимало etag вызывающего: чужая правка
   // между list_events и delete_event стиралась молча.
+  // Шаг 2: Р11 делает etag у update без confirm необязательным («патч
+  // ложится на свежее состояние»), а «несовпадение — отказ» стоит рядом с
+  // confirm; прочтение «переданный и не совпавший etag — отказ» план не
+  // исключает. Цепочка принимает оба исхода и проверяет общее для них:
+  // чужая правка цела. Отказ по confirm с устаревшим etag закреплён в C53.
   // Прежний код: падает на шаге 1 — вместо отказа PUT с EXDATE поверх чужой правки.
-  it.fails("C52: удаление и правка с устаревшим etag — отказ, чужая правка цела", async () => {
+  it.fails("C52: удаление с устаревшим etag — отказ; правка с ним — отказ или патч на свежем состоянии; чужая правка цела", async () => {
     const chain = standWith(weeklyMoscow);
+    const renamed = "Планёрка — перенесена в переговорную 5";
 
     const seen = await occurrence(chain, "2026-10-21 10:00");
-    chain.fake.externalEdit(chain.path, (ics) => ics.split("SUMMARY:Планёрка").join("SUMMARY:Планёрка — перенесена в переговорную 5"));
+    chain.fake.externalEdit(chain.path, (ics) => ics.split("SUMMARY:Планёрка").join(`SUMMARY:${renamed}`));
     const external = chain.fake.ics(chain.path);
-    const staleCode = { test: (code: unknown) => typeof code === "string", what: "отказа по устаревшему etag" };
+    const stale = refusalFor("отказа по устаревшему etag (Р11)");
 
     await expectRefused(
       chain,
       "C52 шаг 1 (delete this 21.10 с etag до чужой правки)",
       () => remove(chain, { scope: "this", instanceStart: seen.instanceStart, etag: seen.etag }),
-      staleCode,
+      stale,
     );
-    await expectRefused(
-      chain,
-      "C52 шаг 2 (update this 21.10 с etag до чужой правки)",
-      () => update(chain, { scope: "this", instanceStart: seen.instanceStart, patch: { summary: "Особая" }, etag: seen.etag }),
-      staleCode,
-    );
-    expect(chain.fake.ics(chain.path), "C52 шаг 2: чужая правка цела").toBe(external);
-    await expectVisible(chain, "C52 шаг 2", rows("Планёрка — перенесена в переговорную 5"));
+    expect(chain.fake.ics(chain.path), "C52 шаг 1: чужая правка цела").toBe(external);
+
+    const label = "C52 шаг 2 (update this 21.10 с etag до чужой правки)";
+    const mark = chain.fake.mark();
+    let refused: unknown;
+    let failed = false;
+    try {
+      await update(chain, { scope: "this", instanceStart: seen.instanceStart, patch: { summary: "Особая" }, etag: seen.etag });
+    } catch (error) {
+      failed = true;
+      refused = error;
+    }
+    if (failed) {
+      const writes = writesAfter(chain, mark);
+      if (writes) throw failure(chain, label, `отказ обязан ничего не писать, а в журнале: ${writes}; ошибка: ${messageOf(refused)}`, mark);
+      const code = (refused as Refusal | undefined)?.code;
+      if (!codeMatches(stale, code)) {
+        throw failure(chain, label, `ожидался отказ с кодом ${codesText(stale)}, а пришёл ${code === undefined ? "отказ без кода" : `код ${String(code)}`}: ${messageOf(refused)}`, mark);
+      }
+      expect(chain.fake.ics(chain.path), `${label}: чужая правка цела`).toBe(external);
+      await expectVisible(chain, label, rows(renamed));
+    } else {
+      // Патч лёг на свежее состояние: 21.10 — «Особая», остальное — с чужим именем.
+      await expectVisible(chain, label, rows(renamed, { "2026-10-21": "2026-10-21 10:00–11:00 Особая" }));
+      expectInvariants(chain, label);
+      expectKept(chain, label, external);
+      expectShape(chain, label, { rids: [RID_21], exdates: [] });
+    }
   });
 
-  // Охранная (без .fails, §6 плана): прежний код серию при delete this не
-  // удалял вовсе, поэтому здесь зелёный. Цепочка ловит мутант M22 новой
-  // реализации — `isEmpty` по горизонту: у серии с шагом больше горизонта
-  // (раз в два года; 29.02) после удаления ближайшей встречи в горизонте
-  // слотов нет, но объект пуст не бывает (Р3).
-  it("C57: YEARLY;INTERVAL=2 и YEARLY 29.02 — удаление ближайшей встречи оставляет объект", async () => {
-    const twoYears = standWith(everyTwoYears);
-    await expectVisible(twoYears, "C57 (а) шаг 0", ["2026-10-19 10:00–11:00 Планёрка", "2028-10-19 10:00–11:00 Планёрка"]);
-    const nearest = await occurrence(twoYears, "2026-10-19 10:00");
-    await act(twoYears, "C57 (а) шаг 1 (удаление 19.10.2026)", () =>
-      remove(twoYears, { scope: "this", instanceStart: nearest.instanceStart, etag: nearest.etag }),
+  // Поломки: AD10 и мутант M22 (`isEmpty` по горизонту, Р3) — у серии с шагом
+  // больше горизонта (400 дней, О12в) после удаления ближайшей встречи в
+  // горизонте слотов нет, а объект не пуст: удалить его — потерять встречу.
+  // Конечные варианты (б) и (в) проверяют и обратное (Р3): удаление
+  // последней встречи — DELETE объекта, а не зомби (AD10).
+  //
+  // 29.02 записан с явными BYMONTH=2;BYMONTHDAY=29. Голое FREQ=YEARLY от
+  // 29.02 ical.js раскрывает не так, как предполагает план (Р3, «шаг > 400
+  // дней»): без BY-частей expand_year_days переносит на каждый год день года
+  // DTSTART (node_modules/ical.js/lib/ical/recur_iterator.js:1108–1111), и в
+  // невисокосный год _nextByYearDay (там же, :923–944) даёт 01.03:
+  // 2028-02-29 → 2029-03-01 → 2030-03-01 → 2031-03-01 → 2032-02-29.
+  // Следующая встреча через 366 дней попадает в горизонт, и M22 такой
+  // вариант не ловит. С BYMONTHDAY=29 next_year (там же, :899–921) через
+  // normalizeByMonthDayRules (:578–582) отбрасывает 29-е невисокосного
+  // февраля: 2028-02-29 → 2032-02-29, шаг 1461 день.
+  // Прежний код: (а) проходит; падает на (б) шаге 2 — объект без встреч
+  // остался на сервере (AD10).
+  it.fails("C57: YEARLY;INTERVAL=2 и 29.02 — удаление ближайшей оставляет объект, удаление последней удаляет его", async () => {
+    // (а) Без конца: удаление ближайшей.
+    const endless = standWith(everyTwoYears);
+    await expectVisible(endless, "C57 (а) шаг 0", ["2026-10-19 10:00–11:00 Планёрка", "2028-10-19 10:00–11:00 Планёрка"]);
+    const initialEndless = endless.fake.ics(endless.path);
+    const nearest = await occurrence(endless, "2026-10-19 10:00");
+    await act(endless, "C57 (а) шаг 1 (удаление 19.10.2026)", () =>
+      remove(endless, { scope: "this", instanceStart: nearest.instanceStart, etag: nearest.etag }),
     );
-    expectAlive(twoYears, "C57 (а) шаг 1", true);
-    expectInvariants(twoYears, "C57 (а) шаг 1");
-    await expectVisible(twoYears, "C57 (а) шаг 1", ["2028-10-19 10:00–11:00 Планёрка"]);
+    expectAlive(endless, "C57 (а) шаг 1", true);
+    expectInvariants(endless, "C57 (а) шаг 1");
+    await expectVisible(endless, "C57 (а) шаг 1", ["2028-10-19 10:00–11:00 Планёрка"]);
+    expectKept(endless, "C57 (а) шаг 1", initialEndless, { master: ["EXDATE"] });
+    expectShape(endless, "C57 (а) шаг 1", { rids: [], exdates: ["Europe/Moscow 20261019T100000"] });
 
-    // Окно — до 2029 года: где ical.js ставит следующую встречу 29.02
-    // невисокосного года, здесь не проверяется (это вопрос З06).
-    const leap = standWith(leapDay);
-    const window = { from: "2026-01-01T00:00:00Z", to: "2029-01-01T00:00:00Z" };
-    await expectVisible(leap, "C57 (б) шаг 0", ["2028-02-29 10:00–11:00 Планёрка"], window);
-    const day = await occurrence(leap, "2028-02-29 10:00");
-    await act(leap, "C57 (б) шаг 1 (удаление 29.02.2028)", () => remove(leap, { scope: "this", instanceStart: day.instanceStart, etag: day.etag }));
-    expectAlive(leap, "C57 (б) шаг 1", true);
-    expectInvariants(leap, "C57 (б) шаг 1");
-    await expectVisible(leap, "C57 (б) шаг 1", [], window);
+    // (б), (в) Две встречи далеко друг от друга: первая, затем последняя.
+    const finite = [
+      { part: "(б)", seed: everyTwoYearsTwice, first: "2026-10-19", last: "2028-10-19", window: DEFAULT_WINDOW },
+      { part: "(в)", seed: leapDayTwice, first: "2028-02-29", last: "2032-02-29", window: { from: "2026-01-01T00:00:00Z", to: "2033-01-01T00:00:00Z" } },
+    ];
+    for (const { part, seed, first, last, window } of finite) {
+      const chain = standWith(seed);
+      const lastRow = `${last} 10:00–11:00 Планёрка`;
+      await expectVisible(chain, `C57 ${part} шаг 0`, [`${first} 10:00–11:00 Планёрка`, lastRow], window);
+
+      const initial = chain.fake.ics(chain.path);
+      const head = await occurrence(chain, `${first} 10:00`, window);
+      await act(chain, `C57 ${part} шаг 1 (удаление ${first})`, () =>
+        remove(chain, { scope: "this", instanceStart: head.instanceStart, etag: head.etag }),
+      );
+      expectAlive(chain, `C57 ${part} шаг 1`, true);
+      expectInvariants(chain, `C57 ${part} шаг 1`);
+      await expectVisible(chain, `C57 ${part} шаг 1`, [lastRow], window);
+      expectKept(chain, `C57 ${part} шаг 1`, initial, { master: ["EXDATE"] });
+      expectShape(chain, `C57 ${part} шаг 1`, { rids: [], exdates: [`Europe/Moscow ${first.replaceAll("-", "")}T100000`] });
+
+      const tail = await occurrence(chain, `${last} 10:00`, window);
+      const result = await act(chain, `C57 ${part} шаг 2 (удаление ${last})`, () =>
+        remove(chain, { scope: "this", instanceStart: tail.instanceStart, etag: tail.etag }),
+      );
+      expectAlive(chain, `C57 ${part} шаг 2`, false);
+      expect(result.objectRemoved, `C57 ${part} шаг 2: ответ сообщает, что объект удалён`).toBe(true);
+      await expectVisible(chain, `C57 ${part} шаг 2`, [], window);
+    }
   });
 });

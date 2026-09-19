@@ -9,15 +9,24 @@
 // Цепочка — последовательность публичных вызовов updateEvent, deleteEvent,
 // readEvents, readEvent (свои серии — через createEvent) на FakeCaldav из
 // tests/support: что записал шаг, то следующий шаг читает с сервера.
-// instanceStart и etag берутся только из выдачи readEvents. После каждого
-// шага: точный видимый список, инварианты О12а всех объектов стенда
-// (строгий стенд к тому же отвергает запись, добавляющую нарушение, кодом
-// 400) и сохранность того, что шаг не называл. Отказы сверяются по `code`
-// и обязаны ничего не записать.
+// instanceStart и etag берутся только из выдачи readEvents.
 //
-// Все цепочки, кроме охранных, помечены it.fails: на прежнем коде (dd99d80;
-// домен src/domain/events.ts не менялся до З13) каждая падает на утверждении
-// о порче данных. Какое утверждение падает первым и с каким сообщением —
+// После каждого пишущего шага, пока объект жив:
+// - точный видимый список readEvents;
+// - инварианты О12а всех объектов стенда (строгий стенд к тому же отвергает
+//   запись, добавляющую нарушение, кодом 400);
+// - сохранность (assertPropsPreserved, §6 плана) через expectKept: у шага
+//   названо, что он вправе менять (свойства основного компонента и
+//   переопределений, снятые переопределения, сдвиг RECURRENCE-ID при сдвиге
+//   или смене пояса серии), всё прочее — свойства и вложенные компоненты
+//   основного VEVENT, каждого оставшегося переопределения и VTIMEZONE —
+//   сверяется с состоянием до шага;
+// - форма хранимого объекта, где шаг её меняет.
+// Отказ сверяется по `code` и обязан ничего не записать.
+//
+// Цепочки помечены it.fails: на прежнем коде (dd99d80; домен
+// src/domain/events.ts не менялся до З13) каждая падает на утверждении о
+// порче данных. Какое утверждение падает первым и с каким сообщением —
 // в строке «Прежний код» у цепочки и в отчёте З05a
 // (.superpowers/sdd/2026-09-18-yandex-calendar-mcp/rework-З05a-report.md).
 // Задача З13 снимает .fails, когда цепочки станут зелёными.
@@ -25,7 +34,7 @@ import { describe, expect, it } from "vitest";
 import { createEvent, readEvent, readEvents, updateEvent, deleteEvent } from "../../src/domain/events.js";
 import type { CalendarEvent, EditScope } from "../../src/types.js";
 import { calendarA, makeStand, plant, type Stand } from "../support/context.js";
-import { lineName, parseRawComponents, type RawComponent } from "../support/invariants.js";
+import { lineName, parseRawComponents, unfold, type RawComponent } from "../support/invariants.js";
 import {
   assertPropsPreserved,
   assertStoredInvariants,
@@ -151,6 +160,47 @@ interface Refusal {
 
 type CodeCheck = readonly string[] | { test: (code: unknown) => boolean; what: string };
 
+/**
+ * Коды отказов, названные планом для других причин: адрес (Р10, AddressError
+ * в §2), время (О8), аномалии и блокировки (О14, Р3, Р5), разрез (Р9) и
+ * пределы (Р1, О12д). Коды отказа по устаревшему etag (Р11) и по потере
+ * данных (О11, needsConfirm) план не называет; пока их проверяет
+ * `refusalFor`: код — строка и ни один из этих. Когда З10 или З13 назовут
+ * коды, проверки сузить до точных.
+ */
+const OTHER_REASONS = [
+  "invalid",
+  "not-found",
+  "excluded",
+  "actual-start",
+  "ambiguous",
+  "mismatch",
+  "invalid-time",
+  "unparsable",
+  "bad-rrule",
+  "no-positions",
+  "multiple-masters",
+  "mixed-uids",
+  "unknown-tzid",
+  "range-override",
+  "duplicate-override",
+  "legacy-override",
+  "empty-series",
+  "series-too-long",
+  "unsynced-rule",
+  "until-too-far",
+  "split-mismatch",
+  "split-stale-continuation",
+  "split-already-done",
+];
+
+function refusalFor(what: string): CodeCheck {
+  return {
+    test: (code) => typeof code === "string" && !OTHER_REASONS.includes(code),
+    what: `${what}: код — строка и не код другой причины из OTHER_REASONS`,
+  };
+}
+
 /** Шаг, который обязан кончиться отказом с кодом и ничего не записать. */
 async function expectRefused(chain: Chain, label: string, run: () => Promise<unknown>, codes: CodeCheck): Promise<Refusal> {
   const mark = chain.fake.mark();
@@ -245,17 +295,19 @@ function linesOf(component: RawComponent, name: string): string[] {
   return component.lines.filter((line) => lineName(line) === name);
 }
 
-/** Значения времени свойства: «TZID значение» или просто «значение», по одному на значение списка. */
+/** Значения времени строки свойства: «TZID значение» или просто «значение», по одному на значение списка. */
+function timeKeys(line: string): string[] {
+  const colon = line.indexOf(":");
+  const tzid = /;TZID=([^;]+)/i.exec(line.slice(0, colon))?.[1];
+  return line
+    .slice(colon + 1)
+    .split(",")
+    .map((value) => (tzid ? `${tzid} ${value}` : value));
+}
+
+/** Значения времени свойства компонента, как timeKeys. */
 function timesOf(component: RawComponent, name: string): string[] {
-  return linesOf(component, name).flatMap((line) => {
-    const colon = line.indexOf(":");
-    const params = line.slice(0, colon);
-    const tzid = /;TZID=([^;]+)/i.exec(params)?.[1];
-    return line
-      .slice(colon + 1)
-      .split(",")
-      .map((value) => (tzid ? `${tzid} ${value}` : value));
-  });
+  return linesOf(component, name).flatMap(timeKeys);
 }
 
 /** Части RRULE основного компонента: FREQ, COUNT, UNTIL… */
@@ -279,6 +331,88 @@ function expectShape(chain: Chain, label: string, rids: string[]): Stored {
     [...rids].sort(),
   );
   return now;
+}
+
+// ---------------------------------------------------------------------------
+// Сохранность: шаг меняет только то, что называет (§6 плана, assertPropsPreserved)
+// ---------------------------------------------------------------------------
+
+/**
+ * Что пишущему шагу можно менять в объекте. Всё прочее сверяется с текстом
+ * до шага: свойства и вложенные компоненты основного VEVENT, каждого
+ * оставшегося переопределения и VTIMEZONE (О5: VTIMEZONE только
+ * добавляются). Метаданные О10 (DTSTAMP, LAST-MODIFIED, SEQUENCE)
+ * assertPropsPreserved по умолчанию не сверяет, SEQUENCE проверяет C54.
+ * Компоненты, которых до шага не было (новое переопределение), не
+ * сверяются — их проверяют видимый список и форма объекта.
+ */
+interface Allowed {
+  /** Свойства и вложенные компоненты основного VEVENT, которые шаг меняет. */
+  master?: readonly string[];
+  /** То же у переопределений. */
+  overrides?: readonly string[];
+  /** Переопределения, которые шаг снимает: RECURRENCE-ID как «TZID значение». */
+  dropped?: readonly string[];
+  /**
+   * Сдвиг или смена пояса серии: RECURRENCE-ID переопределения до шага →
+   * после, как «TZID значение». Новый RID — по позиции слота (Р1) и в форме
+   * DTSTART (О4).
+   */
+  moved?: Readonly<Record<string, string>>;
+}
+
+/** Текст «до» с RECURRENCE-ID, переписанными по `moved`: так assertPropsPreserved сопоставит переопределение с новым RID. */
+function remapRids(ics: string, moved: Readonly<Record<string, string>>): string {
+  return unfold(ics)
+    .split("\n")
+    .map((line) => {
+      if (lineName(line) !== "RECURRENCE-ID") return line;
+      const target = moved[timeKeys(line)[0]];
+      if (target === undefined) return line;
+      const [tzid, value] = target.includes(" ") ? target.split(" ") : [undefined, target];
+      const params = line
+        .slice(0, line.indexOf(":"))
+        .split(";")
+        .slice(1)
+        .filter((param) => !/^TZID=/i.test(param));
+      return `${["RECURRENCE-ID", ...params, ...(tzid ? [`TZID=${tzid}`] : [])].join(";")}:${value}`;
+    })
+    .join("\n");
+}
+
+function allowedText(allowed: Allowed): string {
+  const parts = [
+    allowed.master?.length ? `основному компоненту — ${allowed.master.join(", ")}` : "",
+    allowed.overrides?.length ? `переопределениям — ${allowed.overrides.join(", ")}` : "",
+    allowed.dropped?.length ? `снять переопределения ${allowed.dropped.join(", ")}` : "",
+    allowed.moved ? `сдвинуть RECURRENCE-ID ${Object.entries(allowed.moved).map(([a, b]) => `${a} → ${b}`).join(", ")}` : "",
+  ].filter(Boolean);
+  return parts.length ? `можно было: ${parts.join("; ")}` : "шаг не вправе был менять ничего из прежнего";
+}
+
+function expectKept(chain: Chain, label: string, before: string, allowed: Allowed = {}): void {
+  const was = remapRids(before, allowed.moved ?? {});
+  const now = chain.fake.ics(chain.path);
+  const rid = (component: RawComponent) => timesOf(component, "RECURRENCE-ID")[0];
+  const dropped = new Set(allowed.dropped ?? []);
+  const parts: Array<[string, (component: RawComponent) => boolean, readonly string[]]> = [
+    ["основной компонент", (c) => c.name === "VEVENT" && rid(c) === undefined, allowed.master ?? []],
+    ["переопределения", (c) => c.name === "VEVENT" && rid(c) !== undefined && !dropped.has(rid(c)), allowed.overrides ?? []],
+    ["прочие компоненты", (c) => c.name !== "VEVENT", []],
+  ];
+  const problems: string[] = [];
+  for (const [what, scope, except] of parts) {
+    try {
+      assertPropsPreserved(was, now, { scope, except: [...except] });
+    } catch (error) {
+      problems.push(`${what}: ${messageOf(error)}`);
+    }
+  }
+  if (problems.length > 0) {
+    throw new Error(
+      `${label}: шаг тронул то, чего не называл (${allowedText(allowed)}):\n${problems.join("\n")}\nСостояние стенда:\n${describeStand(chain.fake)}`,
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -457,7 +591,7 @@ describe("Цепочки правки (З05a)", () => {
     );
     await expectVisible(chain, "C01 шаг 1", rows("Планёрка", { "2026-10-21": "2026-10-21 11:30–12:30 Планёрка [слот 2026-10-21 10:00]" }));
     expectInvariants(chain, "C01 шаг 1");
-    expectPreserved(chain, "C01 шаг 1", initial, { scope: "master" });
+    expectKept(chain, "C01 шаг 1", initial);
     expectShape(chain, "C01 шаг 1", ["Europe/Moscow 20261021T100000"]);
 
     const afterMove = chain.fake.ics(chain.path);
@@ -493,12 +627,15 @@ describe("Цепочки правки (З05a)", () => {
       const chain = await standWithCreated(OWN_WEEKLY);
       const label = tail ? "C02 (хвост)" : "C02 (экземпляр)";
 
+      const created = chain.fake.ics(chain.path);
       const slot21 = await occurrence(chain, "2026-10-21 10:00");
       await act(chain, `${label} шаг 1 (21.10: место)`, () =>
         update(chain, { scope: "this", instanceStart: slot21.instanceStart, patch: { location: "Кабинет 3" } }),
       );
       await expectVisible(chain, `${label} шаг 1`, rows("Планёрка", { "2026-10-21": "2026-10-21 10:00–11:00 Планёрка @Кабинет 3" }));
       expectInvariants(chain, `${label} шаг 1`);
+      expectKept(chain, `${label} шаг 1`, created);
+      expectShape(chain, `${label} шаг 1`, ["Europe/Moscow 20261021T100000"]);
 
       const afterOverride = chain.fake.ics(chain.path);
       await act(chain, `${label} шаг 2 (вся серия: место)`, () =>
@@ -511,9 +648,10 @@ describe("Цепочки правки (З05a)", () => {
         rows("Планёрка @Переговорная 5", { "2026-10-21": "2026-10-21 10:00–11:00 Планёрка @Кабинет 3" }),
       );
       expectInvariants(chain, `${label} шаг 2`);
-      expectPreserved(chain, `${label} шаг 2`, afterOverride, { except: ["LOCATION"] });
+      expectKept(chain, `${label} шаг 2`, afterOverride, { master: ["LOCATION"] });
       expectShape(chain, `${label} шаг 2`, ["Europe/Moscow 20261021T100000"]);
 
+      const afterSeries = chain.fake.ics(chain.path);
       const target = await occurrence(chain, tail ? "2026-11-02 10:00" : "2026-11-04 10:00");
       await act(chain, `${label} шаг 3 (удаление)`, () =>
         remove(chain, { scope: tail ? "this_and_following" : "this", instanceStart: target.instanceStart, etag: target.etag }),
@@ -530,6 +668,9 @@ describe("Цепочки правки (З05a)", () => {
         ),
       );
       expectInvariants(chain, `${label} шаг 3`);
+      // delete this ставит EXDATE; усечение меняет конец правила (EXDATE ≥ границы
+      // в этой серии нет). Переопределение 21.10 раньше границы цело.
+      expectKept(chain, `${label} шаг 3`, afterSeries, { master: tail ? ["RRULE"] : ["EXDATE"] });
       expectShape(chain, `${label} шаг 3`, ["Europe/Moscow 20261021T100000"]);
     }
   });
@@ -541,19 +682,22 @@ describe("Цепочки правки (З05a)", () => {
   it.fails("C03: имя 21.10 → вся серия: имя → имя 26.10 — обе правки видны, основной компонент один", async () => {
     const chain = await standWithCreated(OWN_WEEKLY);
 
+    const created = chain.fake.ics(chain.path);
     const slot21 = await occurrence(chain, "2026-10-21 10:00");
     await act(chain, "C03 шаг 1 (21.10: имя)", () =>
       update(chain, { scope: "this", instanceStart: slot21.instanceStart, patch: { summary: "С заказчиком" } }),
     );
     await expectVisible(chain, "C03 шаг 1", rows("Планёрка", { "2026-10-21": "2026-10-21 10:00–11:00 С заказчиком" }));
     expectInvariants(chain, "C03 шаг 1");
+    expectKept(chain, "C03 шаг 1", created);
+    expectShape(chain, "C03 шаг 1", ["Europe/Moscow 20261021T100000"]);
 
     const afterOverride = chain.fake.ics(chain.path);
     await act(chain, "C03 шаг 2 (вся серия: имя)", () => update(chain, { scope: "all_series", patch: { summary: "Планёрка отдела" } }));
     // Имя переопределения своё («С заказчиком» ≠ «Планёрка») — не наследуется (О7).
     await expectVisible(chain, "C03 шаг 2", rows("Планёрка отдела", { "2026-10-21": "2026-10-21 10:00–11:00 С заказчиком" }));
     expectInvariants(chain, "C03 шаг 2");
-    expectPreserved(chain, "C03 шаг 2", afterOverride, { scope: "master", except: ["SUMMARY"] });
+    expectKept(chain, "C03 шаг 2", afterOverride, { master: ["SUMMARY"] });
     expectShape(chain, "C03 шаг 2", ["Europe/Moscow 20261021T100000"]);
 
     const afterSeries = chain.fake.ics(chain.path);
@@ -620,6 +764,7 @@ describe("Цепочки правки (З05a)", () => {
     expectPreserved(chain, "C04 шаг 2", afterThis, { except: ["SUMMARY"] });
     expectShape(chain, "C04 шаг 2", ["Europe/Moscow 20261021T100000", "Europe/Moscow 20261026T100000"]);
 
+    const afterSeries = chain.fake.ics(chain.path);
     const again26 = await occurrence(chain, "2026-10-26 10:00");
     await act(chain, "C04 шаг 3 (удаление 26.10)", () =>
       remove(chain, { scope: "this", instanceStart: again26.instanceStart, etag: again26.etag }),
@@ -630,9 +775,13 @@ describe("Цепочки правки (З05a)", () => {
       rows("Планёрка отдела", { "2026-10-21": "2026-10-21 11:30–12:30 Планёрка отдела [слот 2026-10-21 10:00]", "2026-10-26": null }),
     );
     expectInvariants(chain, "C04 шаг 3");
+    // Снимается переопределение 26.10 целиком, основному — только EXDATE;
+    // перенос 21.10, стоящий в объекте первым, цел.
+    expectKept(chain, "C04 шаг 3", afterSeries, { master: ["EXDATE"], dropped: ["Europe/Moscow 20261026T100000"] });
     const afterDelete = expectShape(chain, "C04 шаг 3", ["Europe/Moscow 20261021T100000"]);
     expect(timesOf(afterDelete.masters[0], "EXDATE"), "C04 шаг 3: EXDATE ровно на слот 26.10").toEqual(["Europe/Moscow 20261026T100000"]);
 
+    const afterSlot = chain.fake.ics(chain.path);
     const slot02 = await occurrence(chain, "2026-11-02 10:00");
     await act(chain, "C04 шаг 4 (удаление хвоста с 02.11)", () =>
       remove(chain, { scope: "this_and_following", instanceStart: slot02.instanceStart, etag: slot02.etag }),
@@ -649,6 +798,9 @@ describe("Цепочки правки (З05a)", () => {
     );
     expect(chain.fake.has(chain.path), "C04 шаг 4: объект серии обязан остаться на сервере").toBe(true);
     expectInvariants(chain, "C04 шаг 4");
+    // Усечение меняет только конец правила: EXDATE 26.10 и перенос 21.10
+    // раньше границы целы.
+    expectKept(chain, "C04 шаг 4", afterSlot, { master: ["RRULE"] });
     const afterTail = expectShape(chain, "C04 шаг 4", ["Europe/Moscow 20261021T100000"]);
     // COUNT — по позициям правила до границы: 19, 21, 26, 28 (EXDATE не влияет).
     expect(ruleOf(afterTail.masters[0]).COUNT, "C04 шаг 4: COUNT усечённой серии").toBe("4");
@@ -660,12 +812,15 @@ describe("Цепочки правки (З05a)", () => {
   it.fails("C05: имя 21.10 → место 21.10 — оба поля сохранены, переопределение одно", async () => {
     const chain = standWith(weeklyMoscow);
 
+    const initial = chain.fake.ics(chain.path);
     const slot21 = await occurrence(chain, "2026-10-21 10:00");
     await act(chain, "C05 шаг 1 (21.10: имя)", () =>
       update(chain, { scope: "this", instanceStart: slot21.instanceStart, patch: { summary: "Особая" } }),
     );
     await expectVisible(chain, "C05 шаг 1", rows("Планёрка", { "2026-10-21": "2026-10-21 10:00–11:00 Особая" }));
     expectInvariants(chain, "C05 шаг 1");
+    expectKept(chain, "C05 шаг 1", initial);
+    expectShape(chain, "C05 шаг 1", ["Europe/Moscow 20261021T100000"]);
 
     const afterFirst = chain.fake.ics(chain.path);
     const again21 = await occurrence(chain, "2026-10-21 10:00");
@@ -674,17 +829,24 @@ describe("Цепочки правки (З05a)", () => {
     );
     await expectVisible(chain, "C05 шаг 2", rows("Планёрка", { "2026-10-21": "2026-10-21 10:00–11:00 Особая @Офис" }));
     expectInvariants(chain, "C05 шаг 2");
-    expectPreserved(chain, "C05 шаг 2", afterFirst, { except: ["LOCATION"] });
+    expectKept(chain, "C05 шаг 2", afterFirst, { overrides: ["LOCATION"] });
     expectShape(chain, "C05 шаг 2", ["Europe/Moscow 20261021T100000"]);
   });
 
-  // Поломки: AE12, R13-N4 — перенесённую встречу нельзя править по
-  // instanceStart из выдачи, а правка по фактическому времени создаёт
-  // переопределение-сироту.
-  // Прежний код: падает на шаге 2 — отказ «не совпадает ни с одним экземпляром».
-  it.fails("C06: перенос 21.10 → правка по слоту из выдачи → правка по фактическому времени — actual-start", async () => {
+  // Поломки: AE12, R13-N4 — правка по фактическому времени перенесённой
+  // создаёт переопределение-сироту, а по instanceStart из выдачи перенесённую
+  // править нельзя.
+  // Правка по фактическому времени идёт раньше правки по слоту: на прежнем
+  // коде она показывает саму порчу (запись сироты), а правка по слоту падает
+  // раньше порчи — на отказе прежней проверки адреса. Отказ ничего не
+  // меняет, так что порядок шагов на итог не влияет.
+  // Прежний код: падает на шаге 2 — вместо отказа actual-start PUT с
+  // переопределением-сиротой, отвергнутый строгим стендом (orphan-override).
+  it.fails("C06: перенос 21.10 → правка по фактическому времени — actual-start → правка по слоту из выдачи", async () => {
     const chain = standWith(weeklyMoscow);
+    const moved21 = "2026-10-21 11:30–12:30 Планёрка [слот 2026-10-21 10:00]";
 
+    const initial = chain.fake.ics(chain.path);
     const slot21 = await occurrence(chain, "2026-10-21 10:00");
     await act(chain, "C06 шаг 1 (перенос 21.10 на 11:30)", () =>
       update(chain, {
@@ -693,39 +855,37 @@ describe("Цепочки правки (З05a)", () => {
         patch: { start: "2026-10-21T11:30:00+03:00", end: "2026-10-21T12:30:00+03:00" },
       }),
     );
-    await expectVisible(chain, "C06 шаг 1", rows("Планёрка", { "2026-10-21": "2026-10-21 11:30–12:30 Планёрка [слот 2026-10-21 10:00]" }));
+    await expectVisible(chain, "C06 шаг 1", rows("Планёрка", { "2026-10-21": moved21 }));
+    expectInvariants(chain, "C06 шаг 1");
+    expectKept(chain, "C06 шаг 1", initial);
+    expectShape(chain, "C06 шаг 1", ["Europe/Moscow 20261021T100000"]);
 
-    const moved = await occurrence(chain, "2026-10-21 10:00");
-    const afterMove = chain.fake.ics(chain.path);
-    await act(chain, "C06 шаг 2 (правка перенесённой по её instanceStart)", () =>
-      update(chain, { scope: "this", instanceStart: moved.instanceStart, patch: { summary: "Перенесённая" } }),
-    );
-    await expectVisible(
-      chain,
-      "C06 шаг 2",
-      rows("Планёрка", { "2026-10-21": "2026-10-21 11:30–12:30 Перенесённая [слот 2026-10-21 10:00]" }),
-    );
-    expectInvariants(chain, "C06 шаг 2");
-    expectPreserved(chain, "C06 шаг 2", afterMove, { except: ["SUMMARY"] });
-    // RECURRENCE-ID неизменен: правка легла на то же переопределение.
-    expectShape(chain, "C06 шаг 2", ["Europe/Moscow 20261021T100000"]);
-
-    const renamed = await occurrence(chain, "2026-10-21 10:00");
+    const shown = await occurrence(chain, "2026-10-21 10:00");
     const refusal = await expectRefused(
       chain,
-      "C06 шаг 3 (правка по фактическому времени 11:30)",
-      () => update(chain, { scope: "this", instanceStart: renamed.start, patch: { summary: "Мимо слота" } }),
+      "C06 шаг 2 (правка по фактическому времени 11:30)",
+      () => update(chain, { scope: "this", instanceStart: shown.start, patch: { summary: "Мимо слота" } }),
       ["actual-start"],
     );
     expect(
       `${String(refusal.hint ?? "")} ${refusal.message ?? ""}`,
-      "C06 шаг 3: подсказка называет адрес перенесённой встречи (её слот)",
+      "C06 шаг 2: подсказка называет адрес перенесённой встречи (её слот)",
     ).toContain("2026-10-21T10:00");
+    await expectVisible(chain, "C06 шаг 2", rows("Планёрка", { "2026-10-21": moved21 }));
+
+    const afterMove = chain.fake.ics(chain.path);
+    await act(chain, "C06 шаг 3 (правка перенесённой по её instanceStart)", () =>
+      update(chain, { scope: "this", instanceStart: shown.instanceStart, patch: { summary: "Перенесённая" } }),
+    );
     await expectVisible(
       chain,
       "C06 шаг 3",
       rows("Планёрка", { "2026-10-21": "2026-10-21 11:30–12:30 Перенесённая [слот 2026-10-21 10:00]" }),
     );
+    expectInvariants(chain, "C06 шаг 3");
+    expectKept(chain, "C06 шаг 3", afterMove, { overrides: ["SUMMARY"] });
+    // RECURRENCE-ID неизменен: правка легла на то же переопределение.
+    expectShape(chain, "C06 шаг 3", ["Europe/Moscow 20261021T100000"]);
   });
 
   // Поломка: AE16 — start без end: конец берётся от исходного слота, DTEND < DTSTART.
@@ -733,13 +893,17 @@ describe("Цепочки правки (З05a)", () => {
   it.fails("C22: start без end у экземпляра и у серии — длительность сохранена; конец не позже начала — invalid-time", async () => {
     const chain = standWith(weeklyMoscow);
 
+    const initial = chain.fake.ics(chain.path);
     const slot21 = await occurrence(chain, "2026-10-21 10:00");
     await act(chain, "C22 шаг 1 (21.10: start 15:00 без end)", () =>
       update(chain, { scope: "this", instanceStart: slot21.instanceStart, patch: { start: "2026-10-21T15:00:00+03:00" } }),
     );
     await expectVisible(chain, "C22 шаг 1", rows("Планёрка", { "2026-10-21": "2026-10-21 15:00–16:00 Планёрка [слот 2026-10-21 10:00]" }));
     expectInvariants(chain, "C22 шаг 1");
+    expectKept(chain, "C22 шаг 1", initial);
+    expectShape(chain, "C22 шаг 1", ["Europe/Moscow 20261021T100000"]);
 
+    const afterMove = chain.fake.ics(chain.path);
     await act(chain, "C22 шаг 2 (вся серия: start 12:00 без end)", () =>
       update(chain, { scope: "all_series", patch: { start: "2026-10-19T12:00:00+03:00" } }),
     );
@@ -751,6 +915,12 @@ describe("Цепочки правки (З05a)", () => {
       rows("Планёрка", { "2026-10-21": "2026-10-21 15:00–16:00 Планёрка [слот 2026-10-21 12:00]" }, "12:00–13:00"),
     );
     expectInvariants(chain, "C22 шаг 2");
+    // Основному — только время (COUNT и прочее правило целы); у перенесённой
+    // меняется лишь RECURRENCE-ID, её 15:00–16:00 и всё прочее целы (О7).
+    expectKept(chain, "C22 шаг 2", afterMove, {
+      master: ["DTSTART", "DTEND"],
+      moved: { "Europe/Moscow 20261021T100000": "Europe/Moscow 20261021T120000" },
+    });
     expectShape(chain, "C22 шаг 2", ["Europe/Moscow 20261021T120000"]);
 
     const slot26 = await occurrence(chain, "2026-10-26 12:00");
@@ -784,19 +954,32 @@ describe("Цепочки правки (З05a)", () => {
   it.fails("C23: имя 21.10 → вся серия в Asia/Yekaterinburg → 26.10 в Asia/Novosibirsk — VTIMEZONE на каждый пояс, 21.10 одна", async () => {
     const chain = standWith(weeklyMoscow);
 
+    const initial = chain.fake.ics(chain.path);
     const slot21 = await occurrence(chain, "2026-10-21 10:00");
     await act(chain, "C23 шаг 1 (21.10: имя)", () =>
       update(chain, { scope: "this", instanceStart: slot21.instanceStart, patch: { summary: "Особая" } }),
     );
     await expectVisible(chain, "C23 шаг 1", rows("Планёрка", { "2026-10-21": "2026-10-21 10:00–11:00 Особая" }));
     expectInvariants(chain, "C23 шаг 1");
+    expectKept(chain, "C23 шаг 1", initial);
+    expectShape(chain, "C23 шаг 1", ["Europe/Moscow 20261021T100000"]);
 
+    const afterName = chain.fake.ics(chain.path);
     await act(chain, "C23 шаг 2 (вся серия: пояс Екатеринбурга)", () =>
       update(chain, { scope: "all_series", patch: { timeZone: "Asia/Yekaterinburg" } }),
     );
     // О8: timeZone без start сохраняет моменты — в МСК всё на прежних местах.
     await expectVisible(chain, "C23 шаг 2", rows("Планёрка", { "2026-10-21": "2026-10-21 10:00–11:00 Особая" }));
     expectInvariants(chain, "C23 шаг 2");
+    // Основному — DTSTART и DTEND в новом поясе; неперенесённое переопределение
+    // 21.10 идёт за серией (О7), его RECURRENCE-ID — в форме DTSTART (О4):
+    // тот же момент 10:00 МСК = 12:00 Екатеринбурга. Имя «Особая», прочие
+    // свойства и VTIMEZONE Europe/Moscow целы (О5).
+    expectKept(chain, "C23 шаг 2", afterName, {
+      master: ["DTSTART", "DTEND"],
+      overrides: ["DTSTART", "DTEND"],
+      moved: { "Europe/Moscow 20261021T100000": "Asia/Yekaterinburg 20261021T120000" },
+    });
     const afterZone = stored(chain);
     expect(afterZone.masters.length, "C23 шаг 2: основной компонент один").toBe(1);
     expect(afterZone.overrides.length, "C23 шаг 2: переопределение 21.10 одно").toBe(1);
@@ -805,6 +988,7 @@ describe("Цепочки правки (З05a)", () => {
     ]);
     expect([...afterZone.zones].sort(), "C23 шаг 2: VTIMEZONE только добавляются (О5)").toEqual(["Asia/Yekaterinburg", "Europe/Moscow"]);
 
+    const zoneText = chain.fake.ics(chain.path);
     const slot26 = await occurrence(chain, "2026-10-26 10:00");
     await act(chain, "C23 шаг 3 (26.10: пояс Новосибирска и имя)", () =>
       update(chain, {
@@ -819,6 +1003,8 @@ describe("Цепочки правки (З05a)", () => {
       rows("Планёрка", { "2026-10-21": "2026-10-21 10:00–11:00 Особая", "2026-10-26": "2026-10-26 10:00–11:00 Из Новосибирска" }),
     );
     expectInvariants(chain, "C23 шаг 3");
+    // Правка одной встречи: основной, переопределение 21.10 и оба VTIMEZONE целы.
+    expectKept(chain, "C23 шаг 3", zoneText);
     const afterThis = stored(chain);
     expect(afterThis.overrides.length, "C23 шаг 3: два переопределения").toBe(2);
     expect([...afterThis.zones].sort(), "C23 шаг 3: определение нового пояса добавлено").toEqual([
@@ -833,7 +1019,9 @@ describe("Цепочки правки (З05a)", () => {
   // Прежний код: падает на шаге 3 — строгий стенд отвергает PUT (orphan-override).
   it.fails("C24: перенос 21.10 на 11:30, удаление 04.11 → вся серия в 11:00 — 5 встреч, 21.10 одна, EXDATE сдвинут", async () => {
     const chain = standWith(weeklyMoscow);
+    const moved21 = "2026-10-21 11:30–12:30 Планёрка [слот 2026-10-21 10:00]";
 
+    const initial = chain.fake.ics(chain.path);
     const slot21 = await occurrence(chain, "2026-10-21 10:00");
     await act(chain, "C24 шаг 1 (перенос 21.10 на 11:30)", () =>
       update(chain, {
@@ -842,16 +1030,21 @@ describe("Цепочки правки (З05a)", () => {
         patch: { start: "2026-10-21T11:30:00+03:00", end: "2026-10-21T12:30:00+03:00" },
       }),
     );
+    await expectVisible(chain, "C24 шаг 1", rows("Планёрка", { "2026-10-21": moved21 }));
+    expectInvariants(chain, "C24 шаг 1");
+    expectKept(chain, "C24 шаг 1", initial);
+    expectShape(chain, "C24 шаг 1", ["Europe/Moscow 20261021T100000"]);
+
+    const afterMove = chain.fake.ics(chain.path);
     const slot04 = await occurrence(chain, "2026-11-04 10:00");
     await act(chain, "C24 шаг 2 (удаление 04.11)", () =>
       remove(chain, { scope: "this", instanceStart: slot04.instanceStart, etag: slot04.etag }),
     );
-    await expectVisible(
-      chain,
-      "C24 шаг 2",
-      rows("Планёрка", { "2026-10-21": "2026-10-21 11:30–12:30 Планёрка [слот 2026-10-21 10:00]", "2026-11-04": null }),
-    );
+    await expectVisible(chain, "C24 шаг 2", rows("Планёрка", { "2026-10-21": moved21, "2026-11-04": null }));
     expectInvariants(chain, "C24 шаг 2");
+    expectKept(chain, "C24 шаг 2", afterMove, { master: ["EXDATE"] });
+    const afterDelete = expectShape(chain, "C24 шаг 2", ["Europe/Moscow 20261021T100000"]);
+    expect(timesOf(afterDelete.masters[0], "EXDATE"), "C24 шаг 2: EXDATE ровно на слот 04.11").toEqual(["Europe/Moscow 20261104T100000"]);
 
     const beforeShift = chain.fake.ics(chain.path);
     await act(chain, "C24 шаг 3 (вся серия: 11:00–12:00)", () =>
@@ -865,7 +1058,11 @@ describe("Цепочки правки (З05a)", () => {
     expectInvariants(chain, "C24 шаг 3");
     const after = expectShape(chain, "C24 шаг 3", ["Europe/Moscow 20261021T110000"]);
     expect(timesOf(after.masters[0], "EXDATE"), "C24 шаг 3: EXDATE сдвинут вместе с серией").toEqual(["Europe/Moscow 20261104T110000"]);
-    expectPreserved(chain, "C24 шаг 3", beforeShift, { scope: "master", except: ["DTSTART", "DTEND", "EXDATE"] });
+    // У перенесённой меняется лишь RECURRENCE-ID, её 11:30–12:30 целы (О7).
+    expectKept(chain, "C24 шаг 3", beforeShift, {
+      master: ["DTSTART", "DTEND", "EXDATE"],
+      moved: { "Europe/Moscow 20261021T100000": "Europe/Moscow 20261021T110000" },
+    });
   });
 
   // Поломки: AE11, AE6 — смена правила all_series молча осиротила или
@@ -874,7 +1071,10 @@ describe("Цепочки правки (З05a)", () => {
   // стендом (orphan-override).
   it.fails("C25: перенос 21.10 → вся серия по понедельникам — отказ с перечнем потерь; с confirm переопределение снято", async () => {
     const chain = standWith(weeklyMoscow);
+    const moved21 = "2026-10-21 11:30–12:30 Планёрка [слот 2026-10-21 10:00]";
+    const rid21 = "Europe/Moscow 20261021T100000";
 
+    const initial = chain.fake.ics(chain.path);
     const slot21 = await occurrence(chain, "2026-10-21 10:00");
     await act(chain, "C25 шаг 1 (перенос 21.10 на 11:30)", () =>
       update(chain, {
@@ -883,25 +1083,30 @@ describe("Цепочки правки (З05a)", () => {
         patch: { start: "2026-10-21T11:30:00+03:00", end: "2026-10-21T12:30:00+03:00" },
       }),
     );
+    await expectVisible(chain, "C25 шаг 1", rows("Планёрка", { "2026-10-21": moved21 }));
+    expectInvariants(chain, "C25 шаг 1");
+    expectKept(chain, "C25 шаг 1", initial);
+    expectShape(chain, "C25 шаг 1", [rid21]);
 
+    const afterMove = chain.fake.ics(chain.path);
     const seen = await occurrence(chain, "2026-10-19 10:00");
     const rule = { frequency: "weekly", interval: 1, byWeekday: ["MO"] };
     const refusal = await expectRefused(
       chain,
       "C25 шаг 2 (вся серия: только понедельники, без confirm)",
       () => update(chain, { scope: "all_series", patch: { recurrence: rule } }),
-      { test: () => true, what: "с needsConfirm" },
+      refusalFor("отказа с просьбой confirm (потеря сверх названного, О11)"),
     );
     expect(refusal.needsConfirm, `C25 шаг 2: отказ обязан просить confirm: ${refusal.message}`).toBe(true);
     expect(
       (refusal.losses ?? []).map((loss) => String(loss.instanceStart ?? "")).some((address) => address.startsWith("2026-10-21")),
       `C25 шаг 2: в перечне потерь — перенесённая 21.10: ${JSON.stringify(refusal.losses)}`,
     ).toBe(true);
-    await expectVisible(chain, "C25 шаг 2", rows("Планёрка", { "2026-10-21": "2026-10-21 11:30–12:30 Планёрка [слот 2026-10-21 10:00]" }));
+    await expectVisible(chain, "C25 шаг 2", rows("Планёрка", { "2026-10-21": moved21 }));
 
-    await act(chain, "C25 шаг 3 (то же с confirm и etag)", () =>
+    const result = (await act(chain, "C25 шаг 3 (то же с confirm и etag)", () =>
       update(chain, { scope: "all_series", patch: { recurrence: rule }, confirm: true, etag: seen.etag }),
-    );
+    )) as { removed?: Array<{ instanceStart?: unknown }> } | undefined;
     // COUNT не менялся: шесть понедельников с 19.10.
     await expectVisible(
       chain,
@@ -909,8 +1114,18 @@ describe("Цепочки правки (З05a)", () => {
       ["2026-10-19", "2026-10-26", "2026-11-02", "2026-11-09", "2026-11-16", "2026-11-23"].map((d) => `${d} 10:00–11:00 Планёрка`),
     );
     expectInvariants(chain, "C25 шаг 3");
+    // Основному — только правило; перенос 21.10 снят с confirm.
+    expectKept(chain, "C25 шаг 3", afterMove, { master: ["RRULE"], dropped: [rid21] });
     const after = expectShape(chain, "C25 шаг 3", []);
     expect(ruleOf(after.masters[0]), "C25 шаг 3: BYDAY сменён, COUNT прежний").toMatchObject({ FREQ: "WEEKLY", BYDAY: "MO", COUNT: "6" });
+    // A §6.2: «с confirm переопределение снято и указано в removed». Форму
+    // ответа updateEvent план (§2) не задаёт; поле названо, как у ответа
+    // deleteEvent и WritePlan. Если З13 выберет иную форму, проверку
+    // переписать на неё — снятая встреча в ответе должна быть названа.
+    expect(
+      (result?.removed ?? []).some((loss) => String(loss.instanceStart ?? "").startsWith("2026-10-21")),
+      `C25 шаг 3: снятая перенесённая 21.10 названа в removed ответа правки: ${JSON.stringify(result?.removed)}`,
+    ).toBe(true);
   });
 
   // Поломка: J-A1 — start с чужого экземпляра сдвигал дату серии; плюс
@@ -921,10 +1136,18 @@ describe("Цепочки правки (З05a)", () => {
     const chain = standWith(dailyMoscow);
     const days = ["19", "20", "21", "22", "23", "24", "25", "26", "27", "28"].map((d) => `2026-10-${d}`);
 
+    const initial = chain.fake.ics(chain.path);
     const slot21 = await occurrence(chain, "2026-10-21 10:00");
     await act(chain, "C39 шаг 1 (удаление 21.10)", () =>
       remove(chain, { scope: "this", instanceStart: slot21.instanceStart, etag: slot21.etag }),
     );
+    await expectVisible(chain, "C39 шаг 1", rows("Планёрка", { "2026-10-21": null }, "10:00–11:00", days));
+    expectInvariants(chain, "C39 шаг 1");
+    expectKept(chain, "C39 шаг 1", initial, { master: ["EXDATE"] });
+    const afterDelete = expectShape(chain, "C39 шаг 1", []);
+    expect(timesOf(afterDelete.masters[0], "EXDATE"), "C39 шаг 1: EXDATE ровно на слот 21.10").toEqual(["Europe/Moscow 20261021T100000"]);
+
+    const afterSlot = chain.fake.ics(chain.path);
     const slot23 = await occurrence(chain, "2026-10-23 10:00");
     await act(chain, "C39 шаг 2 (23.10: имя)", () =>
       update(chain, { scope: "this", instanceStart: slot23.instanceStart, patch: { summary: "Ретро" } }),
@@ -935,7 +1158,10 @@ describe("Цепочки правки (З05a)", () => {
       rows("Планёрка", { "2026-10-21": null, "2026-10-23": "2026-10-23 10:00–11:00 Ретро" }, "10:00–11:00", days),
     );
     expectInvariants(chain, "C39 шаг 2");
+    expectKept(chain, "C39 шаг 2", afterSlot);
+    expectShape(chain, "C39 шаг 2", ["Europe/Moscow 20261023T100000"]);
 
+    const afterName = chain.fake.ics(chain.path);
     await act(chain, "C39 шаг 3 (вся серия: start с экземпляра 22.10, 11:00)", () =>
       update(chain, { scope: "all_series", patch: { start: "2026-10-22T11:00+03:00" } }),
     );
@@ -946,6 +1172,14 @@ describe("Цепочки правки (З05a)", () => {
       rows("Планёрка", { "2026-10-21": null, "2026-10-23": "2026-10-23 11:00–12:00 Ретро" }, "11:00–12:00", days),
     );
     expectInvariants(chain, "C39 шаг 3");
+    // Основному — время и EXDATE (сдвинут по позиции); неперенесённое «Ретро»
+    // идёт за серией (О7): его DTSTART, DTEND и RECURRENCE-ID — 11:00, имя и
+    // прочее цело.
+    expectKept(chain, "C39 шаг 3", afterName, {
+      master: ["DTSTART", "DTEND", "EXDATE"],
+      overrides: ["DTSTART", "DTEND"],
+      moved: { "Europe/Moscow 20261023T100000": "Europe/Moscow 20261023T110000" },
+    });
     const after = expectShape(chain, "C39 шаг 3", ["Europe/Moscow 20261023T110000"]);
     expect(timesOf(after.masters[0], "DTSTART"), "C39 шаг 3: дата DTSTART прежняя").toEqual(["Europe/Moscow 20261019T110000"]);
     expect(timesOf(after.masters[0], "EXDATE"), "C39 шаг 3: EXDATE на прежней дате в новое время").toEqual(["Europe/Moscow 20261021T110000"]);
@@ -976,6 +1210,7 @@ describe("Цепочки правки (З05a)", () => {
     });
     expectPreserved(chain, "C43 шаг 1", initial, { except: ["RRULE"] });
 
+    const afterFirst = chain.fake.ics(chain.path);
     await act(chain, "C43 шаг 2 (вся серия: только COUNT=5)", () =>
       update(chain, { scope: "all_series", patch: { recurrence: { count: 5 } } }),
     );
@@ -985,6 +1220,7 @@ describe("Цепочки правки (З05a)", () => {
       ["2026-10-19", "2026-10-21", "2026-11-02", "2026-11-04", "2026-11-16"].map((d) => `${d} 10:00–11:00 Планёрка`),
     );
     expectInvariants(chain, "C43 шаг 2");
+    expectKept(chain, "C43 шаг 2", afterFirst, { master: ["RRULE"] });
     expect(ruleOf(stored(chain).masters[0]), "C43 шаг 2: INTERVAL и BYDAY целы").toMatchObject({
       FREQ: "WEEKLY",
       INTERVAL: "2",
@@ -1036,8 +1272,10 @@ describe("Цепочки правки (З05a)", () => {
         },
       }),
     );
+    await expectVisible(chain, "C44 шаг 2", rows("Планёрка"));
     expectInvariants(chain, "C44 шаг 2");
     expectPreserved(chain, "C44 шаг 2 (участники без status)", afterFirst, { scope: "master", only: ["ATTENDEE"] });
+    expectKept(chain, "C44 шаг 2", afterFirst, { master: ["ATTENDEE"] });
     const attendees2 = linesOf(stored(chain).masters[0], "ATTENDEE");
     expect(
       attendees2.some((line) => /mailto:orlova@example\.com$/i.test(line) && /PARTSTAT=NEEDS-ACTION/i.test(line)),
@@ -1073,9 +1311,12 @@ describe("Цепочки правки (З05a)", () => {
     ).toBe(true);
     expectPreserved(chain, "C45 шаг 1", initial, { except: ["VALARM"] });
 
+    const afterFirst = chain.fake.ics(chain.path);
     await act(chain, "C45 шаг 2 (вся серия: без напоминаний)", () => update(chain, { scope: "all_series", patch: { reminders: [] } }));
+    await expectVisible(chain, "C45 шаг 2", rows("Планёрка"));
     expectInvariants(chain, "C45 шаг 2");
     expect(alarms(), "C45 шаг 2: снимаются только DISPLAY и EMAIL, AUDIO остаётся").toEqual([audio]);
+    expectKept(chain, "C45 шаг 2", afterFirst, { master: ["VALARM"] });
   });
 
   // Поломки: AD3 (для правки — J-B3), AD9 — правка по адресу, совпадающему
@@ -1085,6 +1326,7 @@ describe("Цепочки правки (З05a)", () => {
   it.fails("C53: перенос 26.10 на 28.10 → правка 28.10 — ambiguous; confirm с устаревшим etag — отказ; со свежим — правка слота", async () => {
     const chain = standWith(weeklyMoscow);
 
+    const initial = chain.fake.ics(chain.path);
     const slot26 = await occurrence(chain, "2026-10-26 10:00");
     await act(chain, "C53 шаг 1 (перенос 26.10 на 28.10 10:00)", () =>
       update(chain, {
@@ -1095,6 +1337,9 @@ describe("Цепочки правки (З05a)", () => {
     );
     const moved = "2026-10-28 10:00–11:00 Планёрка [слот 2026-10-26 10:00]";
     await expectVisible(chain, "C53 шаг 1", [...rows("Планёрка", { "2026-10-26": null }), moved], { unordered: true });
+    expectInvariants(chain, "C53 шаг 1");
+    expectKept(chain, "C53 шаг 1", initial);
+    expectShape(chain, "C53 шаг 1", ["Europe/Moscow 20261026T100000"]);
 
     const slot28 = await occurrence(chain, "2026-10-28 10:00");
     await expectRefused(
@@ -1117,7 +1362,7 @@ describe("Цепочки правки (З05a)", () => {
           confirm: true,
           etag: slot28.etag,
         }),
-      { test: (code) => typeof code === "string" && code !== "ambiguous", what: "отказа по устаревшему etag" },
+      refusalFor("отказа по устаревшему etag (Р11)"),
     );
     expect(chain.fake.ics(chain.path), "C53 шаг 3: чужая правка цела").toBe(external);
 
@@ -1141,6 +1386,9 @@ describe("Цепочки правки (З05a)", () => {
       { unordered: true },
     );
     expectInvariants(chain, "C53 шаг 4");
+    // Правка слота 28.10 заводит новое переопределение; основной с чужим
+    // именем и перенос 26.10 целы.
+    expectKept(chain, "C53 шаг 4", external);
     expectShape(chain, "C53 шаг 4", ["Europe/Moscow 20261026T100000", "Europe/Moscow 20261028T100000"]);
   });
 
@@ -1155,13 +1403,18 @@ describe("Цепочки правки (З05a)", () => {
       return [...now.masters, ...now.overrides].map((event) => linesOf(event, "SEQUENCE").join(",") || "нет");
     };
 
+    const moved26 = "2026-10-26 15:00–16:00 Планёрка [слот 2026-10-26 12:00]";
+    const foreignInitial = foreign.fake.ics(foreign.path);
     await act(foreign, "C54 (б) шаг 1 (вся серия: 12:00–13:00)", () =>
       update(foreign, { scope: "all_series", patch: { start: "2026-10-19T12:00:00+03:00", end: "2026-10-19T13:00:00+03:00" } }),
     );
     await expectVisible(foreign, "C54 (б) шаг 1", rows("Планёрка", {}, "12:00–13:00"));
     expectInvariants(foreign, "C54 (б) шаг 1");
     expect(sequences(foreign), "C54 (б) шаг 1: SEQUENCE чужой встречи не растёт").toEqual(["SEQUENCE:2"]);
+    // Основному — только время: ORGANIZER, ATTENDEE и прочее целы.
+    expectKept(foreign, "C54 (б) шаг 1", foreignInitial, { master: ["DTSTART", "DTEND"] });
 
+    const foreignShifted = foreign.fake.ics(foreign.path);
     const slot26 = await occurrence(foreign, "2026-10-26 12:00");
     await act(foreign, "C54 (б) шаг 2 (перенос 26.10 на 15:00)", () =>
       update(foreign, {
@@ -1170,16 +1423,21 @@ describe("Цепочки правки (З05a)", () => {
         patch: { start: "2026-10-26T15:00:00+03:00", end: "2026-10-26T16:00:00+03:00" },
       }),
     );
+    await expectVisible(foreign, "C54 (б) шаг 2", rows("Планёрка", { "2026-10-26": moved26 }, "12:00–13:00"));
     expectInvariants(foreign, "C54 (б) шаг 2");
     expect(sequences(foreign), "C54 (б) шаг 2: у основного и у переопределения SEQUENCE:2").toEqual(["SEQUENCE:2", "SEQUENCE:2"]);
+    expectKept(foreign, "C54 (б) шаг 2", foreignShifted);
 
     // (а) SEQUENCE нет — не добавляется.
     const bare = standWith(noSequence);
+    const bareInitial = bare.fake.ics(bare.path);
     await act(bare, "C54 (а) шаг 1 (вся серия: 12:00–13:00)", () =>
       update(bare, { scope: "all_series", patch: { start: "2026-10-19T12:00:00+03:00", end: "2026-10-19T13:00:00+03:00" } }),
     );
     await expectVisible(bare, "C54 (а) шаг 1", rows("Планёрка", {}, "12:00–13:00"));
     expectInvariants(bare, "C54 (а) шаг 1");
+    expectKept(bare, "C54 (а) шаг 1", bareInitial, { master: ["DTSTART", "DTEND"] });
+    const bareShifted = bare.fake.ics(bare.path);
     const bare26 = await occurrence(bare, "2026-10-26 12:00");
     await act(bare, "C54 (а) шаг 2 (перенос 26.10 на 15:00)", () =>
       update(bare, {
@@ -1188,8 +1446,10 @@ describe("Цепочки правки (З05a)", () => {
         patch: { start: "2026-10-26T15:00:00+03:00", end: "2026-10-26T16:00:00+03:00" },
       }),
     );
+    await expectVisible(bare, "C54 (а) шаг 2", rows("Планёрка", { "2026-10-26": moved26 }, "12:00–13:00"));
     expectInvariants(bare, "C54 (а) шаг 2");
     expect(sequences(bare), "C54 (а) шаг 2: отсутствующий SEQUENCE не добавляется").toEqual(["нет", "нет"]);
+    expectKept(bare, "C54 (а) шаг 2", bareShifted);
   });
 
   // Поломки: AE11, П «UNTIL за горизонтом» — сдвиг времени серии не
@@ -1200,19 +1460,32 @@ describe("Цепочки правки (З05a)", () => {
     const dates = mondays("2026-10-19", "2028-10-30");
     expect(dates.length, "C58: 107 понедельников").toBe(107);
 
+    const initial = chain.fake.ics(chain.path);
     await act(chain, "C58 шаг 1 (вся серия: 11:00–12:00)", () =>
       update(chain, { scope: "all_series", patch: { start: "2026-10-19T11:00:00+03:00", end: "2026-10-19T12:00:00+03:00" } }),
     );
     await expectVisible(chain, "C58 шаг 1", rows("Планёрка", {}, "11:00–12:00", dates));
     expectInvariants(chain, "C58 шаг 1");
-    expect(ruleOf(stored(chain).masters[0]).UNTIL, "C58 шаг 1: UNTIL — 30.10.2028 11:00 МСК в UTC").toBe("20281030T080000Z");
+    expect(ruleOf(stored(chain).masters[0]), "C58 шаг 1: UNTIL — 30.10.2028 11:00 МСК в UTC, прочие части прежние").toEqual({
+      FREQ: "WEEKLY",
+      BYDAY: "MO",
+      UNTIL: "20281030T080000Z",
+    });
+    // Основному — время и конец правила (UNTIL по Р1), остальное цело.
+    expectKept(chain, "C58 шаг 1", initial, { master: ["DTSTART", "DTEND", "RRULE"] });
 
+    const afterFirst = chain.fake.ics(chain.path);
     await act(chain, "C58 шаг 2 (вся серия: 09:00–10:00)", () =>
       update(chain, { scope: "all_series", patch: { start: "2026-10-19T09:00:00+03:00", end: "2026-10-19T10:00:00+03:00" } }),
     );
     await expectVisible(chain, "C58 шаг 2", rows("Планёрка", {}, "09:00–10:00", dates));
     expectInvariants(chain, "C58 шаг 2");
-    expect(ruleOf(stored(chain).masters[0]).UNTIL, "C58 шаг 2: UNTIL — 30.10.2028 09:00 МСК в UTC").toBe("20281030T060000Z");
+    expect(ruleOf(stored(chain).masters[0]), "C58 шаг 2: UNTIL — 30.10.2028 09:00 МСК в UTC, прочие части прежние").toEqual({
+      FREQ: "WEEKLY",
+      BYDAY: "MO",
+      UNTIL: "20281030T060000Z",
+    });
+    expectKept(chain, "C58 шаг 2", afterFirst, { master: ["DTSTART", "DTEND", "RRULE"] });
   });
 
   // Поломки: AD3 для правки (П), R13-N4 — адрес совпадает со слотом 28.10 и
@@ -1221,6 +1494,7 @@ describe("Цепочки правки (З05a)", () => {
   it.fails("C61: перенос 26.10 на 28.10 10:00 → правка 28.10 10:00 — ambiguous, записей нет", async () => {
     const chain = standWith(weeklyMoscow);
 
+    const initial = chain.fake.ics(chain.path);
     const slot26 = await occurrence(chain, "2026-10-26 10:00");
     await act(chain, "C61 шаг 1 (перенос 26.10 на 28.10 10:00)", () =>
       update(chain, {
@@ -1232,6 +1506,8 @@ describe("Цепочки правки (З05a)", () => {
     const expected = [...rows("Планёрка", { "2026-10-26": null }), "2026-10-28 10:00–11:00 Планёрка [слот 2026-10-26 10:00]"];
     await expectVisible(chain, "C61 шаг 1", expected, { unordered: true });
     expectInvariants(chain, "C61 шаг 1");
+    expectKept(chain, "C61 шаг 1", initial);
+    expectShape(chain, "C61 шаг 1", ["Europe/Moscow 20261026T100000"]);
 
     const slot28 = await occurrence(chain, "2026-10-28 10:00");
     const before = chain.fake.ics(chain.path);
