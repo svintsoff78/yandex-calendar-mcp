@@ -36,6 +36,10 @@ import type { Attendee, CalendarEvent, Recurrence, RecurrenceFrequency, Reminder
 export interface NewRecurrence {
   frequency: RecurrenceFrequency;
   interval: number;
+  /**
+   * Дни недели BYDAY. Порядковый номер — только при monthly (±1…5) и yearly
+   * (±1…9: ical.js читает у номера одну цифру, см. checkedByday).
+   */
   byWeekday?: ReadonlyArray<NonNullable<Recurrence["byWeekday"]>[number]>;
   /**
    * Последняя встреча включительно. У серии на весь день — дата
@@ -68,7 +72,7 @@ export interface NewEvent {
   start: string;
   /** Конец, исключающий: как `start`; у события на весь день — дата после последнего дня. */
   end: string;
-  /** IANA-пояс события. У события на весь день в текст не пишется. */
+  /** IANA-пояс события. У события на весь день в текст не пишется, но проверяется. */
   timeZone: string;
   allDay: boolean;
   recurrence?: NewRecurrence;
@@ -86,7 +90,8 @@ export interface BuildOptions {
  * - `invalid-field` — пустой заголовок или UID, напоминание не целым числом минут;
  * - `invalid-time` — время не разобрано, не той формы, не существует в поясе
  *   события или конец не позже начала;
- * - `unknown-timezone` — пояса нет ни в базе IANA, ни среди зарегистрированных;
+ * - `unknown-timezone` — пояса нет ни в базе IANA, ни среди зарегистрированных
+ *   (у события на весь день тоже);
  * - `invalid-rule` — правило повтора нарушает RFC 5545 или модель;
  * - `unsupported-rule` — части правила вне модели, в том числе BYSETPOS и
  *   WKST, которые Яндекс искажает (docs/yandex-caldav-capabilities.md, Ж6);
@@ -216,13 +221,12 @@ interface Frame {
 
 function frameOf(event: NewEvent): Frame {
   const env: IcalEnv = { floatingZone: event.timeZone };
-  if (event.allDay) return { form: "date", env };
 
   // Имена UTC, GMT и Z ical.js держит за общим utcTimezone
   // (timezone_service.js, reset). Время в нём пишется с Z и без TZID —
   // форма utc; `TZID=UTC` вместе с Z RFC 5545 §3.3.5 не допускает.
   if (ICAL.TimezoneService.get(event.timeZone) === ICAL.Timezone.utcTimezone) {
-    return { form: "utc", zone: ICAL.Timezone.utcTimezone, env };
+    return event.allDay ? { form: "date", env } : { form: "utc", zone: ICAL.Timezone.utcTimezone, env };
   }
 
   // Время считается по тому же описанию пояса, что вкладывается в текст, — из
@@ -230,17 +234,25 @@ function frameOf(event: NewEvent): Frame {
   // чужой VTIMEZONE при чтении других объектов, и от порядка чтения текст
   // нового события зависеть не должен. Объект пояса не регистрируется;
   // tzid в данных важнее TZID компонента (timezone.js, fromData).
-  let vtimezone: ICAL.Component;
+  const vtimezone = knownVtimezone(event.timeZone);
+  // У события на весь день пояс в текст не пишется: у дат пояса нет. Но
+  // проверяется он так же, как у события со временем, — иначе неверное имя
+  // ушло бы без отказа в ответ createEvent.
+  if (event.allDay) return { form: "date", env };
+
+  const zone = new ICAL.Timezone({ component: vtimezone, tzid: event.timeZone });
+  return { form: "zoned", zone, vtimezone, env };
+}
+
+function knownVtimezone(timeZone: string): ICAL.Component {
   try {
-    vtimezone = vtimezoneFor(event.timeZone);
+    return vtimezoneFor(timeZone);
   } catch {
     throw new BuildError(
       "unknown-timezone",
-      `Неизвестный часовой пояс ${JSON.stringify(event.timeZone)}: нужен пояс IANA, например Europe/Moscow.`,
+      `Неизвестный часовой пояс ${JSON.stringify(timeZone)}: нужен пояс IANA, например Europe/Moscow.`,
     );
   }
-  const zone = new ICAL.Timezone({ component: vtimezone, tzid: event.timeZone });
-  return { form: "zoned", zone, vtimezone, env };
 }
 
 function parseField(iso: string, field: string, zone: ICAL.Timezone | undefined): ModelTime {
@@ -326,7 +338,14 @@ const FREQUENCIES: Record<RecurrenceFrequency, string> = {
 };
 
 // BYDAY: день с необязательным порядковым номером со знаком (RFC 5545 §3.3.10).
-const BYDAY_PATTERN = /^([+-]?)(\d{1,2})?(MO|TU|WE|TH|FR|SA|SU)$/;
+// Номер берётся любой длины, чтобы отказ назвал причину (предел, ведущий ноль),
+// а не только «не день недели».
+const BYDAY_PATTERN = /^([+-]?)(\d+)?(MO|TU|WE|TH|FR|SA|SU)$/;
+
+// Как номер BYDAY читает итератор ical.js 2.2.1: одна цифра, поиск без привязки
+// к началу строки (node_modules/ical.js/lib/ical/recur_iterator.js,
+// ruleDayOfWeek). Только для текста отказа: «20MO» → «0MO», «-12FR» → «2FR».
+const ICALJS_BYDAY_READING = /([+-]?[0-9])?(MO|TU|WE|TH|FR|SA|SU)/;
 
 // Части, которые Яндекс молча искажает (docs/yandex-caldav-capabilities.md, Ж6).
 const DISTORTED_PARTS: Record<string, string> = {
@@ -388,10 +407,25 @@ function rejectUnmodeled(unmodeled: string): never {
   );
 }
 
-// Порядковый номер BYDAY — только при MONTHLY (±1…5: в месяце не больше
-// пяти одинаковых дней, иначе итератор ical.js бросает — recur_iterator.js,
-// init, «Malformed values in BYDAY part») и YEARLY (±1…53). При DAILY и
-// WEEKLY номер RFC 5545 §3.3.10 запрещает.
+/**
+ * Значение BYDAY, которое и RFC 5545, и ical.js читают одинаково.
+ *
+ * Порядковый номер RFC 5545 §3.3.10 допускает только при MONTHLY и YEARLY; при
+ * DAILY и WEEKLY он запрещён. Пределы:
+ * - MONTHLY — ±1…5: в месяце не больше пяти одинаковых дней недели, на большем
+ *   номере итератор ical.js бросает «Malformed values in BYDAY part»
+ *   (node_modules/ical.js/lib/ical/recur_iterator.js, init);
+ * - YEARLY — ±1…9, хотя RFC допускает до 53: итератор ical.js 2.2.1 читает у
+ *   номера только одну цифру (recur_iterator.js, ruleDayOfWeek — регулярное
+ *   выражение `/([+-]?[0-9])?(MO|…)/` без привязки к началу строки). «20MO» он
+ *   раскрывает как «0MO», то есть каждый понедельник, «-12FR» — как «2FR».
+ *   Серию с таким правилом этот же проект раскрыл бы неверно — в чтении, в
+ *   слотах и в предохранителе, — и правка по слоту попала бы в несуществующие
+ *   встречи. Однозначные номера итератор читает верно
+ *   (recur_iterator.js, expand_by_day).
+ * Ведущий ноль («05MO») грамматика RFC не допускает, и ICAL.parse такой текст
+ * не читает (recur.js, VALID_BYDAY_PART).
+ */
 function checkedByday(value: string, freq: string): string {
   const match = BYDAY_PATTERN.exec(value);
   if (!match) {
@@ -402,13 +436,27 @@ function checkedByday(value: string, freq: string): string {
     if (sign) throw invalidRule(`byWeekday: ${JSON.stringify(value)} — знак без номера.`);
     return value;
   }
-  const limit = freq === "MONTHLY" ? 5 : freq === "YEARLY" ? 53 : 0;
-  if (limit === 0) {
+  if (freq !== "MONTHLY" && freq !== "YEARLY") {
     throw invalidRule(`byWeekday: номер дня (${value}) допустим только при monthly и yearly.`);
   }
   const number = Number(ordinal);
-  if (number < 1 || number > limit) {
-    throw invalidRule(`byWeekday: номер дня в ${value} должен быть от 1 до ${limit} (со знаком или без).`);
+  if (number < 1 || ordinal.startsWith("0")) {
+    throw invalidRule(`byWeekday: номер дня в ${value} — целое число от 1 без ведущих нулей, например 2MO или -1FR.`);
+  }
+  if (freq === "MONTHLY" && number > 5) {
+    throw invalidRule(
+      `byWeekday: номер дня в ${value} при monthly должен быть от 1 до 5 (со знаком или без): ` +
+        "в месяце не больше пяти одинаковых дней недели.",
+    );
+  }
+  if (freq === "YEARLY" && number > 9) {
+    const misread = ICALJS_BYDAY_READING.exec(value)?.[0] ?? value;
+    throw invalidRule(
+      `byWeekday: номер дня в ${value} при yearly должен быть от 1 до 9 (со знаком или без). ` +
+        "RFC 5545 допускает до 53, но ical.js, которой сервер раскрывает серии, читает у номера BYDAY " +
+        `только одну цифру (recur_iterator.js, ruleDayOfWeek): ${value} она прочла бы как ${misread}, ` +
+        "и встречи легли бы не в те дни. Выразите повтор иначе или создайте несколько событий.",
+    );
   }
   return value;
 }

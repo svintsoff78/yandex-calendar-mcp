@@ -386,11 +386,32 @@ describe("buildEvent: моменты и формы времени", () => {
     const previous = ICAL.TimezoneService.get("Europe/Moscow");
     ICAL.TimezoneService.register(new ICAL.Timezone({ component: foreign, tzid: "Europe/Moscow" }), "Europe/Moscow");
     try {
+      // Момент со смещением.
       const { ics } = buildEvent(base);
 
       expect(line(ics, "DTSTART")).toBe("DTSTART;TZID=Europe/Moscow:20260921T100000");
       expect(ics).toContain("TZOFFSETTO:+0300");
       expect(ics).not.toContain("+0500");
+
+      // Стенное время без смещения (правка по ревью): разобранное как
+      // плавающее, оно досчитывалось бы через пояс календаря, то есть через
+      // TimezoneService, и при фиктивном +05:00 сдвинулось бы на 08:00.
+      const wall = buildEvent({
+        ...base,
+        start: "2026-09-21T10:00:00",
+        end: "2026-09-21T11:00:00",
+        recurrence: { frequency: "daily", interval: 1, until: "2026-09-30T10:00:00" },
+      });
+
+      expect(line(wall.ics, "DTSTART")).toBe("DTSTART;TZID=Europe/Moscow:20260921T100000");
+      expect(line(wall.ics, "DTEND")).toBe("DTEND;TZID=Europe/Moscow:20260921T110000");
+      // 10:00 по Москве (+03:00) — 07:00 UTC; при +05:00 было бы 05:00.
+      expect(line(wall.ics, "RRULE")).toMatch(/[:;]UNTIL=20260930T070000Z(;|$)/);
+
+      // UNTIL датой — конец дня по описанию из базы: 23:59:59 +03:00.
+      const byDate = buildEvent({ ...base, recurrence: { frequency: "daily", interval: 1, until: "2026-09-30" } });
+
+      expect(line(byDate.ics, "RRULE")).toMatch(/[:;]UNTIL=20260930T205959Z(;|$)/);
     } finally {
       ICAL.TimezoneService.remove("Europe/Moscow");
       if (previous) ICAL.TimezoneService.register(previous, "Europe/Moscow");
@@ -427,12 +448,28 @@ describe("buildEvent: моменты и формы времени", () => {
     expect(error.message).toContain("end");
   });
 
-  it("неизвестный пояс отклоняется", () => {
-    expect(thrownBy(() => buildEvent({ ...base, timeZone: "Mars/Olympus_Mons" }))).toMatchObject({
-      name: "BuildError",
-      code: "unknown-timezone",
-    });
+  // У события на весь день пояс в текст не пишется, но проверяется так же
+  // (правка по ревью): неверный пояс иначе ушёл бы в ответ createEvent.
+  it.each([
+    ["со временем", { ...base, timeZone: "Mars/Olympus_Mons" }],
+    ["на весь день", { ...allDayBase, timeZone: "Mars/Olympus_Mons" }],
+  ])("неизвестный пояс отклоняется (%s)", (_label, event) => {
+    const error = thrownBy(() => buildEvent(event));
+
+    expect(error).toMatchObject({ name: "BuildError", code: "unknown-timezone" });
+    expect(error.message).toContain("Mars/Olympus_Mons");
   });
+
+  it.each(["UTC", "GMT", "Etc/UTC", "America/New_York"])(
+    "у события на весь день известный пояс %s принимается и в текст не пишется",
+    (timeZone) => {
+      const { ics } = buildEvent({ ...allDayBase, timeZone });
+
+      expect(line(ics, "DTSTART")).toBe("DTSTART;VALUE=DATE:20260923");
+      expect(ics).not.toContain("TZID");
+      expect(ics).not.toContain("BEGIN:VTIMEZONE");
+    },
+  );
 
   it("отказ — экземпляр BuildError", () => {
     expect(thrownBy(() => buildEvent({ ...base, end: base.start }))).toBeInstanceOf(BuildError);
@@ -486,6 +523,13 @@ describe("buildEvent: правило повтора", () => {
     ["номер больше 5 при MONTHLY", { frequency: "monthly", interval: 1, byWeekday: ["6MO"] }],
     ["номер 0", { frequency: "yearly", interval: 1, byWeekday: ["0MO"] }],
     ["номер больше 53 при YEARLY", { frequency: "yearly", interval: 1, byWeekday: ["54MO"] }],
+    // ical.js читает у номера одну цифру (см. тест «основание предела» ниже).
+    ["двузначный номер 20MO при YEARLY", { frequency: "yearly", interval: 1, byWeekday: ["20MO"] }],
+    ["двузначный номер -12FR при YEARLY", { frequency: "yearly", interval: 1, byWeekday: ["-12FR"] }],
+    ["номер 10MO при YEARLY — первый за пределом", { frequency: "yearly", interval: 1, byWeekday: ["10MO"] }],
+    // «05MO» грамматика RFC 5545 не допускает, и ICAL.parse такой текст не читает.
+    ["номер с ведущим нулём", { frequency: "monthly", interval: 1, byWeekday: ["05MO"] }],
+    ["номер с ведущим нулём и знаком", { frequency: "yearly", interval: 1, byWeekday: ["-01FR"] }],
     ["COUNT вместе с UNTIL", { frequency: "daily", interval: 1, count: 3, until: "2026-09-30" }],
     ["COUNT ноль", { frequency: "daily", interval: 1, count: 0 }],
     ["дробный COUNT", { frequency: "daily", interval: 1, count: 2.5 }],
@@ -506,19 +550,94 @@ describe("buildEvent: правило повтора", () => {
     expect(error).toMatchObject({ name: "BuildError", code: "invalid-rule" });
   });
 
-  it("порядковые номера BYDAY по RFC 5545 принимаются", () => {
+  it("порядковые номера BYDAY при MONTHLY принимаются", () => {
     const monthly = buildEvent({
       ...base,
       recurrence: { frequency: "monthly", interval: 1, byWeekday: ["2MO", "-1FR"], count: 4 },
     });
-    const yearly = buildEvent({
-      ...base,
-      recurrence: { frequency: "yearly", interval: 2, byWeekday: ["20MO"], count: 2 },
-    });
 
     expect(line(monthly.ics, "RRULE")).toBe("RRULE:FREQ=MONTHLY;INTERVAL=1;BYDAY=2MO,-1FR;COUNT=4");
-    expect(line(yearly.ics, "RRULE")).toBe("RRULE:FREQ=YEARLY;INTERVAL=2;BYDAY=20MO;COUNT=2");
     expect(occurrences(monthly.ics)).toHaveLength(4);
+  });
+
+  // Даты посчитаны вручную по RFC 5545 §3.3.10 (n-й день недели года, с
+  // конца — при минусе): 1 января 2026 — четверг, 2027 — пятница, 2028 — суббота.
+  it.each([
+    ["2MO", "2026-01-12", ["2026-01-12", "2027-01-11", "2028-01-10"]],
+    ["9MO", "2026-03-02", ["2026-03-02", "2027-03-01", "2028-02-28"]],
+    ["-1FR", "2026-12-25", ["2026-12-25", "2027-12-31", "2028-12-29"]],
+    ["-9SU", "2026-11-01", ["2026-11-01", "2027-10-31", "2028-11-05"]],
+  ])("YEARLY с номером %s: встречи раз в год, в нужный день", (byday, date, dates) => {
+    const { ics } = buildEvent({
+      ...base,
+      start: `${date}T10:00:00+03:00`,
+      end: `${date}T11:00:00+03:00`,
+      recurrence: { frequency: "yearly", interval: 1, byWeekday: [byday as "MO"], count: 3 },
+    });
+
+    expect(line(ics, "RRULE")).toBe(`RRULE:FREQ=YEARLY;INTERVAL=1;BYDAY=${byday};COUNT=3`);
+    expect(occurrences(ics)).toEqual(dates.map((day) => `${day}T10:00:00`));
+  });
+
+  it("двузначный номер при YEARLY отклоняется с объяснением ограничения ical.js", () => {
+    const error = thrownBy(() =>
+      buildEvent({ ...base, recurrence: { frequency: "yearly", interval: 1, byWeekday: ["20MO"] } }),
+    );
+
+    expect(error).toMatchObject({ name: "BuildError", code: "invalid-rule" });
+    expect(error.message).toContain("20MO");
+    expect(error.message).toContain("от 1 до 9");
+    expect(error.message).toContain("ical.js");
+  });
+
+  // Основание предела ±1…9 при YEARLY: ical.js 2.2.1 разбирает номер BYDAY
+  // регулярным выражением /([+-]?[0-9])?(MO|…)/ без привязки к началу строки
+  // (node_modules/ical.js/lib/ical/recur_iterator.js, ruleDayOfWeek), поэтому
+  // «20MO» читает как «0MO» — каждый понедельник. Если этот тест упадёт после
+  // обновления ical.js, предел в build.ts (checkedByday) можно расширить до 53.
+  it("основание предела: ical.js раскрывает BYDAY=20MO как каждый понедельник", () => {
+    const ics = [
+      "BEGIN:VCALENDAR",
+      "VERSION:2.0",
+      "PRODID:-//test//RU",
+      "BEGIN:VEVENT",
+      "UID:byday-20mo",
+      "DTSTAMP:20260919T000000Z",
+      "DTSTART:20260518T070000Z",
+      "RRULE:FREQ=YEARLY;INTERVAL=1;BYDAY=20MO;COUNT=3",
+      "END:VEVENT",
+      "END:VCALENDAR",
+    ].join("\r\n");
+
+    // По RFC 5545 — двадцатый понедельник года: 18.05.2026, 17.05.2027, 22.05.2028.
+    expect(occurrences(ics)).toEqual(["2026-05-18T07:00:00Z", "2026-05-25T07:00:00Z", "2026-06-01T07:00:00Z"]);
+  });
+
+  // О12а плана: UNTIL ≥ DTSTART; UNTIL включителен (RFC 5545 §3.3.10).
+  it.each([
+    ["со временем", { ...base, recurrence: { frequency: "daily", interval: 1, until: base.start } }, "UNTIL=20260921T070000Z", ["2026-09-21T10:00:00"]],
+    ["на весь день", { ...allDayBase, recurrence: { frequency: "daily", interval: 1, until: allDayBase.start } }, "UNTIL=20260923", ["2026-09-23"]],
+  ] as const)("UNTIL, равный началу, принимается: одна встреча (%s)", (_label, event, until, starts) => {
+    const { ics } = buildEvent(event);
+
+    expect(line(ics, "RRULE")).toMatch(new RegExp(`[:;]${until}(;|$)`));
+    expect(occurrences(ics)).toEqual(starts);
+  });
+
+  it("UNTIL из разрыва весеннего перевода отклоняется", () => {
+    // 08.03.2026 в Нью-Йорке часы переводятся с 02:00 сразу на 03:00.
+    const error = thrownBy(() =>
+      buildEvent({
+        ...base,
+        timeZone: "America/New_York",
+        start: "2026-03-01T10:00:00",
+        end: "2026-03-01T11:00:00",
+        recurrence: { frequency: "daily", interval: 1, until: "2026-03-08T02:30:00" },
+      }),
+    );
+
+    expect(error).toMatchObject({ name: "BuildError", code: "invalid-time" });
+    expect(error.message).toContain("recurrence.until");
   });
 });
 
