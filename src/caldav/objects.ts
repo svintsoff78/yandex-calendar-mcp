@@ -107,6 +107,15 @@ export async function getObject(client: CaldavClient, href: string): Promise<Raw
   };
 }
 
+// putObject и deleteObject уходят на сервер ровно один раз: транспорт не
+// повторяет PUT и DELETE (src/caldav/request.ts, решение Р8 плана
+// docs/superpowers/plans/2026-09-19-recurring-events-rework.md). Сбой
+// доходит до вызывающего как CaldavError без обёрток: status — код ответа
+// (0, если ответа нет), applied — "no" (сервер ответил 4xx, запись не
+// выполнена) или "unknown" (ответа нет или 5xx, запись могла примениться).
+// По applied слой домена решает, перечитывать ли объект (З12); здесь
+// ошибки не перехватываются и не переименовываются, чтобы applied и status
+// не потерялись по дороге.
 export async function putObject(
   client: CaldavClient,
   href: string,

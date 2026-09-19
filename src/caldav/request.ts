@@ -14,11 +14,27 @@ export interface CaldavResponse {
   text: string;
 }
 
+// Дошёл ли запрос до сервера (решение Р8 плана
+// docs/superpowers/plans/2026-09-19-recurring-events-rework.md):
+// - "no" — сервер ответил 4xx, то есть по семантике HTTP запрос не выполнил
+//   (412, 404, 403, 409, 429 и прочие);
+// - "unknown" — ответа нет вовсе (сеть, таймаут, оборванное тело) или
+//   пришёл 5xx: запись могла примениться, а ответ потеряться. Исход такой
+//   записи выясняется перечитыванием объекта (src/domain/writes.ts, З12),
+//   а не вслепую повторённым PUT или DELETE.
+// Поле зависит только от того, что пришло от сервера, и не зависит от метода.
+// У безопасных методов оно ни на что не влияет: побочных действий у них нет.
+export type CaldavApplied = "no" | "unknown";
+
 export class CaldavError extends Error {
+  // applied по умолчанию "unknown": ошибка, созданная без явного знания
+  // исхода, ведёт к перечитыванию, а оно безвредно. Обратное умолчание
+  // выдало бы возможно применённую запись за недошедшую.
   constructor(
     message: string,
     readonly status: number,
     readonly hint: string,
+    readonly applied: CaldavApplied = "unknown",
   ) {
     super(message);
     this.name = "CaldavError";
@@ -29,6 +45,15 @@ export interface CaldavClient {
   request(options: RequestOptions): Promise<CaldavResponse>;
 }
 
+// Повторяются только безопасные методы: они ничего не меняют на сервере,
+// и лишняя попытка ничего не портит (RFC 9110 §9.2.1 для GET, HEAD,
+// OPTIONS; PROPFIND — RFC 4918 §9.1; REPORT в CalDAV — только чтение).
+// PUT и DELETE уходят ровно один раз: повтор условной записи после
+// потерянного ответа получал 412 или 404 на собственную же применённую
+// первую попытку, и пользователь видел ложный отказ, а при разрезе серии
+// терялся хвост (AE7, AE18, AD12 в wave-a-results.json). Прочие методы
+// (POST, MKCOL, PROPPATCH…) тоже не повторяются: безопасность не доказана.
+const RETRYABLE_METHODS = new Set(["GET", "HEAD", "OPTIONS", "PROPFIND", "REPORT"]);
 const RETRY_STATUSES = new Set([429, 500, 502, 503, 504]);
 const MAX_ATTEMPTS = 3;
 const TIMEOUT_MS = 20_000;
@@ -49,6 +74,10 @@ function explain(status: number): string {
   return `Сервер календаря ответил кодом ${status}.`;
 }
 
+function appliedFor(status: number): CaldavApplied {
+  return status >= 400 && status < 500 ? "no" : "unknown";
+}
+
 // "раз"/"раза" по правилам русского числительного. При текущем MAX_ATTEMPTS = 3
 // сюда всегда приходит 3, но функция написана универсально на случай, если
 // MAX_ATTEMPTS изменится.
@@ -61,13 +90,24 @@ function timesWord(n: number): string {
   return "раз";
 }
 
-// Класс ошибки «таймаут, 5xx» из раздела 11 спека: сеть или сервер недоступны.
-// lastStatus — последний реально полученный HTTP-статус (например, 503,
-// когда исчерпаны повторы на 5xx), либо 0, если ни одного ответа получить
-// не удалось (все попытки упали таймаутом или сетевой ошибкой).
+// Класс ошибки «таймаут, 5xx» из раздела 11 спека для безопасных методов:
+// сеть или сервер недоступны, повторы исчерпаны. lastStatus — последний
+// полученный статус из числа повторяемых (например, 503), либо 0, если
+// полного ответа не было ни разу (все попытки упали таймаутом, сетевой
+// ошибкой или обрывом тела).
 function unavailableError(attempts: number, lastStatus: number): CaldavError {
   const hint = `Сеть или сервер недоступны, повтор выполнен ${attempts} ${timesWord(attempts)}.`;
-  return new CaldavError(hint, lastStatus, hint);
+  return new CaldavError(hint, lastStatus, hint, appliedFor(lastStatus));
+}
+
+// Небезопасный запрос (PUT, DELETE…) без внятного ответа: status = 0 —
+// ответа нет вовсе, иначе это 5xx. Текст не утверждает ни успеха, ни
+// провала: запись могла дойти до сервера.
+function unconfirmedError(method: string, status: number): CaldavError {
+  const reason =
+    status === 0 ? "Сеть или сервер недоступны: ответа на запрос нет." : explain(status);
+  const hint = `${reason} Дошла ли запись (${method}) до сервера, неизвестно; автоматически она не повторялась.`;
+  return new CaldavError(hint, status, hint, "unknown");
 }
 
 async function discard(response: Response): Promise<void> {
@@ -96,12 +136,15 @@ export function createClient(config: Config, fetchImpl: typeof fetch = fetch): C
 
   return {
     async request(options) {
-      let response: Response | undefined;
+      // fetch сам приводит стандартные имена методов к верхнему регистру,
+      // так что "put" — тот же PUT и повторяться не должен.
+      const method = options.method.toUpperCase();
+      const retryable = RETRYABLE_METHODS.has(method);
+      const maxAttempts = retryable ? MAX_ATTEMPTS : 1;
       let lastStatus = 0;
 
-      for (let i = 0; i < MAX_ATTEMPTS; i += 1) {
-        const attemptsMade = i + 1;
-        const isLastAttempt = attemptsMade >= MAX_ATTEMPTS;
+      for (let attemptsMade = 1; ; attemptsMade += 1) {
+        const isLastAttempt = attemptsMade >= maxAttempts;
 
         let current: Response;
         try {
@@ -111,36 +154,47 @@ export function createClient(config: Config, fetchImpl: typeof fetch = fetch): C
           // (AbortSignal.timeout → DOMException) и на сетевых сбоях —
           // DNS/connection refused (TypeError). Это тот же класс ошибок
           // «сеть или сервер недоступны», что и исчерпанные повторы на 5xx.
+          if (!retryable) throw unconfirmedError(method, 0);
           if (isLastAttempt) throw unavailableError(attemptsMade, lastStatus);
           continue;
         }
 
-        lastStatus = current.status;
-
-        if (RETRY_STATUSES.has(current.status)) {
-          if (isLastAttempt) {
-            await discard(current);
-            throw unavailableError(attemptsMade, lastStatus);
-          }
+        if (!retryable && current.status >= 500) {
           await discard(current);
+          throw unconfirmedError(method, current.status);
+        }
+
+        if (retryable && RETRY_STATUSES.has(current.status)) {
+          lastStatus = current.status;
+          await discard(current);
+          if (isLastAttempt) throw unavailableError(attemptsMade, lastStatus);
           continue;
         }
 
-        response = current;
-        break;
-      }
+        if (current.status >= 400) {
+          const hint = explain(current.status);
+          await discard(current);
+          throw new CaldavError(hint, current.status, hint, appliedFor(current.status));
+        }
 
-      const finalResponse = response as Response;
-      if (finalResponse.status >= 400) {
-        const hint = explain(finalResponse.status);
-        await discard(finalResponse);
-        throw new CaldavError(hint, finalResponse.status, hint);
+        // Тело читается под тем же AbortSignal.timeout и может оборваться
+        // уже после статуса. Для записи статус 2xx сам подтверждает, что
+        // она применена, и ETag уже есть в заголовках, — тело не нужно,
+        // бросать ошибку здесь значило бы выдать применённую запись за
+        // сбой. Для чтения обрыв тела — тот же сетевой сбой: повторяем.
+        let text: string;
+        try {
+          text = await current.text();
+        } catch {
+          if (!retryable) {
+            text = "";
+          } else {
+            if (isLastAttempt) throw unavailableError(attemptsMade, lastStatus);
+            continue;
+          }
+        }
+        return { status: current.status, headers: current.headers, text };
       }
-      return {
-        status: finalResponse.status,
-        headers: finalResponse.headers,
-        text: await finalResponse.text(),
-      };
     },
   };
 }

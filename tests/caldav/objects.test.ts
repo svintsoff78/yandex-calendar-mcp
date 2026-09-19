@@ -6,7 +6,7 @@ import {
   queryEventByUid,
   queryEvents,
 } from "../../src/caldav/objects.js";
-import type { CaldavClient } from "../../src/caldav/request.js";
+import { CaldavError, createClient, type CaldavClient } from "../../src/caldav/request.js";
 
 function client(response: { status?: number; text?: string; headers?: Record<string, string> }) {
   const request = vi.fn().mockResolvedValue({
@@ -310,5 +310,161 @@ END:VCALENDAR</c:calendar-data>
     const object = await queryEventByUid(caldav, "/calendars/user/work/", uid);
 
     expect(object).toBeUndefined();
+  });
+});
+
+// Задача З02, решение Р8 плана переделки
+// (docs/superpowers/plans/2026-09-19-recurring-events-rework.md): записи
+// объектов уходят на сервер ровно один раз, а CaldavError с полем applied
+// доходит до вызывающего без обёрток — по нему слой домена (З12) решает,
+// перечитывать ли объект. Здесь putObject и deleteObject проверяются через
+// настоящий createClient, а не через мок client.request: иначе повтор
+// внутри транспорта был бы не виден.
+describe("запись объектов через настоящий транспорт", () => {
+  const config = {
+    login: "user@yandex.ru",
+    appPassword: "secret",
+    defaultTimeZone: "Europe/Moscow",
+    baseUrl: "https://caldav.yandex.ru",
+  };
+
+  function transport(fetchMock: ReturnType<typeof vi.fn>): CaldavClient {
+    return createClient(config, fetchMock as unknown as typeof fetch);
+  }
+
+  function reply(status: number, text = "", headers: Record<string, string> = {}) {
+    return new Response(text, { status, headers });
+  }
+
+  async function caught(promise: Promise<unknown>): Promise<CaldavError> {
+    try {
+      await promise;
+    } catch (error) {
+      if (error instanceof CaldavError) return error;
+      throw new Error(`ожидалась CaldavError, а пришло: ${String(error)}`);
+    }
+    throw new Error("ожидался отказ, а запрос прошёл");
+  }
+
+  it("putObject на 503 шлёт PUT ровно один раз и отдаёт applied: unknown", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(reply(503));
+
+    const error = await caught(
+      putObject(transport(fetchMock), "/calendars/user/work/x.ics", "BEGIN:VCALENDAR", {
+        ifMatch: "1789383239000",
+      }),
+    );
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][1].method).toBe("PUT");
+    expect(error.applied).toBe("unknown");
+    expect(error.status).toBe(503);
+  });
+
+  it("putObject с If-None-Match после таймаута не повторяется", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockRejectedValue(new DOMException("The operation was aborted due to timeout", "TimeoutError"));
+
+    const error = await caught(
+      putObject(transport(fetchMock), "/calendars/user/work/x.ics", "BEGIN:VCALENDAR", {
+        ifNoneMatch: true,
+      }),
+    );
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(error.applied).toBe("unknown");
+    expect(error.status).toBe(0);
+  });
+
+  it("deleteObject после сетевого сбоя (TypeError) не повторяет DELETE", async () => {
+    const fetchMock = vi.fn().mockRejectedValue(new TypeError("fetch failed"));
+
+    const error = await caught(
+      deleteObject(transport(fetchMock), "/calendars/user/work/x.ics", "1789383239000"),
+    );
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][1].method).toBe("DELETE");
+    expect(error.applied).toBe("unknown");
+    expect(error.status).toBe(0);
+  });
+
+  it("putObject на 412 отдаёт applied: no и статус 412", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(reply(412));
+
+    const error = await caught(
+      putObject(transport(fetchMock), "/x.ics", "BEGIN:VCALENDAR", { ifMatch: "1" }),
+    );
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(error.applied).toBe("no");
+    expect(error.status).toBe(412);
+  });
+
+  it("deleteObject на 404 отдаёт applied: no и статус 404 — «уже удалено» решает домен", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(reply(404));
+
+    const error = await caught(deleteObject(transport(fetchMock), "/x.ics", "1"));
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(error.applied).toBe("no");
+    expect(error.status).toBe(404);
+  });
+
+  it("putObject с оборванным телом успешного ответа возвращает ETag из заголовка", async () => {
+    const body = new ReadableStream({
+      start(controller) {
+        controller.error(new TypeError("terminated"));
+      },
+    });
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(new Response(body, { status: 201, headers: { ETag: "1789383239001" } }));
+
+    const etag = await putObject(transport(fetchMock), "/x.ics", "BEGIN:VCALENDAR", {
+      ifNoneMatch: true,
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(etag).toBe("1789383239001");
+  });
+
+  // Охранные тесты: чтение безопасно повторять, и перечитывание после
+  // записи без ответа (Р8) должно переживать кратковременный сбой.
+  it("queryEventByUid повторяет REPORT на 503", async () => {
+    const found = `<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:response>
+    <d:href>/calendars/user/work/a.ics</d:href>
+    <d:propstat><d:prop>
+      <d:getetag>5</d:getetag>
+      <c:calendar-data>BEGIN:VCALENDAR
+UID:a
+END:VCALENDAR</c:calendar-data>
+    </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+  </d:response>
+</d:multistatus>`;
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(reply(503))
+      .mockResolvedValueOnce(reply(207, found));
+
+    const object = await queryEventByUid(transport(fetchMock), "/calendars/user/work/", "a");
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(object?.etag).toBe("5");
+  });
+
+  it("getObject повторяет GET после сетевого сбоя", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockRejectedValueOnce(new TypeError("fetch failed"))
+      .mockResolvedValueOnce(reply(200, "BEGIN:VCALENDAR", { ETag: "9" }));
+
+    const object = await getObject(transport(fetchMock), "/x.ics");
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(object.etag).toBe("9");
   });
 });
