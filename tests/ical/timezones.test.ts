@@ -114,6 +114,34 @@ describe("vtimezoneFor", () => {
     expect(component).not.toBe(registerTimeZone("Test/Fixed-Plus-Two").component);
   });
 
+  it("копия пояса вне базы не делит jCal с описанием в сервисе: её правка описание не меняет", () => {
+    const service = registerTimeZone("Test/Out-Of-Base-Copy", RAW_VTIMEZONE).component;
+    const before = service.toString();
+    const copy = vtimezoneFor("Test/Out-Of-Base-Copy");
+
+    copy.updatePropertyWithValue("x-lic-location", "изменено");
+    copy.addPropertyWithValue("x-ycm-mark", "копия");
+    new ICAL.Component(["vcalendar", [], []]).addSubcomponent(copy);
+
+    expect(copy.jCal).not.toBe(service.jCal);
+    expect(service.toString()).toBe(before);
+    expect(copy.toString()).toContain("X-LIC-LOCATION:изменено");
+  });
+
+  it("у пояса вне базы, зарегистрированного под другим именем, в TZID копии — это имя, описание в сервисе цело", () => {
+    // Описание с TZID:Test/Fixed-Plus-Two зарегистрировано прямо в сервисе под
+    // именем Test/Alias-Plus-Two (так делает любой код, минуя registerTimeZone).
+    const described = new ICAL.Component(ICAL.parse(`BEGIN:VCALENDAR\r\nVERSION:2.0\r\n${RAW_VTIMEZONE}\r\nEND:VCALENDAR`))
+      .getFirstSubcomponent("vtimezone")!;
+    ICAL.TimezoneService.register(new ICAL.Timezone({ component: described, tzid: "Test/Alias-Plus-Two" }),
+      "Test/Alias-Plus-Two");
+
+    const copy = vtimezoneFor("Test/Alias-Plus-Two");
+
+    expect(tzidOf(copy)).toBe("Test/Alias-Plus-Two");
+    expect(tzidOf(described)).toBe("Test/Fixed-Plus-Two");
+  });
+
   it("бросает понятную ошибку для неизвестного пояса", () => {
     expect(() => vtimezoneFor("Mars/Olympus_Mons")).toThrow(/Неизвестный часовой пояс/);
   });

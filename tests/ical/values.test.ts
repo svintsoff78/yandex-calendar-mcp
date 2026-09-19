@@ -54,7 +54,32 @@ function floating(year: number, month: number, day: number, hour: number, minute
 function date(year: number, month: number, day: number) {
   return ICAL.Time.fromData({ year, month, day, isDate: true });
 }
+function utcAt(ms: number) {
+  const time = utc(1970, 1, 1, 0);
+  time.fromUnixTime(ms / 1000); // time.js, fromUnixTime — через UTC-поля Date
+  return time;
+}
 const T = (iso: string): SlotKey => `T:${Date.parse(iso) / 1000}`;
+
+// Независимый оракул стенного времени — Intl (ICU из Node), а не ical.js:
+// ical.js сама читает время из разрыва и повторного часа не по RFC 5545
+// §3.3.5 (контракт), поэтому проверять ею её же выбор нельзя. В тестах Intl
+// разрешён, в src/ical — нет.
+const intlFormats = new Map<string, Intl.DateTimeFormat>();
+function intlWall(ms: number, tzid: string): string {
+  let format = intlFormats.get(tzid);
+  if (!format) {
+    format = new Intl.DateTimeFormat("en-US", { timeZone: tzid, hourCycle: "h23", year: "numeric",
+      month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    intlFormats.set(tzid, format);
+  }
+  const p = Object.fromEntries(format.formatToParts(ms).map((part) => [part.type, part.value]));
+  return `${p.year}-${p.month}-${p.day}T${p.hour}:${p.minute}:${p.second}`;
+}
+function intlOffset(ms: number, tzid: string): number {
+  const wall = intlWall(ms, tzid);
+  return (Date.parse(`${wall}Z`) - ms) / 1000;
+}
 
 describe("formOf", () => {
   it("определяет форму свойства по записи: DATE, UTC, TZID, плавающее", () => {
@@ -142,6 +167,12 @@ describe("slotKeyOf (О3)", () => {
     expect(slotKeyOf(utc(2026, 10, 21, 7), "floating", moscowEnv)).toBe("F:2026-10-21T10:00:00");
     expect(slotKeyOf(date(2026, 10, 21), "floating", moscowEnv)).toBe("F:2026-10-21T00:00:00");
   });
+
+  it("плавающая серия в поясе западнее UTC: момент перед весенним переводом — его настоящее стенное время", () => {
+    // 06:30Z 08.03 = 01:30 EST; 02:30 в этот день не существует.
+    expect(slotKeyOf(utc(2026, 3, 8, 6, 30), "floating", newYorkEnv)).toBe("F:2026-03-08T01:30:00");
+    expect(slotKeyOf(floating(2026, 3, 8, 1, 30), "floating", newYorkEnv)).toBe("F:2026-03-08T01:30:00");
+  });
 });
 
 describe("compareSlotKeys", () => {
@@ -167,6 +198,15 @@ describe("wallDateOf", () => {
     expect(wallDateOf(zoned("Europe/Moscow", 2026, 10, 21, 2), moscowEnv, "America/New_York")).toBe("2026-10-20");
     expect(wallDateOf(floating(2026, 10, 21, 2), moscowEnv, "America/New_York")).toBe("2026-10-20");
     expect(wallDateOf(date(2026, 10, 21), moscowEnv, "America/New_York")).toBe("2026-10-21");
+  });
+
+  it("у пояса с переводом часов в полночь — дата момента по часам пояса, а не дата времени из разрыва", () => {
+    // Гавана 08.03: 00:00 CST → 01:00 CDT; 04:00Z = 23:00 CST 07.03.
+    expect(wallDateOf(utc(2026, 3, 8, 4), newYorkEnv, "America/Havana")).toBe("2026-03-07");
+    // Сантьяго 06.09: 00:00 −04 → 01:00 −03; 03:00Z = 23:00 05.09.
+    expect(wallDateOf(utc(2026, 9, 6, 3), newYorkEnv, "America/Santiago")).toBe("2026-09-05");
+    // Гавана 01.11: 01:00 CDT → 00:00 CST; 04:30Z = 00:30 CDT 01.11 (первое вхождение повторного часа).
+    expect(wallDateOf(utc(2026, 11, 1, 4, 30), newYorkEnv, "America/Havana")).toBe("2026-11-01");
   });
 });
 
@@ -307,6 +347,89 @@ describe("timeInForm (О4)", () => {
     expect(lost).toEqual(["2026-10-25T00:00:00Z", "2026-10-25T00:30:00Z"]);
   });
 
+  it("в поясе западнее UTC момент перед весенним переводом пишется настоящим стенным временем, а не временем из разрыва", () => {
+    // 06:30Z 08.03 = 01:30 EST. Стенное 02:30 не существует: ical.js прочтёт
+    // его в тот же 06:30Z (смещение после разрыва), а RFC 5545 §3.3.5 и
+    // другие клиенты — в 07:30Z (смещение до разрыва), на час позже.
+    const wall = timeInForm(utc(2026, 3, 8, 6, 30), "zoned", "America/New_York", newYorkEnv);
+    expect(wall.toString()).toBe("2026-03-08T01:30:00");
+    expect(instantOf(wall, newYorkEnv)).toBe(Date.UTC(2026, 2, 8, 6, 30));
+
+    const e = vevent("DTSTART;TZID=America/New_York:20260301T013000", "RRULE:FREQ=DAILY");
+    expect(setTimeProperty(e, "recurrence-id", wall).toICALString())
+      .toBe("RECURRENCE-ID;TZID=America/New_York:20260308T013000");
+    expect(addListValue(e, "exdate", wall).toICALString()).toBe("EXDATE;TZID=America/New_York:20260308T013000");
+  });
+
+  it("первое вхождение повторного часа пишет стенным временем по RFC 5545 §3.3.5, как его прочтут другие клиенты", () => {
+    // 00:30Z 25.10 = 02:30 CEST, первое вхождение. ical.js читает 02:30 как
+    // второе (CET, 01:30Z), так что в ней этот момент невыразим; по RFC 02:30 —
+    // именно первое вхождение. Прежний запасной путь (convertToZone) давал
+    // 01:30 CEST — на час раньше для всех читателей.
+    expect(timeInForm(utc(2026, 10, 25, 0, 30), "zoned", "Europe/Berlin", moscowEnv).toString())
+      .toBe("2026-10-25T02:30:00");
+    // Нью-Йорк 01.11: 05:30Z = 01:30 EDT, первое вхождение.
+    expect(timeInForm(utc(2026, 11, 1, 5, 30), "zoned", "America/New_York", newYorkEnv).toString())
+      .toBe("2026-11-01T01:30:00");
+  });
+
+  it.each([
+    "America/New_York", "America/Chicago", "America/Los_Angeles", "America/Denver", "America/Halifax",
+    "America/St_Johns", "America/Havana", "America/Santiago", "Europe/Berlin", "Europe/London",
+    "Australia/Sydney", "Australia/Lord_Howe", "Pacific/Chatham",
+  ])("стенное время совпадает с Intl у каждого перехода часов 2026 года: %s", (tzid) => {
+    // Переходы ищутся по Intl: смещение в полдень UTC соседних суток разное.
+    const transitions: number[] = [];
+    for (let day = 0; day < 365; day++) {
+      const noon = Date.UTC(2026, 0, 1 + day, 12);
+      if (intlOffset(noon, tzid) !== intlOffset(noon + 86_400_000, tzid)) transitions.push(noon);
+    }
+    expect(transitions).toHaveLength(2);
+
+    const wrongWall: string[] = [];
+    const lostMoment: string[] = [];
+    const firstOfRepeated: string[] = [];
+    for (const noon of transitions) {
+      const points: number[] = [];
+      for (let ms = noon - 12 * 3_600_000; ms < noon + 36 * 3_600_000; ms += 15 * 60_000) points.push(ms);
+      const walls = points.map((ms) => intlWall(ms, tzid));
+      points.forEach((ms, index) => {
+        const label = new Date(ms).toISOString();
+        const wall = timeInForm(utcAt(ms), "zoned", tzid, newYorkEnv);
+        if (wall.toString() !== walls[index]) wrongWall.push(`${label} → ${wall.toString()}, Intl ${walls[index]}`);
+        if (instantOf(wall, newYorkEnv) !== ms) lostMoment.push(label);
+        // Первое вхождение повторного часа: то же стенное время будет ещё раз позже.
+        if (walls.indexOf(walls[index], index + 1) !== -1) firstOfRepeated.push(label);
+      });
+    }
+
+    expect(wrongWall).toEqual([]);
+    // Момент теряется только там, где ical.js стенное время не выражает
+    // вовсе: неоднозначное время она читает как второе вхождение.
+    expect(firstOfRepeated.length).toBeGreaterThan(0);
+    expect(lostMoment).toEqual(firstOfRepeated);
+  });
+
+  it("форма zoned с поясом UTC остаётся zoned: RID и EXDATE пишутся с TZID, а не с Z", () => {
+    // ical.js на имена UTC, GMT и Z отдаёт общий utcTimezone, время в котором
+    // пишется с Z и без TZID (timezone_service.js, reset; time.js, toString).
+    const e = vevent("DTSTART;TZID=UTC:20261019T070000", "RRULE:FREQ=DAILY");
+    const dtstartZone = (e.getFirstPropertyValue("dtstart") as ICAL.Time).zone!;
+    expect(formOf(e.getFirstProperty("dtstart")!)).toBe("zoned");
+
+    for (const zone of ["UTC", dtstartZone]) {
+      const rid = timeInForm(zoned("Europe/Moscow", 2026, 10, 21, 10), "zoned", zone, moscowEnv);
+      expect(formOf(rid)).toBe("zoned");
+      expect(rid.toString()).toBe("2026-10-21T07:00:00");
+      expect(instantOf(rid, moscowEnv)).toBe(Date.UTC(2026, 9, 21, 7));
+      expect(slotKeyOf(rid, "zoned", moscowEnv)).toBe(T("2026-10-21T07:00:00Z"));
+      expect(setTimeProperty(e, "recurrence-id", rid).toICALString()).toBe("RECURRENCE-ID;TZID=UTC:20261021T070000");
+      expect(addListValue(e, "exdate", rid).toICALString()).toBe("EXDATE;TZID=UTC:20261021T070000");
+    }
+    expect(setTimeProperty(e, "recurrence-id", timeInForm(utc(2026, 10, 21, 7), "zoned", "GMT", moscowEnv))
+      .toICALString()).toBe("RECURRENCE-ID;TZID=GMT:20261021T070000");
+  });
+
   it("форма zoned без пояса — ошибка", () => {
     expect(() => timeInForm(utc(2026, 10, 21, 7), "zoned", undefined, moscowEnv)).toThrow();
   });
@@ -324,7 +447,7 @@ describe("timeInForm (О4)", () => {
       utc(2026, 10, 20, 21, 30), floating(2026, 10, 21, 10), date(2026, 10, 21)];
     const forms: Array<[TimeForm, string | undefined]> =
       [["date", undefined], ["utc", undefined], ["zoned", "Europe/Moscow"], ["zoned", "America/New_York"],
-        ["floating", undefined]];
+        ["zoned", "UTC"], ["floating", undefined]];
 
     for (const env of [moscowEnv, newYorkEnv]) {
       for (const value of values) {
@@ -425,6 +548,35 @@ describe("ruleDict и setRuleDict", () => {
     expect(() => setRuleDict(rrule, { ...ruleDict(rrule), until: "20261030T065959Z" })).toThrow();
   });
 
+  it.each([
+    ["Europe/Moscow", "UNTIL=20261023T070000Z"],
+    ["America/New_York", "UNTIL=20261023T140000Z"],
+  ])("setRuleDict переводит UNTIL-время в поясе %s в UTC, и правило кончается на этой встрече", (tzid, text) => {
+    // RFC 5545 §3.3.10 и О4: при DTSTART с TZID UNTIL — в UTC. Плавающий UNTIL
+    // ical.js читает со смещением 0 (time.js, utcOffset и toUnixTime), и у
+    // серии западнее UTC последняя встреча отрезалась бы.
+    const e = vevent(`DTSTART;TZID=${tzid}:20261019T100000`, "RRULE:FREQ=DAILY");
+    const rrule = e.getFirstProperty("rrule")!;
+    setRuleDict(rrule, { ...ruleDict(rrule), until: zoned(tzid, 2026, 10, 23, 10) });
+
+    expect(rrule.toICALString()).toBe(`RRULE:FREQ=DAILY;${text}`);
+    const iterator = (rrule.getFirstValue() as ICAL.Recur).iterator(e.getFirstPropertyValue("dtstart") as ICAL.Time);
+    const seen: string[] = [];
+    for (let t = iterator.next(); t && seen.length < 10; t = iterator.next()) seen.push(t.toString());
+    expect(seen).toEqual(["2026-10-19T10:00:00", "2026-10-20T10:00:00", "2026-10-21T10:00:00",
+      "2026-10-22T10:00:00", "2026-10-23T10:00:00"]);
+  });
+
+  it("setRuleDict оставляет UNTIL-дату датой, а плавающее время — плавающим", () => {
+    const allDay = vevent("DTSTART;VALUE=DATE:20261019", "RRULE:FREQ=DAILY").getFirstProperty("rrule")!;
+    setRuleDict(allDay, { ...ruleDict(allDay), until: date(2026, 10, 23) });
+    expect(allDay.toICALString()).toBe("RRULE:FREQ=DAILY;UNTIL=20261023");
+
+    const wall = vevent("DTSTART:20261019T100000", "RRULE:FREQ=DAILY").getFirstProperty("rrule")!;
+    setRuleDict(wall, { ...ruleDict(wall), until: floating(2026, 10, 23, 10) });
+    expect(wall.toICALString()).toBe("RRULE:FREQ=DAILY;UNTIL=20261023T100000");
+  });
+
   it("ruleDict отвергает свойство не типа recur", () => {
     expect(() => ruleDict(vevent("DTSTART:20261019T070000Z").getFirstProperty("dtstart")!)).toThrow();
   });
@@ -509,6 +661,15 @@ describe("addListValue", () => {
     expect(text.indexOf("RDATE")).toBeLessThan(text.indexOf("BEGIN:VALARM"));
     expect(listEntries(e, "rdate", { form: "zoned", env: moscowEnv })[0].periodEnd?.toString())
       .toBe("2026-10-22T11:30:00");
+  });
+
+  it("пишет значение в его собственной форме и не переводит в форму серии — это обязанность вызывающего", () => {
+    const e = vevent("DTSTART;TZID=Europe/Moscow:20261019T100000", "RRULE:FREQ=DAILY");
+    const foreign = zoned("America/New_York", 2026, 10, 21, 3);
+
+    expect(addListValue(e, "exdate", foreign).toICALString()).toBe("EXDATE;TZID=America/New_York:20261021T030000");
+    expect(addListValue(e, "exdate", timeInForm(foreign, "zoned", "Europe/Moscow", moscowEnv)).toICALString())
+      .toBe("EXDATE;TZID=Europe/Moscow:20261021T100000");
   });
 
   it("не держит ссылку на переданный объект", () => {
@@ -608,6 +769,22 @@ describe("formatForModel (Р10)", () => {
     expect(formatForModel(date(2026, 10, 21), moscowEnv, "instance")).toBe("2026-10-21");
     expect(formatForModel(date(2026, 10, 21), moscowEnv, "time")).toBe("2026-10-21T00:00:00+03:00");
     expect(formatForModel(date(2026, 10, 21), newYorkEnv, "time")).toBe("2026-10-21T00:00:00-04:00");
+  });
+
+  it("смещение с секундами (исторический LMT) выводит в UTC: в ISO его не записать, момент остаётся точным", () => {
+    // ical.js 2.2.1 секунды TZOFFSETTO отбрасывает (контракт), поэтому такое
+    // смещение даёт только пояс с собственным utcOffset — он здесь и подставлен.
+    class SecondsZone extends ICAL.Timezone {
+      utcOffset(): number {
+        return 2 * 3600 + 30 * 60 + 17;
+      }
+    }
+    const time = ICAL.Time.fromData({ year: 2026, month: 10, day: 21, hour: 10, minute: 0, second: 0, isDate: false },
+      new SecondsZone({ tzid: "Test/LMT" }));
+
+    const iso = formatForModel(time, moscowEnv, "time");
+    expect(iso).toBe("2026-10-21T07:29:43+00:00");
+    expect(Date.parse(iso)).toBe(instantOf(time, moscowEnv));
   });
 
   it("выданный instanceStart разбирается обратно в тот же ключ слота", () => {

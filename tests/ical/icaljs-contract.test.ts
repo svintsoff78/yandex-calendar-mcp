@@ -28,6 +28,27 @@ function collect(next: () => ICAL.Time | null, limit = 50): string[] {
 const PLUS5 = ["BEGIN:VTIMEZONE", "TZID:Test/Plus5", "BEGIN:STANDARD", "TZOFFSETFROM:+0500",
   "TZOFFSETTO:+0500", "TZNAME:P5", "DTSTART:19700101T000000", "END:STANDARD", "END:VTIMEZONE"];
 
+// Нынешние правила IANA для двух поясов по обе стороны от UTC.
+const NEW_YORK = ["BEGIN:VTIMEZONE", "TZID:America/New_York",
+  "BEGIN:DAYLIGHT", "TZOFFSETFROM:-0500", "TZOFFSETTO:-0400", "TZNAME:EDT", "DTSTART:20070311T020000",
+  "RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=2SU", "END:DAYLIGHT",
+  "BEGIN:STANDARD", "TZOFFSETFROM:-0400", "TZOFFSETTO:-0500", "TZNAME:EST", "DTSTART:20071104T020000",
+  "RRULE:FREQ=YEARLY;BYMONTH=11;BYDAY=1SU", "END:STANDARD", "END:VTIMEZONE"];
+const BERLIN = ["BEGIN:VTIMEZONE", "TZID:Europe/Berlin",
+  "BEGIN:DAYLIGHT", "TZOFFSETFROM:+0100", "TZOFFSETTO:+0200", "TZNAME:CEST", "DTSTART:19810329T020000",
+  "RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU", "END:DAYLIGHT",
+  "BEGIN:STANDARD", "TZOFFSETFROM:+0200", "TZOFFSETTO:+0100", "TZNAME:CET", "DTSTART:19961027T030000",
+  "RRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU", "END:STANDARD", "END:VTIMEZONE"];
+
+// Значение DTSTART;TZID=<tzid>:<value> с поясом из дерева объекта (не из сервиса).
+function zonedFromTree(vtimezone: string[], tzid: string, value: string): ICAL.Time {
+  const root = new ICAL.Component(ICAL.parse(["BEGIN:VCALENDAR", "VERSION:2.0", ...vtimezone, "BEGIN:VEVENT",
+    "UID:tree", `DTSTART;TZID=${tzid}:${value}`, "END:VEVENT", "END:VCALENDAR"].join(CRLF)));
+  const time = root.getFirstSubcomponent("vevent")!.getFirstPropertyValue("dtstart") as ICAL.Time;
+  expect(time.zone!.tzid).toBe(tzid);
+  return time;
+}
+
 describe("контракт ical.js: сериализация (stringify.js, component.js, helpers.js)", () => {
   it("свойства выводятся перед подкомпонентами, исходный порядок вперемешку теряется", () => {
     // stringify.js, stringify.component: сначала все component[1], потом component[2].
@@ -300,6 +321,44 @@ describe("контракт ical.js: пояса и моменты (time.js, timez
     expect(relabelled.hour).toBe(10);
     expect(relabelled.toUnixTime()).toBe(Date.UTC(2026, 9, 21, 5, 0, 0) / 1000);
     expect(floating.zone).toBe(ICAL.Timezone.localTimezone);
+  });
+
+  it("несуществующее время из весеннего разрыва читается со смещением после разрыва, а RFC 5545 — до него", () => {
+    // timezone.js:287-364, utcOffset: у перехода с ростом смещения граница
+    // сравнивается в стенном времени до перехода (change + prevUtcOffset), и
+    // всё начиная с 02:00 получает новое смещение. RFC 5545 §3.3.5: время из
+    // разрыва читается со смещением до разрыва, 02:30 → 07:30Z.
+    const gap = zonedFromTree(NEW_YORK, "America/New_York", "20260308T023000");
+    expect(gap.utcOffset()).toBe(-4 * 3600);
+    expect(gap.toUnixTime() * 1000).toBe(Date.UTC(2026, 2, 8, 6, 30));
+
+    // Настоящее время того же момента — 01:30 EST; ical.js читает и его в 06:30Z.
+    const real = zonedFromTree(NEW_YORK, "America/New_York", "20260308T013000");
+    expect(real.toUnixTime()).toBe(gap.toUnixTime());
+  });
+
+  it("неоднозначное время повторного часа читается как второе вхождение, а RFC 5545 — как первое", () => {
+    // timezone.js:287-364, utcOffset: у перехода с падением смещения граница —
+    // change + utcOffset (стенное время после перехода), а ветка с
+    // `want_daylight = false` оставляет стандартное смещение. RFC 5545 §3.3.5:
+    // 02:30 25.10 в Берлине — первое вхождение, CEST, 00:30Z.
+    const ambiguous = zonedFromTree(BERLIN, "Europe/Berlin", "20261025T023000");
+    expect(ambiguous.utcOffset()).toBe(1 * 3600);
+    expect(ambiguous.toUnixTime() * 1000).toBe(Date.UTC(2026, 9, 25, 1, 30));
+
+    const ambiguousNewYork = zonedFromTree(NEW_YORK, "America/New_York", "20261101T013000");
+    expect(ambiguousNewYork.toUnixTime() * 1000).toBe(Date.UTC(2026, 10, 1, 6, 30));
+  });
+
+  it("секунды в TZOFFSETTO (исторические LMT) отбрасываются: смещение всегда в целых минутах", () => {
+    // utc_offset.js:25-33, fromString — «TODO: support seconds per rfc5545»;
+    // timezone.js, _expandComponent, convert_tzoffset — только часы и минуты.
+    const lmt = ["BEGIN:VTIMEZONE", "TZID:Test/LMT", "BEGIN:STANDARD", "TZOFFSETFROM:+023017",
+      "TZOFFSETTO:+023017", "TZNAME:LMT", "DTSTART:18000101T000000", "END:STANDARD", "END:VTIMEZONE"];
+    const time = zonedFromTree(lmt, "Test/LMT", "20261021T100000");
+
+    expect(time.utcOffset()).toBe(2 * 3600 + 30 * 60);
+    expect(time.toUnixTime() * 1000).toBe(Date.UTC(2026, 9, 21, 7, 30));
   });
 
   it("toString даёт jCal-строку: Z только у utcTimezone, у даты — без времени", () => {

@@ -42,11 +42,18 @@ export interface KeyContext {
 
 /**
  * Пояс: имя TZID (ищется в ICAL.TimezoneService, иначе в базе IANA) или
- * готовый объект. В контексте календарного объекта передавайте зону из его
- * дерева (`zone` значения DTSTART основного): Яндекс заменяет вложенный
- * VTIMEZONE полным историческим описанием (docs/yandex-caldav-capabilities.md,
- * Ж10), а по имени берётся описание из базы, где у многих поясов только
- * нынешнее правило.
+ * готовый объект.
+ *
+ * В контексте календарного объекта передавайте зону из его дерева (`zone`
+ * значения DTSTART основного), а не имя: Яндекс заменяет вложенный VTIMEZONE
+ * полным историческим описанием (docs/yandex-caldav-capabilities.md, Ж10), а
+ * по имени берётся описание из базы @touch4it/ical-timezones 1.9.0. База
+ * устарела не только для истории, но и для нынешних правил: при сверке с
+ * Intl за 2026 год America/Sao_Paulo в ней ещё с летним временем,
+ * America/Mexico_City, Asia/Tehran и Asia/Almaty расходятся на час весь год
+ * или его значительную часть, Europe/Kyiv в базе нет. Имя годится только для
+ * пояса, которого в дереве нет (новое событие, пояс календаря), и для
+ * синонимов UTC (см. `timeInForm`).
  */
 export type ZoneRef = string | ICAL.Timezone;
 
@@ -145,7 +152,9 @@ export function compareSlotKeys(a: SlotKey, b: SlotKey): number {
  * - `date` — буквальная дата записи `t`;
  * - `utc` — момент `t` в UTC;
  * - `zoned` — момент `t` стенным временем пояса `zone`; если `t` уже в поясе
- *   с тем же TZID — то же стенное время, но с переданным объектом пояса;
+ *   с тем же TZID — то же стенное время, но с переданным объектом пояса.
+ *   Пояс с именем UTC, GMT или Z тоже даёт форму zoned (значение пишется с
+ *   TZID, а не с Z) — см. `zonedTarget`;
  * - `floating` — стенное время `t` в поясе календаря без пояса.
  *
  * Дата в формах со временем — полночь в поясе календаря (как в `instantOf`),
@@ -159,7 +168,7 @@ export function timeInForm(t: ICAL.Time, form: TimeForm, zone: ZoneRef | undefin
       return fromUnix(instantSeconds(t, env));
     case "zoned": {
       if (zone === undefined) throw new Error("Для формы zoned нужен пояс (TZID DTSTART серии).");
-      const target = resolveZone(zone);
+      const target = zonedTarget(zone);
       if (isFloatingZone(target)) throw new Error("Пояс floating не годится для формы zoned.");
       if (!t.isDate && formOf(t) === "zoned" && t.zone.tzid === target.tzid) return withWall(t, target);
       return atInstant(instantSeconds(t, env), target);
@@ -241,8 +250,10 @@ export function ruleDict(p: ICAL.Property): RuleDict {
  * Записывает словарь правила в свойство и сбрасывает кеш разобранного
  * значения (property.js, removeAllValues: `_values.length = 0`,
  * `jCal.length = 3`). Порядок ключей сохраняется; части со значением `null`
- * или `undefined` снимаются; UNTIL приводится к jCal-строке. После вызова
- * живой словарь — новый: берите его заново через `ruleDict`.
+ * или `undefined` снимаются; UNTIL приводится к jCal-строке, причём
+ * ICAL.Time с поясом переводится в UTC (`…Z`), а дата, UTC и плавающее
+ * время пишутся как есть — форму под DTSTART (О4) выбирает вызывающий код.
+ * После вызова живой словарь — новый: берите его заново через `ruleDict`.
  */
 export function setRuleDict(p: ICAL.Property, d: RuleDictInput): void {
   assertRecur(p);
@@ -295,10 +306,11 @@ export function listKeys(c: ICAL.Component, name: ListName, o: KeyContext): Slot
 /**
  * Добавляет значение отдельным новым свойством `name` в форме самого
  * значения (DATE — `VALUE=DATE`, с поясом — `TZID`, UTC — `Z`, плавающее —
- * без пояса); имеющиеся свойства не трогаются. Значение сначала переводится
- * в форму серии (`timeInForm`), дубли проверяет вызывающий код по `listKeys`.
- * Новое свойство встаёт в конец списка свойств — при выводе всё равно до
- * подкомпонентов (stringify.js, stringify.component).
+ * без пояса); имеющиеся свойства не трогаются. Функция значение НЕ
+ * переводит: вызывающий код обязан сначала привести его к форме серии через
+ * `timeInForm` (О4 — та же форма и тот же TZID, что у DTSTART) и проверить
+ * дубли по `listKeys`. Новое свойство встаёт в конец списка свойств — при
+ * выводе всё равно до подкомпонентов (stringify.js, stringify.component).
  */
 export function addListValue(c: ICAL.Component, name: ListName, value: ICAL.Time | ICAL.Period): ICAL.Property {
   if (name === "exdate" && value instanceof ICAL.Period) throw new Error("EXDATE не принимает PERIOD.");
@@ -473,6 +485,38 @@ function resolveZone(zone: ZoneRef): ICAL.Timezone {
   return typeof zone === "string" ? registerTimeZone(zone) : zone;
 }
 
+// Пояса для формы zoned с именами-синонимами UTC, по имени TZID.
+const utcAliasZones = new Map<string, ICAL.Timezone>();
+
+/**
+ * Пояс для формы zoned. На имена UTC, GMT и Z ical.js отдаёт общий
+ * `utcTimezone` (timezone_service.js, reset), а время в нём пишется с Z и без
+ * TZID (time.js, toString) — это форма utc. Серии с `DTSTART;TZID=UTC:…`
+ * нужна форма zoned с тем же TZID (О4), поэтому вместо `utcTimezone` берётся
+ * отдельный пояс с нулевым смещением и тем же именем. Объект `utcTimezone`
+ * имени не хранит (его tzid всегда "UTC"): для TZID=GMT или Z передавайте
+ * имя строкой.
+ */
+function zonedTarget(zone: ZoneRef): ICAL.Timezone {
+  const resolved = resolveZone(zone);
+  if (resolved !== ICAL.Timezone.utcTimezone) return resolved;
+
+  const tzid = typeof zone === "string" ? zone : resolved.tzid;
+  let alias = utcAliasZones.get(tzid);
+  if (!alias) {
+    // Смещение пояса ical.js считает по подкомпонентам VTIMEZONE
+    // (timezone.js, _ensureCoverage, _expandComponent), поэтому нужен
+    // компонент с одним STANDARD и нулевым смещением.
+    const component = new ICAL.Component(["vtimezone", [["tzid", {}, "text", tzid]], [
+      ["standard", [["tzoffsetfrom", {}, "utc-offset", "+00:00"], ["tzoffsetto", {}, "utc-offset", "+00:00"],
+        ["dtstart", {}, "date-time", "1970-01-01T00:00:00"]], []],
+    ]]);
+    alias = new ICAL.Timezone({ component, tzid });
+    utcAliasZones.set(tzid, alias);
+  }
+  return alias;
+}
+
 function isFloatingZone(zone: ICAL.Timezone | null | undefined): boolean {
   return !zone || zone === ICAL.Timezone.localTimezone || zone.tzid === "floating";
 }
@@ -496,29 +540,50 @@ function fromUnix(seconds: number): ICAL.Time {
   return time;
 }
 
+const DAY_SECONDS = 86_400;
+
 /**
- * Момент стенным временем пояса `zone`.
+ * Момент стенным временем пояса `zone` — тем, которым этот момент записывает
+ * RFC 5545 §3.3.5 и показывают другие клиенты.
  *
  * `convertToZone` из UTC ошибается у перехода часов: смещение он берёт по
  * UTC-полям, прочитанным как стенное время (timezone.js, convert_time:
  * `to_zone.utcOffset(tt)` до сдвига). Проба: 2026-03-29T01:00Z в
- * Europe/Berlin даёт 02:00 (несуществующее время, обратно — 00:00Z) вместо
- * 03:00. Поэтому стенное время подбирается так, чтобы ical.js сам прочёл его
- * обратно в тот же момент (`toUnixTime` при `utcOffset` зоны). Если такого
- * стенного времени нет (первое вхождение повторного часа осенью: ical.js
- * читает неоднозначное время как второе), остаётся результат convertToZone.
+ * Europe/Berlin даёт 02:00 (несуществующее время) вместо 03:00.
+ *
+ * Поэтому смещение берётся из вариантов по обе стороны возможного перехода:
+ * смещения стенного времени за сутки до момента, в сам момент и через сутки
+ * (считается, что два перехода одного пояса не ближе двух суток). Из
+ * вариантов, которые ical.js читает обратно в тот же момент, выбирается
+ * наименьшее стенное время. Второй такой вариант бывает только у моментов
+ * перед весенним переводом, на его величину: стенное время из разрыва (в
+ * Нью-Йорке 08.03 06:30Z → 02:30 вместо 01:30 EST) ical.js читает со
+ * смещением после разрыва (timezone.js:287-364, utcOffset), а RFC 5545 и
+ * другие клиенты — со смещением до разрыва, на час позже. Время из разрыва
+ * всегда позже настоящего, так что наименьшее — настоящее.
+ *
+ * Если ни один вариант не читается обратно (первое вхождение повторного часа
+ * осенью: ical.js читает неоднозначное время как второе вхождение), берётся
+ * наибольшее смещение — смещение до перехода. Такое стенное время по RFC
+ * 5545 означает именно этот момент, а ical.js прочтёт его позже на величину
+ * перевода (контракт в tests/ical/icaljs-contract.test.ts). Прежний запасной
+ * путь через convertToZone давал в поясах западнее UTC время на час раньше
+ * для всех читателей, а в Гаване — ещё и предыдущую дату.
  */
 function atInstant(seconds: number, zone: ICAL.Timezone): ICAL.Time {
   const utc = fromUnix(seconds);
   if (zone === ICAL.Timezone.utcTimezone) return utc;
 
-  let guess = withWall(utc, zone);
-  for (let attempt = 0; attempt < 4; attempt++) {
-    const candidate = withWall(fromUnix(seconds + guess.utcOffset()), zone);
-    if (candidate.toUnixTime() === seconds) return candidate;
-    guess = candidate;
+  const offsets = new Set<number>();
+  for (const shift of [-DAY_SECONDS, 0, DAY_SECONDS]) {
+    offsets.add(withWall(fromUnix(seconds + shift), zone).utcOffset());
   }
-  return utc.convertToZone(zone);
+  let readBack: number | undefined;
+  for (const offset of offsets) {
+    if (withWall(fromUnix(seconds + offset), zone).toUnixTime() !== seconds) continue;
+    if (readBack === undefined || offset < readBack) readBack = offset;
+  }
+  return withWall(fromUnix(seconds + (readBack ?? Math.max(...offsets))), zone);
 }
 
 // Новое время с теми же стенными полями в поясе zone.
@@ -547,6 +612,10 @@ function wallString(t: ICAL.Time): string {
 
 // ISO со смещением пояса значения. Смещение с секундами (исторические LMT)
 // в ISO не записать — тогда время выводится в UTC, момент остаётся точным.
+// ical.js 2.2.1 секунды TZOFFSETTO отбрасывает (utc_offset.js, fromString —
+// «TODO: support seconds»; контракт), так что из VTIMEZONE такое смещение
+// сейчас не приходит; ветка — на случай пояса с собственным utcOffset или
+// новой версии библиотеки.
 function isoWithOffset(t: ICAL.Time): string {
   const offset = t.utcOffset();
   if (offset % 60 !== 0) return `${wallString(fromUnix(t.toUnixTime()))}+00:00`;
@@ -579,8 +648,15 @@ function assertRecur(p: ICAL.Property): void {
 
 const UNTIL_PATTERN = /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}:\d{2}Z?)?$/;
 
+// UNTIL-объект: время с поясом — момент в UTC (RFC 5545 §3.3.10, О4: при
+// DTSTART с TZID UNTIL задаётся в UTC). Иначе toString дал бы стенное время
+// без Z и TZID, то есть плавающее, а плавающий UNTIL ical.js читает со
+// смещением 0 (time.js:1136 utcOffset, 1340 toUnixTime) — у серии западнее
+// UTC последняя встреча отрезалась бы. Дата, UTC и плавающее — как есть.
 function untilString(value: RuleValue | ICAL.Time): string {
-  if (value instanceof ICAL.Time) return value.toString();
+  if (value instanceof ICAL.Time) {
+    return formOf(value) === "zoned" ? fromUnix(value.toUnixTime()).toString() : value.toString();
+  }
   if (typeof value === "string" && UNTIL_PATTERN.test(value)) return value;
   throw new Error(
     `UNTIL должен быть jCal-строкой YYYY-MM-DD или YYYY-MM-DDTHH:MM:SS[Z], получено ${JSON.stringify(value)}.`,
