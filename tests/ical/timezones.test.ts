@@ -1,6 +1,6 @@
 import ICAL from "ical.js";
 import { describe, expect, it } from "vitest";
-import { registerTimeZone } from "../../src/ical/timezones.js";
+import { registerTimeZone, vtimezoneFor } from "../../src/ical/timezones.js";
 
 // Сырое (без обёртки BEGIN:VCALENDAR) описание пояса, как оно приходит вложенным
 // в calendar-data события с сервера Яндекса.
@@ -47,5 +47,74 @@ describe("registerTimeZone", () => {
 
   it("бросает понятную ошибку для неизвестного пояса без базы и без явного VTIMEZONE", () => {
     expect(() => registerTimeZone("Mars/Olympus_Mons")).toThrow(/Неизвестный часовой пояс/);
+  });
+
+  it("у пояса-синонима tzid совпадает с запрошенным именем, а не с каноническим из базы", () => {
+    // База отдаёт для US/Eastern описание с TZID:America/New_York. Если tzid
+    // зоны взять из описания, RECURRENCE-ID и EXDATE, записанные по её tzid,
+    // получат другой TZID, чем DTSTART (нарушение О4 плана).
+    const zone = registerTimeZone("US/Eastern");
+    const time = new ICAL.Time(
+      { year: 2026, month: 10, day: 21, hour: 10, minute: 0, second: 0, isDate: false },
+      zone,
+    );
+
+    expect(zone.tzid).toBe("US/Eastern");
+    expect(time.utcOffset()).toBe(-4 * 3600);
+  });
+});
+
+describe("vtimezoneFor", () => {
+  function tzidOf(component: ICAL.Component): unknown {
+    return component.getFirstPropertyValue("tzid");
+  }
+
+  it("отдаёт VTIMEZONE из базы IANA с запрошенным TZID", () => {
+    const component = vtimezoneFor("Europe/Berlin");
+    const zone = new ICAL.Timezone({ component, tzid: "Europe/Berlin" });
+
+    expect(component.name).toBe("vtimezone");
+    expect(tzidOf(component)).toBe("Europe/Berlin");
+    expect(new ICAL.Time({ year: 2026, month: 7, day: 1, hour: 12, minute: 0, second: 0, isDate: false }, zone)
+      .utcOffset()).toBe(2 * 3600);
+    expect(new ICAL.Time({ year: 2026, month: 12, day: 1, hour: 12, minute: 0, second: 0, isDate: false }, zone)
+      .utcOffset()).toBe(1 * 3600);
+  });
+
+  it("каждый вызов даёт независимую копию без родителя, общий пояс сервиса не трогается", () => {
+    const service = registerTimeZone("Europe/Moscow").component;
+    const before = service.toString();
+    const first = vtimezoneFor("Europe/Moscow");
+    const second = vtimezoneFor("Europe/Moscow");
+
+    expect(first).not.toBe(second);
+    expect(first).not.toBe(service);
+    expect(first.jCal).not.toBe(second.jCal);
+    expect(first.parent).toBeNull();
+
+    const calendar = new ICAL.Component(["vcalendar", [], []]);
+    calendar.addSubcomponent(first);
+    first.updatePropertyWithValue("x-lic-location", "изменено");
+
+    expect(second.toString()).toBe(service.toString());
+    expect(service.toString()).toBe(before);
+    expect(registerTimeZone("Europe/Moscow").component).toBe(service);
+  });
+
+  it("у синонима ставит в TZID запрошенное имя", () => {
+    expect(tzidOf(vtimezoneFor("US/Eastern"))).toBe("US/Eastern");
+    expect(tzidOf(vtimezoneFor("UTC"))).toBe("UTC");
+  });
+
+  it("пояс вне базы берёт из уже зарегистрированного описания", () => {
+    registerTimeZone("Test/Fixed-Plus-Two", RAW_VTIMEZONE);
+    const component = vtimezoneFor("Test/Fixed-Plus-Two");
+
+    expect(tzidOf(component)).toBe("Test/Fixed-Plus-Two");
+    expect(component).not.toBe(registerTimeZone("Test/Fixed-Plus-Two").component);
+  });
+
+  it("бросает понятную ошибку для неизвестного пояса", () => {
+    expect(() => vtimezoneFor("Mars/Olympus_Mons")).toThrow(/Неизвестный часовой пояс/);
   });
 });
