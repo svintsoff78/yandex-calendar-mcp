@@ -256,10 +256,87 @@ describe("неразбираемый объект (Р4)", () => {
     expect(event.anomalies?.[0]).toMatch(/^unparsable: /);
   });
 
-  it("eventOfObject у разобранного объекта — то же, что parseEvent", () => {
-    const meta = { calendarId: "work", etag: "5" };
-    expect(eventOfObject(loadObject(seeds.weeklyMoscow.ics, MSK), meta, MSK)).toEqual(
-      parseEvent(seeds.weeklyMoscow.ics, "work", "5", MSK),
-    );
+  // Ревью З09: прежний тест сравнивал eventOfObject с parseEvent, который сам
+  // зовёт eventOfObject, и ошибки ни в одной из них не ловил. Здесь — явные
+  // ожидаемые поля.
+  it("eventOfObject у разобранного объекта — основной компонент с повтором, exceptions и напоминаниями модели", () => {
+    const ics = calendarOf(MOSCOW_ZONE,
+      override("20261021T100000", "20261021T150000", "20261021T160000", "SUMMARY:Перенесена"),
+      vevent([...WEEKLY, "EXDATE;TZID=Europe/Moscow:20261026T100000", "LOCATION:Переговорная",
+        "BEGIN:VALARM", "ACTION:DISPLAY", "TRIGGER:-PT15M", "END:VALARM",
+        "BEGIN:VALARM", "ACTION:AUDIO", "TRIGGER:-PT5M", "END:VALARM"]));
+
+    const event = eventOfObject(loadObject(ics, MSK), { calendarId: "work", etag: "5", href: "/c/w/p.ics" }, MSK);
+    expect(event).toEqual({
+      id: UID,
+      calendarId: "work",
+      summary: "Планёрка",
+      location: "Переговорная",
+      start: "2026-10-19T10:00:00+03:00",
+      end: "2026-10-19T11:00:00+03:00",
+      timeZone: "Europe/Moscow",
+      allDay: false,
+      reminders: [{ minutesBefore: 15, method: "display" }],
+      attendees: [],
+      recurrence: { frequency: "weekly", interval: 1, byWeekday: ["MO", "WE"], count: 6 },
+      recurring: true,
+      etag: "5",
+      href: "/c/w/p.ics",
+      exceptions: [
+        {
+          instanceStart: "2026-10-21T10:00:00+03:00",
+          state: "moved",
+          start: "2026-10-21T15:00:00+03:00",
+          end: "2026-10-21T16:00:00+03:00",
+          summary: "Перенесена",
+          reason: expect.stringContaining("перенесена"),
+        },
+        { instanceStart: "2026-10-26T10:00:00+03:00", state: "excluded", reason: expect.stringContaining("EXDATE") },
+      ],
+    });
+  });
+});
+
+// Р3: серия без встреч от другого клиента («зомби») видна только в get_event,
+// и там должно быть сказано, что она пуста и как её удалить.
+describe("серия без встреч — аномалия empty-series (Р3)", () => {
+  const EMPTY = [
+    "DTSTART;TZID=Europe/Moscow:20261019T100000", "DTEND;TZID=Europe/Moscow:20261019T110000",
+    "RRULE:FREQ=WEEKLY;BYDAY=MO,WE;COUNT=2", "SUMMARY:Зомби",
+  ];
+  const emptySeries = (event: { anomalies?: string[] }) => (event.anomalies ?? []).filter((a) => a.startsWith("empty-series: "));
+
+  it("все встречи закрыты EXDATE, отдельных нет — empty-series с подсказкой удалить через all_series", () => {
+    const ics = calendarOf(MOSCOW_ZONE,
+      vevent([...EMPTY, "EXDATE;TZID=Europe/Moscow:20261019T100000,20261021T100000"]),
+      // Скрытый след прошлого удаления пустоте не мешает.
+      override("20261021T100000", "20261021T150000", "20261021T160000", "SUMMARY:След"));
+
+    const viaParse = parseEvent(ics, "work", "1", MSK);
+    expect(emptySeries(viaParse)).toHaveLength(1);
+    expect(emptySeries(viaParse)[0]).toContain("all_series");
+    expect(emptySeries(eventOfObject(loadObject(ics, MSK), { calendarId: "work" }, MSK))).toHaveLength(1);
+  });
+
+  it("одна встреча жива или есть detached — empty-series нет", () => {
+    const oneLeft = calendarOf(MOSCOW_ZONE, vevent([...EMPTY, "EXDATE;TZID=Europe/Moscow:20261019T100000"]));
+    const withDetached = calendarOf(MOSCOW_ZONE,
+      vevent([...EMPTY, "EXDATE;TZID=Europe/Moscow:20261019T100000,20261021T100000"]),
+      override("20261020T100000", "20261020T100000", "20261020T110000", "SUMMARY:Отдельная"));
+
+    expect(emptySeries(parseEvent(oneLeft, "work", "1", MSK))).toEqual([]);
+    expect(emptySeries(parseEvent(withDetached, "work", "1", MSK))).toEqual([]);
+    expect(emptySeries(parseEvent(seeds.weeklyMoscow.ics, "work", "1", MSK))).toEqual([]);
+  });
+
+  it("bad-rrule с закрытым DTSTART — empty-series нет: какие встречи назначило правило, неизвестно", () => {
+    const ics = calendarOf(MOSCOW_ZONE, vevent([
+      "DTSTART;TZID=Europe/Moscow:20261019T100000", "DTEND;TZID=Europe/Moscow:20261019T110000",
+      "RRULE:FREQ=MONTHLY;BYWEEKNO=2", "EXDATE;TZID=Europe/Moscow:20261019T100000", "SUMMARY:Плохое правило",
+    ]));
+
+    const event = parseEvent(ics, "work", "1", MSK);
+    expect(event.anomalies?.some((a) => a.startsWith("bad-rrule: "))).toBe(true);
+    expect(emptySeries(event)).toEqual([]);
   });
 });

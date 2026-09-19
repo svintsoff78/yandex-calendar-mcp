@@ -2,6 +2,7 @@ import ICAL from "ical.js";
 import type { CalendarEvent, Recurrence, RecurrenceFrequency, Reminder } from "../types.js";
 import { instanceAt, toCalendarEvent, type EventMeta } from "./instances.js";
 import { isUnparsable, loadObject, splitContentLine, type CalendarObject, type Unparsable } from "./object.js";
+import { isEmpty } from "./slots.js";
 import { registerTimeZone } from "./timezones.js";
 import { formatForModel, type IcalEnv } from "./values.js";
 
@@ -13,11 +14,12 @@ import { formatForModel, type IcalEnv } from "./values.js";
  * `toCalendarEvent` (instances.ts): основной компонент — VEVENT без
  * RECURRENCE-ID, где бы он ни стоял (О1); у объекта без основного — первая
  * по адресу встреча (Р6); отступления серии — в `exceptions` (Р5–Р7),
- * аномалии — в `anomalies`. Свой разбор полей здесь не ведётся, кроме двух
+ * аномалии — в `anomalies`. Свой разбор полей здесь не ведётся, кроме трёх
  * вещей, которых instances.ts не делает:
  * - напоминания — только те, что модель умеет вернуть при правке
  *   (`modelReminders`, О9);
- * - заглушка для текста, который ical.js не разбирает (`unparsableEvent`, Р4).
+ * - заглушка для текста, который ical.js не разбирает (`unparsableEvent`, Р4);
+ * - аномалия empty-series у объекта без единой встречи (Р3).
  *
  * Пояс процесса не участвует: даты и плавающее время читаются в поясе
  * календаря из `IcalEnv.floatingZone`, моменты — через values.ts.
@@ -69,13 +71,17 @@ export function parseEvent(ics: string, calendarId: string, etag?: string, env: 
 }
 
 /**
- * Объект целиком для get_event (Р4–Р7): у разобранного — как `parseEvent`,
- * у неразбираемого — заглушка `unparsableEvent`.
+ * Объект целиком для get_event (Р3–Р7): у разобранного — как `parseEvent`,
+ * у неразбираемого — заглушка `unparsableEvent`. У объекта без единой
+ * встречи («зомби» другого клиента) — аномалия empty-series с подсказкой,
+ * как его удалить (Р3).
  */
 export function eventOfObject(o: CalendarObject | Unparsable, meta: EventMeta, env: IcalEnv): CalendarEvent {
   if (isUnparsable(o)) return unparsableEvent(o, meta, env);
   const event = toCalendarEvent(o, "object", meta);
   event.reminders = modelReminders(objectShown(o));
+  const empty = emptySeriesAnomaly(o);
+  if (empty) event.anomalies = [...(event.anomalies ?? []), empty];
   return event;
 }
 
@@ -169,6 +175,20 @@ export function unparsableEvent(u: Unparsable, meta: EventMeta, env: IcalEnv): C
 }
 
 // ─────────────────────────────── внутреннее ───────────────────────────────
+
+// Р3: у объекта не осталось ни одной встречи — все слоты закрыты EXDATE
+// (или EXRULE), отдельных встреч (detached) нет; скрытые переопределения —
+// следы прошлых удалений — пустоте не мешают (slots.ts, isEmpty: полный
+// проход без горизонта, сбой или предел — «не пуст»). В list_events и
+// find_free_slots такого объекта нет, так что сказать о нём может только
+// get_event. У правила, которое итератор не перебирает (bad-rrule), слоты
+// читаются без правила (slots.ts, specOf), и пустоту не узнать — аномалии нет.
+function emptySeriesAnomaly(o: CalendarObject): string | undefined {
+  if (o.anomalies.some((anomaly) => anomaly.code === "bad-rrule")) return undefined;
+  if (!isEmpty(o)) return undefined;
+  return "empty-series: у события не осталось ни одной встречи — все закрыты EXDATE (или EXRULE), отдельных встреч нет, " +
+    "и времени оно не занимает. Удалить его можно только целиком: delete_event со scope all_series";
+}
 
 // Компонент, чьи поля показывает toCalendarEvent(o, "object"): основной, а
 // без него — первая по адресу встреча (instances.ts, objectInstance: обход

@@ -712,6 +712,57 @@ describe("expandOccurrences: неразбираемое не роняет чте
     expect(events[0].anomalies?.[0]).toMatch(/^bad-rrule: /);
   });
 
+  // Ревью З09: окно через месяц после DTSTART. Встречи DTSTART в окне нет, а
+  // какие встречи назначило правило, неизвестно. Прежде выдача была пустой:
+  // list_events молча не показывал объект, find_free_slots считал время
+  // свободным.
+  describe("bad-rrule, окно позже DTSTART — заглушка основного компонента, а не пустая выдача", () => {
+    const badRule = calendarOf(MOSCOW_ZONE, vevent([...WEEKLY, "RRULE:FREQ=MONTHLY;BYWEEKNO=2"]));
+
+    it("окно через месяц после DTSTART: заглушка с DTSTART, bad-rrule и unexpanded, без адреса", () => {
+      const events = expand(badRule, "2026-11-01T00:00:00+03:00", "2026-12-01T00:00:00+03:00");
+
+      expect(events).toHaveLength(1);
+      const [stub] = events;
+      expect(stub).toMatchObject({
+        id: UID,
+        calendarId: "work",
+        summary: "Планёрка",
+        start: "2026-10-19T10:00:00+03:00",
+        end: "2026-10-19T11:00:00+03:00",
+        etag: '"etag-z09"',
+        recurring: true,
+      });
+      expect(stub.instanceStart).toBeUndefined();
+      expect(stub.exceptions).toBeUndefined();
+      expect(stub.anomalies?.[0]).toMatch(/^bad-rrule: /);
+      expect(stub.anomalies?.some((a) => a.startsWith("unexpanded: "))).toBe(true);
+    });
+
+    it("окно раньше DTSTART — пусто: правило встреч раньше DTSTART не назначает", () => {
+      expect(expand(badRule, "2026-09-01T00:00:00+03:00", "2026-10-19T10:00:00+03:00")).toEqual([]);
+    });
+
+    it("встреча DTSTART закрыта EXDATE — заглушка и в окне с DTSTART: объект не пропадает", () => {
+      const excluded = calendarOf(MOSCOW_ZONE,
+        vevent([...WEEKLY, "RRULE:FREQ=MONTHLY;BYWEEKNO=2", "EXDATE;TZID=Europe/Moscow:20261019T100000"]));
+
+      const events = expand(excluded, "2026-10-01T00:00:00+03:00", "2026-12-01T00:00:00+03:00");
+      expect(events.map((event) => [event.start, event.instanceStart])).toEqual([["2026-10-19T10:00:00+03:00", undefined]]);
+      expect(events[0].anomalies?.some((a) => a.startsWith("bad-rrule: "))).toBe(true);
+    });
+
+    // object.ts помечает сломанный EXRULE как bad-rrule, и тогда не читается и
+    // RRULE (slots.ts, specOf): встречи 02.11 и 04.11 неизвестны.
+    it("сломанный EXRULE: окно после DTSTART — тоже заглушка, а не пустая выдача", () => {
+      const brokenExrule = calendarOf(MOSCOW_ZONE, vevent([...WEEKLY, COUNT6, "EXRULE:FREQ=MONTHLY;BYWEEKNO=2"]));
+
+      const events = expand(brokenExrule, "2026-11-01T00:00:00+03:00", "2026-12-01T00:00:00+03:00");
+      expect(events.map((event) => [event.start, event.instanceStart])).toEqual([["2026-10-19T10:00:00+03:00", undefined]]);
+      expect(events[0].anomalies?.some((a) => a.startsWith("bad-rrule: "))).toBe(true);
+    });
+  });
+
   it("серия длиннее предела перебора до окна — заглушка основного компонента с аномалией unexpanded, а не пустая выдача", () => {
     // SECONDLY с 01.10: до окна 06.10 больше 200 000 слотов (SERIES_CAP, slots.ts).
     const ics = calendarOf([], vevent(["DTSTART:20261001T000000Z", "DURATION:PT1S", "RRULE:FREQ=SECONDLY", "SUMMARY:Датчик"], "secondly-z09@yandex.ru"));
@@ -723,6 +774,32 @@ describe("expandOccurrences: неразбираемое не роняет чте
     expect(stub.instanceStart).toBeUndefined();
     expect(stub.exceptions).toBeUndefined();
     expect(stub.anomalies?.some((a) => a.startsWith("unexpanded: "))).toBe(true);
+  }, 30_000);
+
+  // Ревью З09: при SlotScanError встречи со своим компонентом известны точно —
+  // их время записано в компоненте. Прежде выдавалась одна заглушка, и
+  // перенесённая в окно встреча пропадала из list_events.
+  it("unexpanded: вместе с заглушкой — встречи переопределений, чьё время в окне; скрытое — нет", () => {
+    // HOURLY с 2000 года: до окна 21.10.2026 больше 200 000 слотов (SERIES_CAP).
+    const hourly = "hourly-z09@yandex.ru";
+    const ics = calendarOf([],
+      vevent(["DTSTART:20000101T000000Z", "DURATION:PT30M", "RRULE:FREQ=HOURLY", "EXDATE:20261021T110000Z",
+        "SUMMARY:Каждый час"], hourly),
+      vevent(["RECURRENCE-ID:20261021T100000Z", "DTSTART:20261021T123000Z", "DTEND:20261021T130000Z",
+        "SUMMARY:Перенесена в окно"], hourly),
+      // Под EXDATE — hidden: время в окне, но встречи нет.
+      vevent(["RECURRENCE-ID:20261021T110000Z", "DTSTART:20261021T124000Z", "DTEND:20261021T125000Z",
+        "SUMMARY:Под EXDATE"], hourly),
+      vevent(["RECURRENCE-ID:20261022T100000Z", "DTSTART:20261022T100000Z", "DTEND:20261022T103000Z",
+        "SUMMARY:Вне окна"], hourly));
+
+    const events = expand(ics, "2026-10-21T12:00:00Z", "2026-10-21T13:00:00Z");
+    expect(events.map((event) => `${event.instanceStart ?? "-"} → ${event.start}/${event.end} ${event.summary}`)).toEqual([
+      "- → 2000-01-01T00:00:00+00:00/2000-01-01T00:30:00+00:00 Каждый час",
+      "2026-10-21T10:00:00+00:00 → 2026-10-21T12:30:00+00:00/2026-10-21T13:00:00+00:00 Перенесена в окно",
+    ]);
+    expect(events[0].anomalies?.some((a) => a.startsWith("unexpanded: "))).toBe(true);
+    expect(events[1]).toMatchObject({ moved: true, seriesId: hourly });
   }, 30_000);
 });
 

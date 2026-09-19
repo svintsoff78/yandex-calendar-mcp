@@ -406,6 +406,25 @@ describe("findFreeSlots: время занимают только видимые
     expect(await freeOn("2026-10-19", [series, single])).toEqual(BUSY_10_11);
   });
 
+  // Ревью З09: время освобождает только STATUS:CANCELLED. Без этого теста
+  // проходил мутант «занимают только встречи без STATUS».
+  it("встречи со STATUS:CONFIRMED и STATUS:TENTATIVE занимают время, со STATUS:CANCELLED — нет", async () => {
+    const single = (uid: string, from: string, to: string, status: string) =>
+      calendarOf(vevent([`DTSTART;TZID=Europe/Moscow:20261021T${from}`, `DTEND;TZID=Europe/Moscow:20261021T${to}`,
+        `SUMMARY:${status}`, `STATUS:${status}`], uid));
+    const confirmed = single("confirmed-z09@yandex.ru", "100000", "110000", "CONFIRMED");
+    const tentative = single("tentative-z09@yandex.ru", "120000", "130000", "TENTATIVE");
+    const cancelled = single("cancelled-z09@yandex.ru", "140000", "150000", "CANCELLED");
+    const series = calendarOf(
+      vevent([...WEEKLY, COUNT6, "STATUS:CONFIRMED"], "confirmed-series-z09@yandex.ru"),
+      vevent(["RECURRENCE-ID;TZID=Europe/Moscow:20261021T100000", "DTSTART;TZID=Europe/Moscow:20261021T160000",
+        "DTEND;TZID=Europe/Moscow:20261021T170000", "SUMMARY:Под вопросом", "STATUS:TENTATIVE"], "confirmed-series-z09@yandex.ru"));
+
+    expect(await freeOn("2026-10-21", [confirmed, tentative, cancelled, series]))
+      .toEqual(["11:00–12:00", "13:00–16:00", "17:00–19:00"]);
+    expect(await freeOn("2026-10-19", [series])).toEqual(BUSY_10_11);
+  });
+
   it("объект из одних переопределений занимает время (Р6, R8-N3)", async () => {
     const ics = calendarOf(override("20261021T100000", "20261021T120000", "20261021T130000"));
 
@@ -441,6 +460,20 @@ describe("findFreeSlots: непрочитанные встречи — отка�
     const refusal = await refusalOf(freeOn("2026-10-19", [ics]));
     expect(refusal.code).toBe("unreadable");
     expect(refusal.message).toContain("badrule-z09@yandex.ru");
+  });
+
+  // Ревью З09: в день DTSTART дефект не виден. Через три недели встречи DTSTART
+  // в окне нет, а встречи правила неизвестны; прежде поиск считал день
+  // свободным: [07:00Z–16:00Z] без отказа.
+  it("bad-rrule: день через три недели после DTSTART — тоже отказ с UID, а не свободный день", async () => {
+    const ics = calendarOf(vevent([...WEEKLY, "RRULE:FREQ=MONTHLY;BYWEEKNO=2"], "badrule-z09@yandex.ru"));
+
+    const refusal = await refusalOf(freeOn("2026-11-09", [ics]));
+    expect(refusal.code).toBe("unreadable");
+    expect(refusal.message).toContain("badrule-z09@yandex.ru");
+    expect(refusal.events).toEqual([
+      { id: "badrule-z09@yandex.ru", calendarId: "work", reason: expect.stringMatching(/^bad-rrule: /) },
+    ]);
   });
 
   it("серия длиннее предела перебора до окна — отказ с UID, а не пустая занятость", async () => {
