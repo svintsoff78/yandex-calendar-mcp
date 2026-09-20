@@ -2205,24 +2205,64 @@ describe("испорченное время чужого объекта не т�
   const MIXED = calendar(MOSCOW, vevent(["DTSTART;VALUE=DATE:20261019", "DTEND;TZID=Europe/Moscow:20261019T110000",
     "RRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=3", "SUMMARY:Планёрка"]));
 
-  it("правка всей серии — отказ, а не молча укороченная или перевёрнутая встреча", () => {
+  it("правка времени всей серии — отказ, а не молча укороченная или перевёрнутая встреча", () => {
     for (const ics of [BOTH, BACKWARDS, MIXED]) {
-      const error = refusal(() => update(load(ics), { scope: "all_series", patch: { summary: "Х" } }));
+      const error = refusal(() => update(load(ics), { scope: "all_series", patch: { timeZone: "Europe/Berlin" } }));
+      expect(error.code).toBe("invalid-time");
       expect(error.needsConfirm).toBe(false);
-      expect(error.message).toContain("испорчен другим клиентом");
+      expect(error.message).toContain("против RFC 5545");
       expect(error.hint ?? "").toContain("delete_event со scope all_series");
     }
   });
 
-  it("update this и t&f — тот же отказ: нарушение не переезжает в переопределение и в продолжение", () => {
+  it("правка повтора всей серии — отказ: испорченную длительность унаследовала бы каждая позиция", () => {
+    for (const ics of [BOTH, BACKWARDS, MIXED]) {
+      expect(refusal(() => update(load(ics), { scope: "all_series", patch: { recurrence: { count: 5 } } })).code).toBe("invalid-time");
+    }
+  });
+
+  it("update this и разрез — тот же отказ: нарушение не переезжает в переопределение и в продолжение", () => {
     for (const ics of [BOTH, BACKWARDS]) {
       const o = load(ics);
-      expect(refusal(() => update(o, { instanceStart: "2026-10-19T10:00:00+03:00", patch: { summary: "Х" } })).message)
-        .toContain("испорчен другим клиентом");
+      expect(refusal(() => update(o, { instanceStart: "2026-10-19T10:00:00+03:00", patch: { summary: "Х" } })).code).toBe("invalid-time");
       expect(refusal(() => update(o, {
         scope: "this_and_following", instanceStart: "2026-10-26T10:00:00+03:00", patch: { summary: "Х" },
-      })).message).toContain("испорчен другим клиентом");
+      })).code).toBe("invalid-time");
     }
+  });
+
+  it("правка одних полей всей серии проходит: времени она не касается", () => {
+    for (const ics of [BOTH, BACKWARDS, MIXED]) {
+      const plan = update(load(ics), { scope: "all_series", patch: { summary: "Другое название" } });
+      expect(plan.kind).toBe("put");
+      // Время объекта осталось ровно таким, каким его записал чужой клиент.
+      const times = (text: string) => events(text)[0].filter((line) => /^(DTSTART|DTEND|DURATION)[;:]/.test(line));
+      expect(times(icsOf(plan))).toEqual(times(ics));
+    }
+  });
+
+  it("удаление встречи и хвоста проходит: EXDATE и усечение правила времени не копируют", () => {
+    // У серии на весь день адрес встречи — дата (Р10).
+    const cases = [
+      { ics: BOTH, second: "2026-10-26T10:00:00+03:00", third: "2026-11-02T10:00:00+03:00" },
+      { ics: BACKWARDS, second: "2026-10-26T10:00:00+03:00", third: "2026-11-02T10:00:00+03:00" },
+      { ics: MIXED, second: "2026-10-26", third: "2026-11-02" },
+    ];
+    for (const { ics, second, third } of cases) {
+      expect(remove(load(ics), { scope: "this", instanceStart: second }).kind).toBe("put");
+      expect(remove(load(ics), { scope: "this_and_following", instanceStart: third }).kind).toBe("put");
+    }
+  });
+
+  it("patch со своим началом и концом чинит время: угадывать нечего — кроме двух концов разом", () => {
+    const patch = { start: "2026-10-19T10:00:00", end: "2026-10-19T11:00:00" };
+    for (const ics of [BACKWARDS, MIXED]) {
+      const plan = update(load(ics), { scope: "all_series", patch: { ...patch, allDay: false } });
+      expect(visible(after(plan))[0]).toBe("2026-10-19T10:00:00+03:00 → 2026-10-19T10:00:00+03:00–11:00 Планёрка");
+    }
+    // DTEND и DURATION разом патч не лечит: он пишет одно свойство, второе
+    // остаётся, и конец по-прежнему записан дважды.
+    expect(refusal(() => update(load(BOTH), { scope: "all_series", patch })).code).toBe("invalid-time");
   });
 
   it("delete all_series удаляет такой объект целиком", () => {

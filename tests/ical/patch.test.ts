@@ -336,9 +336,74 @@ describe("напоминания (О9): трогаются только DISPLAY 
         { minutesBefore: 60, method: "email" },
       ],
     });
-    expect(alarmsOf(master)).toEqual([AUDIO, DISPLAY_15, AFTER_END, ABSOLUTE, "ACTION:EMAIL | TRIGGER:-PT1H | DESCRIPTION:Планёрка"]);
+    // Письмо собирается заново по RFC 5545 §3.6.6: с темой и получателем. У
+    // события писем с адресатом нет (абсолютное — без ATTENDEE), получателем
+    // становится владелец календаря.
+    expect(alarmsOf(master)).toEqual([
+      AUDIO,
+      DISPLAY_15,
+      AFTER_END,
+      ABSOLUTE,
+      "ACTION:EMAIL | TRIGGER:-PT1H | DESCRIPTION:Планёрка | SUMMARY:Планёрка | ATTENDEE:mailto:user@yandex.ru",
+    ]);
     expect(result.changed).toEqual(["reminders"]);
     expect(touched.components.size).toBe(1);
+  });
+
+  it("новое письмо берёт получателя у прежнего письма события — вместе с CN, даже если то снимается", () => {
+    // Просят два письма, у события одно: одному правится сдвиг на месте (свой
+    // ATTENDEE цел), второе собирается заново — и адресат у него тот же.
+    const ics = calendar(MOSCOW, vevent([
+      "DTSTART;TZID=Europe/Moscow:20261019T100000", "DTEND;TZID=Europe/Moscow:20261019T110000", "SUMMARY:Планёрка",
+      ...alarm("ACTION:EMAIL", "TRIGGER:-PT1H", "ATTENDEE;CN=Пётр:mailto:petrov@example.com", "SUMMARY:Письмо"),
+    ]));
+    const { master } = patchMaster(ics, {
+      reminders: [{ minutesBefore: 30, method: "email" }, { minutesBefore: 5, method: "email" }],
+    });
+    expect(alarmsOf(master)).toEqual([
+      "ACTION:EMAIL | TRIGGER:-PT30M | ATTENDEE;CN=Пётр:mailto:petrov@example.com | SUMMARY:Письмо",
+      "ACTION:EMAIL | TRIGGER:-PT5M | DESCRIPTION:Планёрка | SUMMARY:Планёрка | ATTENDEE;CN=Пётр:mailto:petrov@example.com",
+    ]);
+  });
+
+  it("получателем не становится посторонний ORGANIZER: берётся владелец календаря", () => {
+    const ics = calendar(MOSCOW, vevent([
+      "DTSTART;TZID=Europe/Moscow:20261019T100000", "DTEND;TZID=Europe/Moscow:20261019T110000", "SUMMARY:Планёрка",
+      'ORGANIZER;CN="Анна Смирнова":mailto:anna@example.com',
+    ]));
+    const { master } = patchMaster(ics, { reminders: [{ minutesBefore: 30, method: "email" }] });
+    expect(alarmsOf(master)).toEqual([
+      "ACTION:EMAIL | TRIGGER:-PT30M | DESCRIPTION:Планёрка | SUMMARY:Планёрка | ATTENDEE:mailto:user@yandex.ru",
+    ]);
+  });
+
+  it("адресата взять неоткуда — отказ invalid-field, и дерево не тронуто", () => {
+    const ics = calendar(MOSCOW, vevent([
+      "DTSTART;TZID=Europe/Moscow:20261019T100000", "DTEND;TZID=Europe/Moscow:20261019T110000", "SUMMARY:Планёрка",
+      ...alarm("ACTION:DISPLAY", "DESCRIPTION:Напоминание", "TRIGGER:-PT15M"),
+    ]));
+    const o = load(ics);
+    const before = JSON.stringify(o.root.jCal);
+    const patch = { summary: "Другое название", reminders: [{ minutesBefore: 30, method: "email" as const }] };
+    const refused = refusal(() =>
+      applyFieldPatch(o.master!, patch, { env: { floatingZone: "Europe/Moscow" }, touched: newTouched() }),
+    );
+    expect(refused.code).toBe("invalid-field");
+    expect(refused.message).toContain("отправить некому");
+    expect(JSON.stringify(o.root.jCal)).toBe(before);
+  });
+
+  it("без владельца календаря правка сдвига у имеющегося письма проходит: заново ничего не собирается", () => {
+    const ics = calendar(MOSCOW, vevent([
+      "DTSTART;TZID=Europe/Moscow:20261019T100000", "DTEND;TZID=Europe/Moscow:20261019T110000", "SUMMARY:Планёрка",
+      ...alarm("ACTION:EMAIL", "TRIGGER:-PT1H", "DESCRIPTION:Письмо"),
+    ]));
+    const o = load(ics);
+    applyFieldPatch(o.master!, { reminders: [{ minutesBefore: 30, method: "email" }] }, {
+      env: { floatingZone: "Europe/Moscow" },
+      touched: newTouched(),
+    });
+    expect(alarmsOf(o.master!)).toEqual(["ACTION:EMAIL | TRIGGER:-PT30M | DESCRIPTION:Письмо"]);
   });
 
   it("C45: DISPLAY за 30 минут вместо 15 — правится TRIGGER на месте; затем пустой список — чужие VALARM целы", () => {

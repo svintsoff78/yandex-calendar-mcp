@@ -152,7 +152,8 @@ const FIELD_KEYS: ReadonlySet<string> = new Set([
  *   начала (О9): совпавшие остаются дословно, у совпавших по одному ACTION
  *   правится TRIGGER на месте (прочие свойства — ATTENDEE письма, ATTACH,
  *   свои SUMMARY и DESCRIPTION — целы), лишние снимаются, недостающие
- *   собираются заново; AUDIO, TRIGGER от конца и абсолютные не трогаются.
+ *   собираются заново (у письма — с темой и получателем, RFC 5545 §3.6.6);
+ *   AUDIO, TRIGGER от конца и абсолютные не трогаются.
  * Значение, равное прежнему, компонент не трогает (О13: пустой план ничего
  * не пишет). Повтор здесь не правится — правило правит `patchRule`.
  */
@@ -184,6 +185,9 @@ export function applyFieldPatch(c: ICAL.Component, p: FieldPatch, ctx: PatchCont
   const times = resolveTimes(c, p, ctx);
   const attendees = p.attendees === undefined ? undefined : checkedAttendees(p.attendees);
   const reminders = p.reminders === undefined ? undefined : checkedReminders(p.reminders);
+  // Получатели письма ищутся здесь же, до первой правки дерева: отказ за
+  // ненайденного адресата не вправе оставить объект наполовину исправленным.
+  const recipients = reminders === undefined ? [] : alarmRecipients(c, reminders, ctx.env);
 
   // 2. Правка.
   const changed = new Set<PatchField>();
@@ -202,7 +206,7 @@ export function applyFieldPatch(c: ICAL.Component, p: FieldPatch, ctx: PatchCont
     const pending = reminders.map(({ action, seconds }) => ({
       action,
       seconds,
-      make: () => newAlarm(action, seconds, description),
+      make: () => newAlarm(action, seconds, description, recipients),
     }));
     if (syncAlarms(c, pending, ctx.touched)) changed.add("reminders");
   }
@@ -376,13 +380,77 @@ function managedAlarmKey(alarm: ICAL.Component): string | undefined {
   return managed === undefined ? undefined : alarmKey(managed.action, managed.seconds);
 }
 
-function newAlarm(action: AlarmAction, seconds: number, description: string): ICAL.Component {
-  // Как у сборки нового события (build.ts): ACTION, TRIGGER, DESCRIPTION.
+/**
+ * Собирает напоминание заново. У показа — ACTION, TRIGGER, DESCRIPTION. У
+ * письма RFC 5545 §3.6.6 требует сверх того тему (SUMMARY) и хотя бы одного
+ * получателя (ATTENDEE): письмо без адресата отправить некуда, и сервер
+ * вправе такую запись отвергнуть. Получатели приходят готовыми свойствами —
+ * копируются вместе со своими параметрами (CN).
+ */
+function newAlarm(
+  action: AlarmAction,
+  seconds: number,
+  description: string,
+  recipients: readonly ICAL.Property[],
+): ICAL.Component {
   const alarm = new ICAL.Component("valarm");
   alarm.addPropertyWithValue("action", action);
   alarm.addPropertyWithValue("trigger", ICAL.Duration.fromSeconds(seconds));
   alarm.addPropertyWithValue("description", description);
+  if (action !== "EMAIL") return alarm;
+  alarm.addPropertyWithValue("summary", description);
+  for (const source of recipients) alarm.addProperty(new ICAL.Property(ICAL.helpers.clone(source.jCal, true)));
   return alarm;
+}
+
+/**
+ * Получатели напоминания письмом, которое придётся собрать заново.
+ *
+ * Заново письмо собирается только тогда, когда напоминаний письмом просят
+ * больше, чем у компонента есть: совпавшие остаются дословно, а прочим
+ * `syncAlarms` правит сдвиг на месте, и адресат у них свой. Пока собирать
+ * нечего, адресата и не ищем — иначе правка одного лишь сдвига упиралась бы
+ * в отказ там, где ничего нового не создаётся.
+ *
+ * Адрес берётся у напоминаний письмом самого компонента (в том числе у тех,
+ * что правка сейчас снимет: получатель у события уже выбран пользователем), а
+ * если их нет — у владельца календаря. ORGANIZER источником не служит:
+ * организатором чужой встречи бывает посторонний, и напоминание пользователя
+ * ушло бы ему.
+ */
+function alarmRecipients(
+  c: ICAL.Component,
+  wanted: ReadonlyArray<{ action: AlarmAction }>,
+  env: IcalEnv,
+): ICAL.Property[] {
+  const asked = wanted.filter((entry) => entry.action === "EMAIL").length;
+  const have = c.getAllSubcomponents("valarm").filter((alarm) => managedAlarm(alarm)?.action === "EMAIL").length;
+  if (asked <= have) return [];
+
+  const seen = new Set<string>();
+  const own: ICAL.Property[] = [];
+  for (const alarm of c.getAllSubcomponents("valarm")) {
+    if (String(alarm.getFirstPropertyValue("action") ?? "").toUpperCase() !== "EMAIL") continue;
+    for (const property of alarm.getAllProperties("attendee")) {
+      const key = addressKey(property.getFirstValue());
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      own.push(property);
+    }
+  }
+  if (own.length > 0) return own;
+
+  const owner = (env.ownerEmail ?? "").trim();
+  if (!owner) {
+    throw new EditRefusal("invalid-field", "Напоминание письмом отправить некому: получатель неизвестен.", {
+      hint:
+        "У события нет напоминания письмом с адресатом, а адрес владельца календаря в настройках не задан. " +
+        "Задайте его или оставьте напоминание показом (method: display).",
+    });
+  }
+  const property = new ICAL.Property("attendee");
+  property.setValue(`mailto:${owner}`);
+  return [property];
 }
 
 /** Напоминание, которое должно получиться: чем оно задано и чем его собрать, если собирать придётся. */
