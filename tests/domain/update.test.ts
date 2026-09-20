@@ -14,13 +14,16 @@ const calendar: Calendar = {
   readOnly: false,
 };
 
+/** Логин владельца (Config.login): полный адрес, как требует Яндекс. */
+const OWNER = "owner@yandex.ru";
+
 function contextWith(ics: string) {
   const put = vi.fn().mockResolvedValue('"etag-new"');
   const get = vi.fn().mockResolvedValue({ href: "/c/work/x.ics", etag: '"etag-old"', ics });
   return {
     context: {
       client: {} as never,
-      config: { defaultTimeZone: "Europe/Moscow" } as never,
+      config: { defaultTimeZone: "Europe/Moscow", login: OWNER } as never,
       calendars: async () => [calendar],
       resolveCalendar: async () => calendar,
       get,
@@ -76,6 +79,29 @@ describe("updateEvent", () => {
     expect(ics).toContain("Перенесённая встреча");
     expect(ics).toContain("RRULE");
   });
+
+  // Получатель напоминания письмом — владелец календаря (Config.login).
+  // Каждый разрез собирает свой текст (правка серии, переопределение
+  // экземпляра, продолжение), и адрес обязан дойти до каждого.
+  it.each(["all_series", "this", "this_and_following"] as const)(
+    "проводит адрес владельца в напоминание письмом (scope %s)",
+    async (scope) => {
+      const { context, put } = contextWith(weekly);
+
+      await updateEvent(context as never, {
+        id: "test-weekly-1",
+        scope,
+        instanceStart: "2026-10-21T10:00:00+03:00",
+        patch: { reminders: [{ minutesBefore: 30, method: "email" }] },
+      });
+
+      const byEmail = put.mock.calls
+        .map(([, ics]) => ics as string)
+        .filter((ics) => ics.includes("ACTION:EMAIL"));
+      expect(byEmail.length).toBeGreaterThan(0);
+      for (const ics of byEmail) expect(ics).toContain(`ATTENDEE:mailto:${OWNER}`);
+    },
+  );
 
   it("требует instanceStart при scope this", async () => {
     const { context } = contextWith(weekly);
@@ -170,7 +196,7 @@ END:VCALENDAR</c:calendar-data>
     function contextFor(client: CaldavClient) {
       return {
         client,
-        config: { defaultTimeZone: "Europe/Moscow" } as never,
+        config: { defaultTimeZone: "Europe/Moscow", login: OWNER } as never,
         calendars: async () => [calendar],
         resolveCalendar: async () => calendar,
       };
@@ -405,7 +431,7 @@ END:VCALENDAR`;
     get.mockResolvedValueOnce({ href: "/c/work/x.ics", etag: '"etag-1"', ics: weekly });
     const context = {
       client: {} as never,
-      config: { defaultTimeZone: "Europe/Moscow" } as never,
+      config: { defaultTimeZone: "Europe/Moscow", login: OWNER } as never,
       calendars: async () => [calendar],
       resolveCalendar: async () => calendar,
       get,

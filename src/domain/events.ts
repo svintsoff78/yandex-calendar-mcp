@@ -2,7 +2,7 @@ import ICAL from "ical.js";
 import { randomUUID } from "node:crypto";
 import { deleteObject, queryEventByUid, queryEvents, putObject } from "../caldav/objects.js";
 import { expandOccurrences } from "../ical/expand.js";
-import { buildEvent } from "../ical/build.js";
+import { buildEvent, type BuildOptions } from "../ical/build.js";
 import { parseEvent } from "../ical/parse.js";
 import { registerTimeZone } from "../ical/timezones.js";
 import { resolveCalendarIn } from "./calendars.js";
@@ -182,6 +182,16 @@ function putFor(context: Context): PutFn {
   return (href, ics, options) => putObject(context.client, href, ics, options);
 }
 
+/**
+ * Окружение сборки нового текста. Полный адрес владельца календаря
+ * (`Config.login`, name@yandex.ru) — получатель напоминания письмом: без него
+ * VALARM с ACTION:EMAIL собрать нельзя (RFC 5545 §3.6.6, src/ical/build.ts,
+ * newAlarm), и сборка отказывает «получатель неизвестен».
+ */
+function buildOptionsFor(context: Context): BuildOptions {
+  return { ownerEmail: context.config.login };
+}
+
 export async function createEvent(context: Context, input: EventInput): Promise<CalendarEvent> {
   // Самопроверка задачи 12 (проверки, которых нет в брифе): дешёвые проверки
   // формы входа — до resolveCalendar и уж тем более до сети.
@@ -216,7 +226,7 @@ export async function createEvent(context: Context, input: EventInput): Promise<
     attendees: input.attendees ?? [],
   };
 
-  const { ics, uid } = buildEvent(event);
+  const { ics, uid } = buildEvent(event, buildOptionsFor(context));
   const href = hrefFor(calendar, uid);
   const etag = await putFor(context)(href, ics, { ifNoneMatch: true });
 
@@ -444,7 +454,7 @@ export async function updateEvent(
   // Одиночное событие или правка сразу всей серии: правится сам исходный
   // компонент, без RECURRENCE-ID и без второй серии.
   if (!current.recurrence || scope === "all_series") {
-    const { ics } = buildEvent({ ...merged, id: params.id });
+    const { ics } = buildEvent({ ...merged, id: params.id }, buildOptionsFor(context));
     // replaceMaster (не голый ics из buildEvent) — иначе переопределения
     // экземпляров, уже лежащие в объекте, пропадут молча (находка ревью,
     // Critical, круг 1). Для одиночного события без переопределений это
@@ -488,7 +498,7 @@ export async function updateEvent(
     // чем добавлять новое.
     removeExistingOverride(root, params.id, new Date(params.instanceStart));
     const override = veventOf(
-      buildEvent({ ...instanceMerged, id: params.id, recurrence: undefined }).ics,
+      buildEvent({ ...instanceMerged, id: params.id, recurrence: undefined }, buildOptionsFor(context)).ics,
     ).vevent;
     const recurrenceId = override.addPropertyWithValue(
       "recurrence-id",
@@ -547,18 +557,21 @@ export async function updateEvent(
     if (remaining > 0) continuationRecurrence = { ...recurrence, count: remaining };
   }
 
-  const continuation = buildEvent({
-    ...merged,
-    recurrence: continuationRecurrence,
-    id: randomUUID(),
-    start: params.patch.start ?? params.instanceStart,
-    end:
-      params.patch.end ??
-      new Date(
-        new Date(params.instanceStart).getTime() +
-          (new Date(current.end).getTime() - new Date(current.start).getTime()),
-      ).toISOString(),
-  });
+  const continuation = buildEvent(
+    {
+      ...merged,
+      recurrence: continuationRecurrence,
+      id: randomUUID(),
+      start: params.patch.start ?? params.instanceStart,
+      end:
+        params.patch.end ??
+        new Date(
+          new Date(params.instanceStart).getTime() +
+            (new Date(current.end).getTime() - new Date(current.start).getTime()),
+        ).toISOString(),
+    },
+    buildOptionsFor(context),
+  );
   const continuationHref = hrefFor(calendar, continuation.uid);
 
   // Находка ревью (Important): две записи здесь неатомарны — CalDAV не даёт

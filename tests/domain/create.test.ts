@@ -9,11 +9,14 @@ const calendar: Calendar = {
   readOnly: false,
 };
 
+/** Логин владельца (Config.login): полный адрес, как требует Яндекс. */
+const OWNER = "owner@yandex.ru";
+
 function contextWith(put = vi.fn().mockResolvedValue('"etag-new"')) {
   return {
     context: {
       client: {} as never,
-      config: { defaultTimeZone: "Europe/Moscow" } as never,
+      config: { defaultTimeZone: "Europe/Moscow", login: OWNER } as never,
       calendars: async () => [calendar],
       resolveCalendar: async () => calendar,
       put,
@@ -49,6 +52,22 @@ describe("createEvent", () => {
     await createEvent(context as never, input);
 
     expect(put.mock.calls[0][1]).toContain("TZID=Europe/Moscow");
+  });
+
+  // Получатель напоминания письмом — владелец календаря (Config.login): без
+  // адреса сборка отказывает (src/ical/build.ts, newAlarm), поэтому домен
+  // обязан его проводить.
+  it("проводит адрес владельца в напоминание письмом", async () => {
+    const { context, put } = contextWith();
+
+    await createEvent(context as never, {
+      ...input,
+      reminders: [{ minutesBefore: 30, method: "email" }],
+    });
+
+    const ics = put.mock.calls[0][1];
+    expect(ics).toContain("ACTION:EMAIL");
+    expect(ics).toContain(`ATTENDEE:mailto:${OWNER}`);
   });
 
   it("отказывается писать в календарь только для чтения", async () => {

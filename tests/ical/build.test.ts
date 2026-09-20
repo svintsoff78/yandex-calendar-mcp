@@ -476,6 +476,59 @@ describe("buildEvent: моменты и формы времени", () => {
   });
 });
 
+// Напоминание письмом. RFC 5545 §3.6.6 требует у ACTION:EMAIL сверх
+// ACTION/TRIGGER/DESCRIPTION ещё тему письма (SUMMARY) и хотя бы одного
+// получателя (ATTENDEE): письмо без адресата отправить некуда, и строгий
+// сервер вправе ответить 400. Тот же порядок держит правка события
+// (src/ical/patch.ts, newAlarm и alarmRecipients): адресат — владелец
+// календаря, а не гости встречи и не ORGANIZER.
+describe("buildEvent: напоминание письмом", () => {
+  const owner = "user@yandex.ru";
+  const byEmail = { ...base, reminders: [{ minutesBefore: 30, method: "email" as const }] };
+
+  function valarm(ics: string): ICAL.Component {
+    const vevent = new ICAL.Component(ICAL.parse(ics)).getFirstSubcomponent("vevent");
+    const alarm = vevent?.getFirstSubcomponent("valarm");
+    if (!alarm) throw new Error("в собранном тексте нет VALARM");
+    return alarm;
+  }
+
+  it("получает тему и адресата — владельца календаря", () => {
+    const alarm = valarm(buildEvent(byEmail, { ownerEmail: owner }).ics);
+
+    expect(alarm.getFirstPropertyValue("action")).toBe("EMAIL");
+    expect(alarm.getFirstPropertyValue("summary")).toBe(base.summary);
+    expect(alarm.getAllProperties("attendee").map((property) => property.getFirstValue())).toEqual([
+      `mailto:${owner}`,
+    ]);
+  });
+
+  it("адресат — владелец, а не гости встречи", () => {
+    const withGuest = { ...byEmail, attendees: [{ email: "guest@example.com", status: "accepted" as const }] };
+
+    const alarm = valarm(buildEvent(withGuest, { ownerEmail: owner }).ics);
+
+    expect(alarm.getAllProperties("attendee").map((property) => property.getFirstValue())).toEqual([
+      `mailto:${owner}`,
+    ]);
+  });
+
+  it("напоминание показом темы и адресата не получает", () => {
+    const alarm = valarm(buildEvent(base, { ownerEmail: owner }).ics);
+
+    expect(alarm.getFirstPropertyValue("action")).toBe("DISPLAY");
+    expect(alarm.getAllProperties("summary")).toEqual([]);
+    expect(alarm.getAllProperties("attendee")).toEqual([]);
+  });
+
+  it("без адреса владельца отклоняется: отправить письмо некому", () => {
+    const error = thrownBy(() => buildEvent(byEmail));
+
+    expect(error).toMatchObject({ name: "BuildError", code: "invalid-field" });
+    expect(error.message).toContain("получатель неизвестен");
+  });
+});
+
 describe("buildEvent: правило повтора", () => {
   // Ж6 (docs/yandex-caldav-capabilities.md): BYSETPOS Яндекс молча
   // заменяет другим правилом, WKST выбрасывает.

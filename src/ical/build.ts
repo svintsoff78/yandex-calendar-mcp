@@ -83,11 +83,18 @@ export interface NewEvent {
 export interface BuildOptions {
   /** Момент для DTSTAMP; по умолчанию — системные часы. */
   now?: Date;
+  /**
+   * Полный адрес владельца календаря (`Config.login`, name@yandex.ru) —
+   * получатель напоминания письмом. Без него событие с таким напоминанием
+   * не собирается: отправить письмо некому (RFC 5545 §3.6.6).
+   */
+  ownerEmail?: string;
 }
 
 /**
  * Код отказа сборки:
- * - `invalid-field` — пустой заголовок или UID, напоминание не целым числом минут;
+ * - `invalid-field` — пустой заголовок или UID, напоминание не целым числом
+ *   минут, напоминание письмом без известного получателя;
  * - `invalid-time` — время не разобрано, не той формы, не существует в поясе
  *   события или конец не позже начала;
  * - `unknown-timezone` — пояса нет ни в базе IANA, ни среди зарегистрированных
@@ -118,7 +125,7 @@ export class BuildError extends Error {
 
 export function buildEvent(event: NewEvent, options: BuildOptions = {}): { ics: string; uid: string } {
   assertNewEvent(event);
-  const frame = frameOf(event);
+  const frame = frameOf(event, options);
 
   const start = eventTime(event.start, "start", frame);
   const end = eventTime(event.end, "end", frame);
@@ -149,11 +156,7 @@ export function buildEvent(event: NewEvent, options: BuildOptions = {}): { ics: 
   if (rrule) vevent.addProperty(rrule);
 
   for (const reminder of event.reminders) {
-    const alarm = new ICAL.Component("valarm");
-    alarm.addPropertyWithValue("action", reminder.method === "email" ? "EMAIL" : "DISPLAY");
-    alarm.addPropertyWithValue("trigger", ICAL.Duration.fromSeconds(-reminder.minutesBefore * 60));
-    alarm.addPropertyWithValue("description", event.summary);
-    vevent.addSubcomponent(alarm);
+    vevent.addSubcomponent(newAlarm(reminder, event.summary, frame.env));
   }
 
   for (const attendee of event.attendees) {
@@ -163,6 +166,40 @@ export function buildEvent(event: NewEvent, options: BuildOptions = {}): { ics: 
 
   calendar.addSubcomponent(vevent);
   return { ics: calendar.toString(), uid };
+}
+
+// ───────────────────────────── напоминания ─────────────────────────────
+
+/**
+ * Напоминание события. У показа — ACTION, TRIGGER, DESCRIPTION. У письма
+ * RFC 5545 §3.6.6 требует сверх того тему (SUMMARY) и хотя бы одного
+ * получателя (ATTENDEE): письмо без адресата отправить некуда, и строгий
+ * сервер вправе такую запись отвергнуть.
+ *
+ * Получатель — владелец календаря (`env.ownerEmail` из `Config.login`), как
+ * и в правке события (patch.ts, alarmRecipients). Гости встречи источником
+ * не служат: напоминание заводится пользователем себе, а не им.
+ */
+function newAlarm(reminder: Reminder, summary: string, env: IcalEnv): ICAL.Component {
+  const alarm = new ICAL.Component("valarm");
+  const action = reminder.method === "email" ? "EMAIL" : "DISPLAY";
+  alarm.addPropertyWithValue("action", action);
+  alarm.addPropertyWithValue("trigger", ICAL.Duration.fromSeconds(-reminder.minutesBefore * 60));
+  alarm.addPropertyWithValue("description", summary);
+  if (action !== "EMAIL") return alarm;
+
+  const owner = (env.ownerEmail ?? "").trim();
+  if (!owner) {
+    throw new BuildError(
+      "invalid-field",
+      "Напоминание письмом отправить некому: получатель неизвестен. " +
+        "Адрес владельца календаря в настройках не задан — задайте его " +
+        "или оставьте напоминание показом (method: display).",
+    );
+  }
+  alarm.addPropertyWithValue("summary", summary);
+  alarm.addPropertyWithValue("attendee", `mailto:${owner}`);
+  return alarm;
 }
 
 // ─────────────────────────────── вход ───────────────────────────────
@@ -219,8 +256,8 @@ interface Frame {
   env: IcalEnv;
 }
 
-function frameOf(event: NewEvent): Frame {
-  const env: IcalEnv = { floatingZone: event.timeZone };
+function frameOf(event: NewEvent, options: BuildOptions): Frame {
+  const env: IcalEnv = { floatingZone: event.timeZone, ownerEmail: options.ownerEmail };
 
   // Имена UTC, GMT и Z ical.js держит за общим utcTimezone
   // (timezone_service.js, reset). Время в нём пишется с Z и без TZID —

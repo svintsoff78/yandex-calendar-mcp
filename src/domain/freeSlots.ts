@@ -77,7 +77,7 @@ export async function findFreeSlots(
   }
 
   // Пояс календаря: в нём читаются стенное время и даты (values.ts, instantOf).
-  const env: IcalEnv = { floatingZone: context.config.defaultTimeZone };
+  const env: IcalEnv = { floatingZone: context.config.defaultTimeZone, ownerEmail: context.config.login };
   const fromMs = boundaryMs(params.from, "from", env);
   const toMs = boundaryMs(params.to, "to", env);
   const hours = params.workingHours ?? { start: "10:00", end: "19:00" };
