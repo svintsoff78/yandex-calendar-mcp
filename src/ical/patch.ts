@@ -514,6 +514,36 @@ function syncAlarms(c: ICAL.Component, pending: readonly PendingAlarm[], touched
   return changed;
 }
 
+// ─────────────────────────────── края значений года ───────────────────────────────
+
+/**
+ * Год, меньше которого значение времени в iCalendar не записывается.
+ *
+ * RFC 5545 §3.3.4 и §3.3.5 задают год ровно четырьмя цифрами, а ical.js
+ * дополнять его не умеет (design.js пишет число как есть): год 1 вышел бы
+ * строкой `DTSTART;VALUE=DATE:1-01-01`, которую не прочтёт ни сервер, ни
+ * следующее чтение объекта.
+ */
+export const MIN_YEAR = 1000;
+/** Год, больше которого значение времени в iCalendar не записывается (те же четыре цифры). */
+export const MAX_YEAR = 9999;
+
+/**
+ * Проверяет, что год значения времени записывается четырьмя цифрами
+ * (`MIN_YEAR`–`MAX_YEAR`). Отказ `invalid-time`: и у значения из патча
+ * (`what` — имя поля), и у посчитанного правкой конца, который перевалил за
+ * верхний край.
+ */
+export function checkYear(year: number, what: string): void {
+  if (Number.isInteger(year) && year >= MIN_YEAR && year <= MAX_YEAR) return;
+  throw new EditRefusal(
+    "invalid-time",
+    `${what}: год ${year} вне ${MIN_YEAR}–${MAX_YEAR}. Календарь записывает год ровно четырьмя цифрами ` +
+      "(RFC 5545 §3.3.4), и такое время ни сервер, ни календарь не прочтут.",
+    { hint: `Выберите время с годом от ${MIN_YEAR} до ${MAX_YEAR}.` },
+  );
+}
+
 // ─────────────────────────────── время (О8) ───────────────────────────────
 
 /** Форма и пояс значений времени: у zoned — пояс и его TZID. */
@@ -655,6 +685,15 @@ export function resolveTimes(c: ICAL.Component, p: FieldPatch, ctx: PatchContext
   // Проверяется только сдвинутое время: патч, который ни начала, ни конца не
   // двигает, не отказывает и у объекта, испорченного раньше.
   const moved = p.start !== undefined || p.end !== undefined || !sameFrame;
+  // Верхний край года: начало у самого края плюс прежняя длительность (или
+  // плюс сутки у события на весь день) переваливает за 9999-й год, и ical.js
+  // пишет заведомо негодный конец вида `1000-0-01T0:0:0` — с месяцем 0.
+  // Проверяется только то, что правка пишет: у объекта, испорченного раньше,
+  // патч, который времени не двигает, не отказывает.
+  if (moved) {
+    checkYear(start.year, "start");
+    if (end !== undefined) checkYear(end.year, "end");
+  }
   if (moved && end !== undefined && compareTimes(end, start, env) <= 0) {
     throw new EditRefusal(
       "invalid-time",
@@ -825,12 +864,18 @@ function unknownTimezone(tzid: string): EditRefusal {
 }
 
 function parseField(iso: string, field: string, zone: ZoneRef | undefined) {
+  let parsed;
   try {
-    return parseModelTime(iso, zone);
+    parsed = parseModelTime(iso, zone);
   } catch (error) {
     if (error instanceof ModelTimeError) throw new EditRefusal("invalid-time", `${field}: ${error.message}`);
     throw error;
   }
+  // Край года — до всякой записи: строку с годом меньше 1000 ical.js пишет
+  // без дополнения до четырёх цифр (`1-01-01`), и в календарь ушло бы
+  // неразбираемое значение.
+  checkYear(parsed.wall.year, field);
+  return parsed;
 }
 
 /**
@@ -1310,6 +1355,20 @@ const DISTORTED_PARTS: Record<string, string> = {
 const RULE_PATCH_KEYS: ReadonlySet<string> = new Set(["frequency", "interval", "byWeekday", "until", "count", "replace"]);
 
 /**
+ * Наибольший шаг повтора (INTERVAL), который правка записывает.
+ *
+ * Предел не про вкус, а про то, что перебор серии упирается в календарь:
+ * `FREQ=DAILY;INTERVAL=1000000` уводит вторую встречу в район 4764 года, а
+ * четырёхсотую — за миллионный, и разворот такой серии (свой у планировщика,
+ * свой у предохранителя) разворачивает заодно YEARLY-правила самого
+ * VTIMEZONE от 1970-го до запрошенного года — миллионы переходов, на которых
+ * процесс кончается нехваткой памяти. Тысячи шагов хватает на любой разумный
+ * повтор (раз в тысячу дней, раз в тысячу месяцев), а предохранитель сверх
+ * того держит свой предел по абсолютной дате (guard.ts, HORIZON_MAX_YEAR).
+ */
+export const MAX_INTERVAL = 1000;
+
+/**
  * Части правила, которые Яндекс искажает (Ж6), в порядке правила: "BYSETPOS",
  * "WKST". Планировщик решает по ним, можно ли писать объект с таким правилом.
  */
@@ -1372,6 +1431,12 @@ export function patchRule(p: ICAL.Property, rp: RecurrencePatch, ctx: RuleContex
   }
   if (rp.interval !== undefined && rp.interval !== null && (!Number.isInteger(rp.interval) || rp.interval < 1)) {
     throw invalidRule(`interval — целое число от 1, получено ${String(rp.interval)}.`);
+  }
+  if (typeof rp.interval === "number" && rp.interval > MAX_INTERVAL) {
+    throw invalidRule(
+      `шаг повтора interval не больше ${MAX_INTERVAL}, получено ${rp.interval}. При большем шаге встречи серии уходят ` +
+        "за пределы календаря, и ни расписание, ни конец серии не проверить.",
+    );
   }
   if (rp.count !== undefined && rp.count !== null && (!Number.isInteger(rp.count) || rp.count < 1)) {
     throw invalidRule(`count — целое число от 1, получено ${String(rp.count)}.`);

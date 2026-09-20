@@ -2254,15 +2254,47 @@ describe("испорченное время чужого объекта не т�
     }
   });
 
-  it("patch со своим началом и концом чинит время: угадывать нечего — кроме двух концов разом", () => {
+  it("patch со своим началом и концом чинит время: угадывать нечего", () => {
     const patch = { start: "2026-10-19T10:00:00", end: "2026-10-19T11:00:00" };
     for (const ics of [BACKWARDS, MIXED]) {
       const plan = update(load(ics), { scope: "all_series", patch: { ...patch, allDay: false } });
       expect(visible(after(plan))[0]).toBe("2026-10-19T10:00:00+03:00 → 2026-10-19T10:00:00+03:00–11:00 Планёрка");
     }
-    // DTEND и DURATION разом патч не лечит: он пишет одно свойство, второе
-    // остаётся, и конец по-прежнему записан дважды.
-    expect(refusal(() => update(load(BOTH), { scope: "all_series", patch })).code).toBe("invalid-time");
+    // DTEND и DURATION разом патч тоже лечит: длительность считается от
+    // названного конца, а DTEND рядом с DURATION снимается (RFC 5545 §3.6.1).
+    const plan = update(load(BOTH), { scope: "all_series", patch });
+    expect(visible(after(plan))[0]).toBe("2026-10-19T10:00:00+03:00 → 2026-10-19T10:00:00+03:00–11:00 Планёрка");
+    expect(masterLines(icsOf(plan)).filter((line) => /^(DTEND|DURATION)[;:]/.test(line))).toEqual(["DURATION:PT1H"]);
+  });
+
+  it("end в одиночку и allDay: true пишут годное время вместо отказа — прежний конец в запись не идёт", () => {
+    // Конец назван патчем: начало берётся из целого DTSTART, испорченный
+    // конец не читается (О8) — отказывать не за что.
+    for (const ics of [BOTH, BACKWARDS]) {
+      const plan = update(load(ics), { scope: "all_series", patch: { end: "2026-10-19T11:00:00" } });
+      expect(visible(after(plan))[0]).toBe("2026-10-19T10:00:00+03:00 → 2026-10-19T10:00:00+03:00–11:00 Планёрка");
+    }
+    // «Весь день» строит обе даты из даты начала: сколько бы дней ни выходило
+    // из испорченного конца, их не меньше одного.
+    for (const ics of [BOTH, BACKWARDS]) {
+      const plan = update(load(ics), { scope: "all_series", patch: { allDay: true } });
+      expect(visible(after(plan))[0]).toBe("2026-10-19 → 2026-10-19T00:00:00+03:00–00:00 Планёрка");
+    }
+    // Начало в одиночку прежний конец как раз читает (длительность прежняя) — отказ остаётся.
+    expect(refusal(() => update(load(BACKWARDS), { scope: "all_series", patch: { start: "2026-10-19T12:00:00" } })).code).toBe("invalid-time");
+  });
+
+  it("пустой план остаётся пустым: правка, которая ничего не меняет, не отказывает из-за чужой порчи", () => {
+    for (const ics of [BOTH, BACKWARDS, MIXED]) {
+      const o = load(ics);
+      // Патч без полей — плана нет вовсе (О13).
+      expect(update(o, { scope: "all_series", patch: {} }).kind).toBe("noop");
+      expect(update(o, { scope: "this", instanceStart: visible(o)[0].split(" ")[0], patch: {} }).kind).toBe("noop");
+    }
+    // Пояс тот же, что у события: время не двигается, писать нечего.
+    for (const ics of [BOTH, BACKWARDS]) {
+      expect(update(load(ics), { scope: "all_series", patch: { timeZone: "Europe/Moscow" } }).kind).toBe("noop");
+    }
   });
 
   it("delete all_series удаляет такой объект целиком", () => {
@@ -2305,5 +2337,111 @@ describe("continuationUid", () => {
     expect(continuationUid(UID, key)).toBe(expected);
     expect(continuationUid(UID, key)).toBe(continuationUid(UID, key));
     expect(continuationUid(UID, at("2026-10-28T10:00:00+03:00"))).not.toBe(expected);
+  });
+});
+
+describe("края значений года и предел повтора", () => {
+  /** Серия на весь день: 19–24 октября 2026. */
+  const allDay = load(calendar([], vevent(["DTSTART;VALUE=DATE:20261019", "DTEND;VALUE=DATE:20261020",
+    "RRULE:FREQ=DAILY;COUNT=6", "SUMMARY:Дела"])));
+  const timed = () => weekly();
+
+  it("год меньше 1000 — отказ invalid-time, а не DTSTART;VALUE=DATE:1-01-01 в чужом календаре", () => {
+    // Прежде план принимался и предохранителем, и строгим подставным сервером,
+    // а в календарь уходило переопределение, которого не прочесть.
+    const error = refusal(() => update(allDay, {
+      scope: "all_series", patch: { start: "0001-01-01", recurrence: { frequency: "daily" } },
+      confirm: true, etag: ETAG, currentEtag: ETAG,
+    }));
+    expect(error.code).toBe("invalid-time");
+    expect(error.message).toContain("вне 1000–9999");
+  });
+
+  it("верхний край: длительность, перенесённая за 9999 год, — отказ, а не месяц 0 в DTEND", () => {
+    // Часовая встреча у самого края: конец уезжает в 10000 год.
+    const error = refusal(() => update(timed(), {
+      scope: "this", instanceStart: "2026-10-19T10:00:00+03:00", patch: { start: "9999-12-31T23:30:00" },
+    }));
+    expect(error.code).toBe("invalid-time");
+    expect(error.message).toContain("вне 1000–9999");
+    // И у всей серии, когда дату начала переносит правило (Р1).
+    expect(refusal(() => update(timed(), {
+      scope: "all_series", patch: { start: "9999-12-31T23:30:00", recurrence: { frequency: "weekly" } },
+      confirm: true, etag: ETAG, currentEtag: ETAG,
+    })).code).toBe("invalid-time");
+    expect(refusal(() => update(allDay, { scope: "all_series", patch: { start: "9999-12-31", recurrence: { frequency: "daily" } },
+      confirm: true, etag: ETAG, currentEtag: ETAG })).code).toBe("invalid-time");
+  });
+
+  it("огромный шаг повтора — отказ invalid-rule: развернуть такую серию нельзя", () => {
+    const error = refusal(() => update(timed(), { scope: "all_series", patch: { recurrence: { interval: 1_000_000 } } }));
+    expect(error.code).toBe("invalid-rule");
+    expect(error.message).toContain("не больше 1000");
+  });
+});
+
+describe("патч с правилом и временем не оставляет сирот", () => {
+  /** Серия по понедельникам с 19.10, COUNT=4; 26.10 закрыта EXDATE, а её скрытый след остался. */
+  const hidden = () => load(calendar(MOSCOW,
+    vevent(["DTSTART;TZID=Europe/Moscow:20261019T100000", "DTEND;TZID=Europe/Moscow:20261019T110000",
+      "RRULE:FREQ=WEEKLY;COUNT=4", "EXDATE;TZID=Europe/Moscow:20261026T100000", "SUMMARY:Планёрка"]),
+    override("20261026T100000", "20261026T120000", "20261026T130000", "SUMMARY:След")));
+  const patch = { start: "2026-11-02T10:00:00", recurrence: { frequency: "weekly" as const } };
+
+  it("скрытый след, потерявший свой слот, снимается с перечнем и confirm, а не остаётся сиротой", () => {
+    // Дата начала серии берётся из патча (Р1), а адрес следа за правилом не
+    // идёт: он оказался бы мимо всех встреч новой серии, и строгий сервер
+    // ответил бы на такую запись 400.
+    const asked = refusal(() => update(hidden(), { scope: "all_series", patch }));
+    expect(asked.code).toBe("confirm-required");
+    expect(asked.losses.map((loss) => loss.instanceStart)).toEqual(["2026-10-26T10:00:00+03:00"]);
+    expect(asked.losses[0].reason).toContain("не совпадает ни с одной встречей нового правила");
+
+    const plan = update(hidden(), { scope: "all_series", patch, confirm: true, etag: ETAG, currentEtag: ETAG });
+    const text = icsOf(plan);
+    expect(events(text)).toHaveLength(1);
+    expect(linesNamed(masterLines(text), "DTSTART")).toEqual(["DTSTART;TZID=Europe/Moscow:20261102T100000"]);
+    expect(plan.removed.map((loss) => loss.instanceStart)).toEqual(["2026-10-26T10:00:00+03:00"]);
+  });
+
+  it("след, стоящий на слоте и в новом правиле, не трогается", () => {
+    // То же правило и то же начало: слот 26.10 в серии остаётся, снимать нечего.
+    const plan = update(hidden(), { scope: "all_series", patch: { summary: "Другое" } });
+    expect(events(icsOf(plan))).toHaveLength(2);
+    expect(plan.removed).toEqual([]);
+  });
+});
+
+describe("форма UNTIL в продолжении разреза (RFC 5545 §3.3.10)", () => {
+  const series = (rule: string) => load(calendar(MOSCOW, vevent([
+    "DTSTART;TZID=Europe/Moscow:20261019T100000", "DTEND;TZID=Europe/Moscow:20261019T110000", rule, "SUMMARY:Планёрка"])));
+  const B = "2026-11-02T10:00:00+03:00";
+
+  it("UNTIL датой или плавающим при DTSTART с TZID приводится к UTC: продолжение рождается годным", () => {
+    // Исходному объекту нарушение чужого клиента можно простить — оно там
+    // было; новорождённому продолжению оправдания нет, строгий сервер
+    // отвечает на такое правило 400.
+    for (const rule of ["RRULE:FREQ=WEEKLY;UNTIL=20261124", "RRULE:FREQ=WEEKLY;UNTIL=20261124T100000"]) {
+      const o = series(rule);
+      const before = visible(o, "2026-10-01T00:00:00+03:00", "2027-01-01T00:00:00+03:00");
+      const plan = split(update(o, { scope: "this_and_following", instanceStart: B, patch: { summary: "Совещание" } }));
+      expect(linesNamed(masterLines(plan.continuation.ics), "RRULE")).toEqual(["RRULE:FREQ=WEEKLY;UNTIL=20261123T070000Z"]);
+      // Набор встреч не изменился: конец считается по последней встрече прежнего правила.
+      const after = [...visible(load(plan.truncated.ics)), ...visible(load(plan.continuation.ics))];
+      expect(after.map((row) => row.split(" ")[0])).toEqual(before.map((row) => row.split(" ")[0]));
+    }
+  });
+
+  it("UNTIL, уже записанный в UTC, разрез не трогает", () => {
+    const plan = split(update(series("RRULE:FREQ=WEEKLY;UNTIL=20261124T070000Z"),
+      { scope: "this_and_following", instanceStart: B, patch: { summary: "Совещание" } }));
+    expect(linesNamed(masterLines(plan.continuation.ics), "RRULE")).toEqual(["RRULE:FREQ=WEEKLY;UNTIL=20261124T070000Z"]);
+  });
+
+  it("у серии на весь день UNTIL остаётся датой", () => {
+    const o = load(calendar([], vevent(["DTSTART;VALUE=DATE:20261019", "DTEND;VALUE=DATE:20261020",
+      "RRULE:FREQ=DAILY;UNTIL=20261024", "SUMMARY:Дела"])));
+    const plan = split(update(o, { scope: "this_and_following", instanceStart: "2026-10-22", patch: { summary: "Иное" } }));
+    expect(linesNamed(masterLines(plan.continuation.ics), "RRULE")).toEqual(["RRULE:FREQ=DAILY;UNTIL=20261024"]);
   });
 });

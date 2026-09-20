@@ -23,7 +23,7 @@ export function registerTimeZone(tzid: string, vtimezoneIcs?: string): ICAL.Time
   const existing = ICAL.TimezoneService.get(tzid);
   if (existing) return existing;
 
-  const ics = vtimezoneIcs ?? tzdb.getVtimezoneComponent(tzid);
+  const ics = vtimezoneIcs ?? vtimezoneIcsFor(tzid);
   if (!ics) throw new Error(`Неизвестный часовой пояс: ${tzid}`);
 
   const component = parseVtimezone(ics, tzid);
@@ -54,7 +54,7 @@ export function registerTimeZone(tzid: string, vtimezoneIcs?: string): ICAL.Time
  * (node_modules/ical.js/lib/ical/helpers.js, clone).
  */
 export function vtimezoneFor(tzid: string): ICAL.Component {
-  const ics = tzdb.getVtimezoneComponent(tzid);
+  const ics = vtimezoneIcsFor(tzid);
   if (ics) return parseVtimezone(ics, tzid);
 
   const registered = ICAL.TimezoneService.get(tzid)?.component;
@@ -64,6 +64,41 @@ export function vtimezoneFor(tzid: string): ICAL.Component {
     return copy;
   }
   throw new Error(`Неизвестный часовой пояс: ${tzid}`);
+}
+
+/**
+ * Описание пояса из базы IANA по имени, с учётом того, что имена поясов
+ * регистронезависимы: «europe/berlin» называет тот же пояс, что
+ * «Europe/Berlin», и `Intl.DateTimeFormat` принимает оба написания.
+ * `@touch4it/ical-timezones` ищет по точному имени и на неканоническом
+ * написании отдаёт пустоту — поэтому имя, которого в базе нет как есть,
+ * приводится к каноническому виду средствами ICU и ищется ещё раз. Так
+ * законное имя пояса перестаёт быть отказом unknown-timezone.
+ *
+ * Найденное описание получает ЗАПРОШЕННОЕ имя (`parseVtimezone` ставит его в
+ * TZID): значения объекта ссылаются на пояс тем именем, которое в них
+ * записано, и подменять его каноническим нельзя — DTSTART и RECURRENCE-ID
+ * разъехались бы по разным TZID (О4).
+ */
+function vtimezoneIcsFor(tzid: string): string | undefined {
+  const direct = tzdb.getVtimezoneComponent(tzid);
+  if (direct) return direct;
+  const canonical = canonicalTzid(tzid);
+  if (canonical === undefined || canonical === tzid) return undefined;
+  return tzdb.getVtimezoneComponent(canonical) || undefined;
+}
+
+/**
+ * Каноническое написание имени пояса по базе ICU; имя не из IANA (и вообще
+ * любое, которого ICU не знает) — undefined. `Intl.DateTimeFormat` на
+ * неизвестном поясе бросает RangeError.
+ */
+function canonicalTzid(tzid: string): string | undefined {
+  try {
+    return new Intl.DateTimeFormat("en-US", { timeZone: tzid }).resolvedOptions().timeZone;
+  } catch {
+    return undefined;
+  }
 }
 
 // Разбирает описание пояса (с обёрткой VCALENDAR или без) в отдельный

@@ -679,6 +679,48 @@ describe("время (О8)", () => {
 // корректная встреча получала отказ invalid-time.
 //
 // Берлин, 28.03.2027: в 02:00 CET часы переводятся на 03:00 CEST.
+describe("края значений года (RFC 5545 §3.3.4, §3.3.5)", () => {
+  const timed = calendar(MOSCOW, vevent(["DTSTART;TZID=Europe/Moscow:20261021T100000",
+    "DTEND;TZID=Europe/Moscow:20261021T110000", "SUMMARY:Встреча"]));
+  const allDay = calendar([], vevent(["DTSTART;VALUE=DATE:20261021", "DTEND;VALUE=DATE:20261022", "SUMMARY:Дела"]));
+
+  it("год меньше 1000 — отказ invalid-time: ical.js записал бы его без дополнения до четырёх цифр", () => {
+    // Без проверки выходило DTSTART;VALUE=DATE:1-01-01 вместо 00010101 — значение,
+    // которого не прочтёт ни сервер, ни следующее чтение объекта.
+    for (const patch of [{ start: "0001-01-01" }, { start: "0999-12-31" }] as const) {
+      const error = refusal(() => patchMaster(allDay, patch));
+      expect(error.code).toBe("invalid-time");
+      expect(error.message).toContain("вне 1000–9999");
+    }
+    const timedError = refusal(() => patchMaster(timed, { start: "0001-01-01T10:00:00", end: "0001-01-01T11:00:00" }));
+    expect(timedError.code).toBe("invalid-time");
+  });
+
+  it("верхний край: перенос длительности за 9999 год — отказ, а не месяц 0 в DTEND", () => {
+    // Прежде выходило DTEND;TZID=Europe/Moscow:1000-0-01T0:0:0, и переполнение не ловилось нигде.
+    const error = refusal(() => patchMaster(timed, { start: "9999-12-31T23:30:00" }));
+    expect(error.code).toBe("invalid-time");
+    expect(error.message).toContain("вне 1000–9999");
+    // У события на весь день конец — день после последнего затронутого: он тоже переполняется.
+    expect(refusal(() => patchMaster(allDay, { start: "9999-12-31" })).code).toBe("invalid-time");
+  });
+
+  it("края внутри диапазона правка пишет как есть: год всегда четырьмя цифрами", () => {
+    const { master } = patchMaster(timed, { start: "9999-12-31T22:00:00", end: "9999-12-31T23:00:00" });
+    expect(lines(master, "dtstart")).toEqual(["DTSTART;TZID=Europe/Moscow:99991231T220000"]);
+    expect(lines(master, "dtend")).toEqual(["DTEND;TZID=Europe/Moscow:99991231T230000"]);
+    const { master: low } = patchMaster(allDay, { start: "1000-01-01", end: "1000-01-02" });
+    expect(lines(low, "dtstart")).toEqual(["DTSTART;VALUE=DATE:10000101"]);
+  });
+
+  it("патч, который время не двигает, у объекта с годом за краем не отказывает", () => {
+    // Порча чужого клиента — не повод отказывать правке, которая её не читает.
+    const ancient = calendar([], vevent(["DTSTART;VALUE=DATE:10000101", "DTEND;VALUE=DATE:10000102", "SUMMARY:Дела"]));
+    const { result } = patchMaster(ancient, { summary: "Другое" });
+    expect(result.changed).toEqual(["summary"]);
+  });
+});
+
 describe("конец при DURATION — как в выдаче (RFC 5545 §3.3.6, §3.8.2.5)", () => {
   const berlin = (start: string, duration: string, ...extra: string[]) =>
     calendar([], vevent([`DTSTART;TZID=Europe/Berlin:${start}`, `DURATION:${duration}`, ...extra, "SUMMARY:Встреча"]));
@@ -986,6 +1028,19 @@ describe("patchRule (Р4): меняются только переданные ч
     expect(first.result).toEqual({ changed: true, lostParts: [] });
     expect(namesOf(first.touched, first.master)).toEqual(["rrule"]);
     expect(patch("RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,WE;COUNT=4", { count: 5 }).rule).toBe("RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,WE;COUNT=5");
+  });
+
+  it("шаг повтора ограничен: INTERVAL=1000000 — отказ invalid-rule, а не разворот за пределы календаря", () => {
+    // Без предела план строился, а разворот (и у планировщика, и у
+    // предохранителя) уходил в район миллионного года: ical.js разворачивал
+    // YEARLY-правила самого VTIMEZONE от 1970-го до него, и процесс кончался
+    // нехваткой памяти, не оставив ни отказа, ни сообщения.
+    const error = refusal(() => patch("RRULE:FREQ=DAILY", { interval: 1_000_000 }));
+    expect(error.code).toBe("invalid-rule");
+    expect(error.message).toContain("не больше 1000");
+    expect(refusal(() => patch("RRULE:FREQ=WEEKLY;COUNT=4", { interval: 1001 })).code).toBe("invalid-rule");
+    // Предел не мешает разумному шагу.
+    expect(patch("RRULE:FREQ=DAILY;COUNT=4", { interval: 1000 }).rule).toBe("RRULE:FREQ=DAILY;COUNT=4;INTERVAL=1000");
   });
 
   it("неизвестные модели части (BYMONTHDAY, BYMONTH, RSCALE, X-) целы", () => {

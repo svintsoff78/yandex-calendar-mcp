@@ -1,10 +1,10 @@
 import type ICAL from "ical.js";
 import { occurrencesOf, unreadableReason } from "./expand.js";
-import { parseAddress, type EventMeta } from "./instances.js";
+import { instanceAt, parseAddress, toCalendarEvent, type EventMeta, type Instance } from "./instances.js";
 import { isUnparsable, loadObject, serializeObject, type CalendarObject, type OverrideRef } from "./object.js";
 import type { EventPatch, Expectation, PatchField, RecurrencePatch, WritePlan } from "./plan.js";
 import { iterateSlots, seriesExtent } from "./slots.js";
-import { compareSlotKeys, instantOf, listKeys, parseModelTime, type IcalEnv, type SlotKey } from "./values.js";
+import { compareSlotKeys, instantOf, listKeys, parseModelTime, ruleDict, type IcalEnv, type SlotKey } from "./values.js";
 import type { Attendee, CalendarEvent } from "../types.js";
 
 /**
@@ -91,7 +91,9 @@ import type { Attendee, CalendarEvent } from "../types.js";
  * - `plan-shape` — план не отвечает операции (правка удаляет объект, разрез
  *   не у update this_and_following, пустой план с убранными встречами,
  *   запись слово в слово прочитанным текстом);
- * - `unparsable` — прочитанный или записываемый текст не разобран;
+ * - `unparsable` — прочитанный или записываемый текст не разобран (им же
+ *   выражается всякая чужая ошибка разбора значения, до которой сверка
+ *   добралась: наружу предохранитель голых ошибок не выпускает);
  * - `invariant` — у записываемого объекта чужой UID или UID продолжения
  *   разреза совпал с исходным;
  * - `untouched-changed` — изменено поле, которого патч не называл, или
@@ -182,6 +184,21 @@ export const HORIZON_YEARS = 2;
  * частота была бы не видна вовсе: расходиться такие серии начинают дальше.
  */
 export const EXTRA_SLOTS = 5;
+/**
+ * Абсолютный край горизонта: дальше этого года встречи не разворачиваются.
+ *
+ * Предел нужен не ради скорости, а чтобы разворот вообще закончился.
+ * `FREQ=DAILY;INTERVAL=1000000` уводит вторую встречу в район 4764 года, а
+ * четырёхсотую — за миллионный; ical.js, считая смещение пояса на такую
+ * дату, разворачивает YEARLY-правила самого VTIMEZONE от 1970-го до
+ * запрошенного года — миллионы переходов, на которых процесс кончается
+ * нехваткой памяти, не оставив ни отказа, ни сообщения. Год 9999 — тот же
+ * край, которым ограничены значения времени (RFC 5545 §3.3.5 и patch.ts,
+ * MAX_YEAR): встречу дальше него календарь и записать не может.
+ */
+export const HORIZON_MAX_YEAR = 9999;
+/** Последний миг последнего года, который календарь ещё записывает. */
+const HORIZON_MAX_MS = Date.UTC(HORIZON_MAX_YEAR + 1, 0, 1) - 1;
 
 const DAY_MS = 86_400_000;
 const YEAR_MS = 365 * DAY_MS;
@@ -221,6 +238,27 @@ const SNAPSHOT: readonly { name: string; label: string; field?: PatchField }[] =
  * компоненты правка трогала.
  */
 export function verifyPlan(beforeIcs: string, plan: WritePlan, env: IcalEnv, options: GuardOptions = {}): void {
+  try {
+    checkPlan(beforeIcs, plan, env, options);
+  } catch (error) {
+    if (error instanceof GuardError) throw error;
+    // Всякая остановка записи выражена GuardError: по коду оркестрация
+    // решает, что показать. Чужая ошибка (ical.js на значении, которого не
+    // прочесть, — «Could not extract integer from ":0"») голой наружу не
+    // выходит: снаружи она неотличима от сбоя вызова, и запись, которую
+    // предохранитель на деле остановил, выглядела бы упавшей на полпути.
+    throw new GuardError([
+      {
+        code: "unparsable",
+        message:
+          `Сверить план не удалось: ${messageOf(error)}. Значение в объекте или в записываемом тексте не прочитать — ` +
+          "запись не выполняется.",
+      },
+    ]);
+  }
+}
+
+function checkPlan(beforeIcs: string, plan: WritePlan, env: IcalEnv, options: GuardOptions): void {
   // Аннотация обязательна: без неё вывод типов не признаёт `findings.fail` невозвращающим.
   const findings: Findings = new Findings();
   const expect = plan.expect;
@@ -257,7 +295,9 @@ export function verifyPlan(beforeIcs: string, plan: WritePlan, env: IcalEnv, opt
   checkRewrite(ctx, plan, sides);
   checkOtherComponents(ctx, sides);
 
-  const window = windowOf(ctx, [before, ...sides.map((side) => side.o)]);
+  const objects = [before, ...sides.map((side) => side.o)];
+  checkHorizon(ctx, objects);
+  const window = windowOf(ctx, objects);
   const beforeSet = recordsOf(ctx, before, window, "прочитанный объект", undefined);
   const afterSet = new Map<SlotKey, Rec>();
   for (const side of sides) {
@@ -570,22 +610,94 @@ function windowOf(ctx: Ctx, objects: readonly CalendarObject[]): Window {
       toMs = Math.max(toMs, ms + DAY_MS);
     }
     // Конец конечной серии — только пока она короче упора: длинную всё равно
-    // подрежет набор, а разворачивать её до конца незачем.
+    // подрежет набор, а разворачивать её до конца незачем. Серию, чьи первые
+    // позиции уходят за абсолютный край горизонта, до конца не проходят
+    // вовсе (`withinHorizon`): проход по ней и есть та нехватка памяти.
+    if (!withinHorizon(o)) continue;
     const extent = seriesExtent(o, MEETINGS_CAP);
     if (extent.kind === "finite" && extent.last) toMs = Math.max(toMs, instantOf(extent.last.time, ctx.env) + DAY_MS);
   }
   if (!Number.isFinite(fromMs)) fromMs = ctx.nowMs;
   toMs = Math.max(toMs, Math.max(ctx.nowMs, fromMs) + HORIZON_YEARS * YEAR_MS);
   for (const o of objects) {
+    if (!withinHorizon(o)) continue;
     const dense = slotBeyondCap(o, ctx.env);
     if (dense !== undefined) toMs = Math.min(toMs, dense);
   }
   const horizon = toMs;
   for (const o of objects) {
+    if (!withinHorizon(o)) continue;
     const sparse = slotsBeyondHorizon(o, horizon, ctx.env);
     if (sparse !== undefined) toMs = Math.max(toMs, sparse);
   }
-  return { fromMs, toMs };
+  // Абсолютный край: дальше {@link HORIZON_MAX_YEAR} окно не тянется ни явным
+  // значением, ни пробой за горизонт.
+  return { fromMs, toMs: Math.max(fromMs, Math.min(toMs, HORIZON_MAX_MS)) };
+}
+
+/**
+ * Шаг повтора (в годах) уводит встречи за абсолютный край горизонта: такую
+ * серию не развернуть — уже на второй позиции ical.js считает смещение пояса
+ * на дату, до которой разворачивает VTIMEZONE миллионами переходов. Отказ,
+ * а не молчаливая подрезка: набор встреч у такого объекта не сверить, и
+ * выдать его за сверенный нельзя.
+ */
+function checkHorizon(ctx: Ctx, objects: readonly CalendarObject[]): void {
+  const labels = ["прочитанный объект", "записываемый объект", "второй записываемый объект"];
+  objects.forEach((o, index) => {
+    const step = stepYears(o);
+    if (step <= 0 || startYear(o) + step <= HORIZON_MAX_YEAR) return;
+    ctx.findings.fail(
+      "series-too-long",
+      `${capital(labels[index] ?? "записываемый объект")}: шаг повтора — около ${Math.round(step)} лет, и уже следующая ` +
+        `встреча серии уходит за ${HORIZON_MAX_YEAR} год. Такую серию не развернуть, и план не сверить.`,
+    );
+  });
+}
+
+/** Первые сверяемые позиции серии укладываются в абсолютный край горизонта. */
+function withinHorizon(o: CalendarObject): boolean {
+  return startYear(o) + (MEETINGS_CAP + EXTRA_SLOTS) * stepYears(o) <= HORIZON_MAX_YEAR;
+}
+
+/** Лет между соседними позициями — грубо, по FREQ и INTERVAL; без правил — 0. */
+const YEARS_PER_STEP: Readonly<Record<string, number>> = {
+  secondly: 1 / 31_557_600,
+  minutely: 1 / 525_960,
+  hourly: 1 / 8766,
+  daily: 1 / 365.25,
+  weekly: 7 / 365.25,
+  monthly: 1 / 12,
+  yearly: 1,
+};
+
+function stepYears(o: CalendarObject): number {
+  let step = 0;
+  for (const event of o.root.getAllSubcomponents("vevent")) {
+    for (const property of event.getAllProperties("rrule")) {
+      let dict: ReturnType<typeof ruleDict>;
+      try {
+        dict = ruleDict(property);
+      } catch {
+        continue; // не правило — шагу неоткуда взяться
+      }
+      const per = YEARS_PER_STEP[String(dict.freq ?? "").toLowerCase()];
+      const interval = Number(dict.interval ?? 1);
+      if (per === undefined || !Number.isFinite(interval) || interval < 1) continue;
+      step = Math.max(step, per * interval);
+    }
+  }
+  return step;
+}
+
+/** Год начала объекта: меньший DTSTART его компонентов; без них — текущий по краю горизонта. */
+function startYear(o: CalendarObject): number {
+  let year = Infinity;
+  for (const event of o.root.getAllSubcomponents("vevent")) {
+    const dtstart = event.getFirstPropertyValue("dtstart") as ICAL.Time | null;
+    if (dtstart) year = Math.min(year, dtstart.year);
+  }
+  return Number.isFinite(year) ? year : HORIZON_MAX_YEAR;
 }
 
 /**
@@ -601,6 +713,7 @@ function slotsBeyondHorizon(o: CalendarObject, horizonMs: number, env: IcalEnv):
     for (const slot of iterateSlots(o)) {
       if (++seen > MEETINGS_CAP + EXTRA_SLOTS) return undefined;
       const ms = instantOf(slot.time, env);
+      if (ms > HORIZON_MAX_MS) return undefined; // за абсолютным краем окно не тянут
       if (ms <= horizonMs) continue;
       if (++beyond >= EXTRA_SLOTS) return ms + DAY_MS;
     }
@@ -620,8 +733,10 @@ function slotBeyondCap(o: CalendarObject, env: IcalEnv): number | undefined {
   let seen = 0;
   try {
     for (const slot of iterateSlots(o)) {
+      const ms = instantOf(slot.time, env);
+      if (ms > HORIZON_MAX_MS) return undefined; // за абсолютным краем подрезать нечего
       if (++seen <= MEETINGS_CAP) continue;
-      return instantOf(slot.time, env) + DAY_MS;
+      return ms + DAY_MS;
     }
   } catch {
     // Серию не перебрать — подрезать по густоте не по чему.
@@ -711,10 +826,32 @@ function recordsOf(ctx: Ctx, o: CalendarObject, window: Window, label: string, s
     else records.set(rec.key, rec);
   }
   for (const [key, refs] of o.overrides) {
-    if (o.roles.get(refs[0].component)?.role !== "hidden" || records.has(key)) continue;
-    records.set(key, hiddenRecord(ctx, o, key, refs, side));
+    if (records.has(key)) continue;
+    if (o.roles.get(refs[0].component)?.role === "hidden") {
+      records.set(key, hiddenRecord(ctx, o, key, refs, side));
+      continue;
+    }
+    // Встреча со своим компонентом, чьё время лежит за концом окна: правка
+    // перенесла её на годы вперёд, и разворот окна её не находит. Пропажей
+    // она не является — компонент на месте, — а раздвинуть окно до неё
+    // нельзя: густую серию до того года не перебрать. Читается она прямо по
+    // своему компоненту, без перебора серии.
+    const instance = ownInstance(o, key);
+    // Место в наборе — по адресу встречи, а не по её началу: началом она за
+    // концом набора, и подрезка ({@link trim}) выбросила бы её с одной
+    // стороны, а с другой оставила — вышла бы мнимая пропажа.
+    if (instance) records.set(key, { ...visibleRecord(ctx, o, toCalendarEvent(o, instance, META), side), ms: keyMs(key, ctx.env) });
   }
   return records;
+}
+
+/** Встреча переопределения по её собственному компоненту; серию не перебирает. */
+function ownInstance(o: CalendarObject, key: SlotKey): Instance | undefined {
+  try {
+    return instanceAt(o, key);
+  } catch {
+    return undefined; // серию не перебрать — читать нечего
+  }
 }
 
 function visibleRecord(ctx: Ctx, o: CalendarObject, event: CalendarEvent, side: Side | undefined): Rec {

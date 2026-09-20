@@ -49,6 +49,20 @@ describe("registerTimeZone", () => {
     expect(() => registerTimeZone("Mars/Olympus_Mons")).toThrow(/Неизвестный часовой пояс/);
   });
 
+  it("имя пояса регистронезависимо: europe/berlin — тот же пояс, что Europe/Berlin", () => {
+    // Intl.DateTimeFormat принимает оба написания, а база ищет по точному
+    // имени; без приведения к канону законное имя становилось отказом
+    // unknown-timezone.
+    const zone = registerTimeZone("europe/berlin");
+    const summer = new ICAL.Time({ year: 2026, month: 7, day: 1, hour: 12, minute: 0, second: 0, isDate: false }, zone);
+    const winter = new ICAL.Time({ year: 2026, month: 12, day: 1, hour: 12, minute: 0, second: 0, isDate: false }, zone);
+
+    // TZID — запрошенное имя: значения объекта ссылаются на пояс тем именем, которое в них записано (О4).
+    expect(zone.tzid).toBe("europe/berlin");
+    expect(summer.utcOffset()).toBe(2 * 3600);
+    expect(winter.utcOffset()).toBe(1 * 3600);
+  });
+
   it("у пояса-синонима tzid совпадает с запрошенным именем, а не с каноническим из базы", () => {
     // База отдаёт для US/Eastern описание с TZID:America/New_York. Если tzid
     // зоны взять из описания, RECURRENCE-ID и EXDATE, записанные по её tzid,
@@ -140,6 +154,15 @@ describe("vtimezoneFor", () => {
 
     expect(tzidOf(copy)).toBe("Test/Alias-Plus-Two");
     expect(tzidOf(described)).toBe("Test/Fixed-Plus-Two");
+  });
+
+  it("имя в другом регистре находит описание в базе, TZID — запрошенное имя", () => {
+    const component = vtimezoneFor("europe/berlin");
+    const zone = new ICAL.Timezone({ component, tzid: "europe/berlin" });
+
+    expect(tzidOf(component)).toBe("europe/berlin");
+    expect(new ICAL.Time({ year: 2026, month: 7, day: 1, hour: 12, minute: 0, second: 0, isDate: false }, zone)
+      .utcOffset()).toBe(2 * 3600);
   });
 
   it("бросает понятную ошибку для неизвестного пояса", () => {

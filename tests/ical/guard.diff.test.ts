@@ -663,6 +663,62 @@ describe("длинная серия", () => {
   });
 });
 
+// ─────────────────────────────── края горизонта ───────────────────────────────
+
+describe("края горизонта", () => {
+  it("огромный шаг повтора — отказ GuardError, а не обвал кучи", () => {
+    // FREQ=DAILY;INTERVAL=1000000 уводит вторую встречу в район 4764 года, а
+    // четырёхсотую — за миллионный: ical.js, считая смещение пояса на такую
+    // дату, разворачивает YEARLY-правила самого VTIMEZONE от 1970-го до неё,
+    // и процесс кончается нехваткой памяти, не оставив ни отказа, ни
+    // сообщения.
+    const huge = calendar(vevent(["DTSTART;TZID=Europe/Moscow:20261019T100000",
+      "DTEND;TZID=Europe/Moscow:20261019T110000", "SUMMARY:Планёрка", "RRULE:FREQ=YEARLY;INTERVAL=9000"]));
+    const after = calendar(vevent(["DTSTART;TZID=Europe/Moscow:20261019T100000",
+      "DTEND;TZID=Europe/Moscow:20261019T110000", "SUMMARY:Совещание", "RRULE:FREQ=YEARLY;INTERVAL=9000"]));
+    const plan = putPlan(after, { op: "update", scope: "all_series", fields: ["summary"] });
+    expect(guardCodes(huge, plan, { patch: { summary: "Совещание" } })).toEqual(["series-too-long"]);
+  });
+
+  it("встреча, перенесённая за горизонт, пропажей не считается: её читают по её компоненту", () => {
+    // Перенос одной встречи бесконечной серии на 9999 год законен, а окно
+    // разворота до того года не дотянуть — густую серию до него не перебрать.
+    const daily = calendar(vevent(["DTSTART;TZID=Europe/Moscow:20261019T100000",
+      "DTEND;TZID=Europe/Moscow:20261019T110000", "SUMMARY:Планёрка", "RRULE:FREQ=DAILY"]));
+    const after = calendar(
+      vevent(["DTSTART;TZID=Europe/Moscow:20261019T100000", "DTEND;TZID=Europe/Moscow:20261019T110000",
+        "SUMMARY:Планёрка", "RRULE:FREQ=DAILY"]),
+      override("20261021T100000", "99991231T230000", "99991231T233000", "SUMMARY:Планёрка"),
+    );
+    const plan = putPlan(after, { op: "update", scope: "this", target: timeKey("2026-10-21T10:00:00+03:00"), fields: ["start"] });
+    expect(guardCodes(daily, plan, { patch: { start: "9999-12-31T23:00:00" } })).toEqual([]);
+  });
+
+  it("чужая ошибка разбора внутри сверки становится GuardError, а не голой Error", () => {
+    // Шапка guard.ts обещает: всякая остановка записи выражена GuardError, и
+    // оркестрация решает по коду, что показать.
+    const plan = putPlan(PLANNING, { op: "update", scope: "all_series", fields: ["summary"] });
+    const broken: WritePlan = {
+      ...plan,
+      expect: {
+        ...plan.expect,
+        get keyMap(): never {
+          throw new Error('Could not extract integer from ":0"');
+        },
+      },
+    };
+    let caught: unknown;
+    try {
+      verifyPlan(PLANNING, broken, ENV, { now: NOW, patch: { summary: "Совещание" } });
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(GuardError);
+    expect((caught as GuardError).code).toBe("unparsable");
+    expect((caught as GuardError).message).toContain("Could not extract integer");
+  });
+});
+
 // ─────────────────────────────── форма плана ───────────────────────────────
 
 describe("форма плана", () => {

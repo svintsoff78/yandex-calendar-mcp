@@ -29,6 +29,7 @@ import {
 } from "./object.js";
 import {
   applyFieldPatch,
+  checkYear,
   cloneComponent,
   distortedParts,
   inheritFields,
@@ -380,12 +381,18 @@ function refuseCorrupted(o: CalendarObject, op: EditOp, scope: EditScope): void 
  * Такие операции отказа не заслуживают: иначе объект, испорченный чужим
  * клиентом, нельзя было бы даже разобрать по частям.
  *
- * `replaced` — патч назвал и начало, и конец: новое время приходит целиком из
- * патча, прежнее не читается, и порча, которую такая запись переписывает,
- * правке не мешает (см. `BrokenTime.replaceable`). Так правка, которая как
- * раз и чинит время события, не упирается в отказ из-за этого же времени.
+ * `replaced` — по компоненту: пишет ли патч его время целиком (см.
+ * `replacesTime`). Такая запись прежнего конца не переносит и порчу как раз
+ * чинит, поэтому из-за этого же времени не отказывает.
+ *
+ * Вызывается там, где уже видно, что план — запись: пустой план ничего не
+ * пишет (О13), и порча чужого клиента ему не помеха.
  */
-function refuseBrokenTime(o: CalendarObject, components: readonly ICAL.Component[], replaced = false): void {
+function refuseBrokenTime(
+  o: CalendarObject,
+  components: readonly ICAL.Component[],
+  replaced: (c: ICAL.Component) => boolean = () => false,
+): void {
   const list = brokenTimes(o, components, replaced);
   if (list.length === 0) return;
   throw new EditRefusal(
@@ -396,14 +403,46 @@ function refuseBrokenTime(o: CalendarObject, components: readonly ICAL.Component
   );
 }
 
+/**
+ * Правка, считающая новое время от испорченного чужим клиентом значения,
+ * упирается в отказ «конец не позже начала» — это следствие порчи, а не её
+ * причина. Здесь такой отказ заменяется отказом на самой порче: он говорит,
+ * что именно записано против RFC 5545 и как объект всё-таки удалить.
+ *
+ * Отказ на порче в обход этой замены не ставится раньше времени: он стоит
+ * там, где уже видно, что план — запись, потому что пустой план ничего не
+ * пишет (О13).
+ */
+function keepingBrokenTime<T>(refuse: () => void, run: () => T): T {
+  try {
+    return run();
+  } catch (error) {
+    if (error instanceof EditRefusal && error.code === "invalid-time") refuse();
+    throw error;
+  }
+}
+
 /** Все VEVENT объекта: продолжение разреза уносит с собой и переопределения. */
 function allEvents(o: CalendarObject): ICAL.Component[] {
   return o.root.getAllSubcomponents("vevent");
 }
 
-/** Патч назвал время целиком: и начало, и конец приходят из него. */
-function fullTime(fields: FieldPatch): boolean {
-  return fields.start !== undefined && fields.end !== undefined;
+/**
+ * Патч пишет время компонента целиком, и прежний испорченный конец в запись
+ * не попадает (О8, patch.ts, resolveTimes):
+ * - `end` (сам по себе или вместе со `start`) — конец назван патчем, начало
+ *   берётся из целого DTSTART или тоже из патча; DTEND рядом с DURATION при
+ *   этом снимается (`writeTimes`), то есть чинится и порча «два конца разом»;
+ * - `allDay: true` у события со временем — обе даты строятся из даты начала,
+ *   и число затронутых дней не меньше одного, каким бы ни был прежний конец.
+ * Прочие патчи времени (`start` в одиночку, `timeZone`) считают новое время
+ * от прежнего конца и несут порчу дальше — им отказ.
+ */
+function replacesTime(fields: FieldPatch, c: ICAL.Component): boolean {
+  if (fields.end !== undefined) return true;
+  if (fields.allDay !== true) return false;
+  const start = c.getFirstProperty("dtstart");
+  return start !== null && formOf(start) !== "date";
 }
 
 /**
@@ -420,51 +459,31 @@ function fullTime(fields: FieldPatch): boolean {
  * Последние два переезжают из основного компонента в переопределение
  * (update this) и в продолжение (update t&f), и сервер отвечает 400.
  */
-interface BrokenTime {
-  text: string;
-  /**
-   * Порча целиком переписывается патчем, который назвал и начало, и конец:
-   * оба значения приходят из патча, старые не читаются. Два конца разом так
-   * не лечатся: патч пишет одно из двух свойств, второе остаётся на месте и
-   * противоречие сохраняется.
-   */
-  replaceable: boolean;
-}
-
-function brokenTime(c: ICAL.Component, env: IcalEnv): BrokenTime | undefined {
+function brokenTime(c: ICAL.Component, env: IcalEnv): string | undefined {
   const start = c.getFirstProperty("dtstart");
   const dtend = c.getFirstProperty("dtend");
   if (!start) return undefined;
   if (dtend && c.hasProperty("duration")) {
-    return {
-      text: "записаны сразу DTEND и DURATION (RFC 5545 §3.6.1 разрешает только одно), и длительности у них разные по смыслу",
-      replaceable: false,
-    };
+    return "записаны сразу DTEND и DURATION (RFC 5545 §3.6.1 разрешает только одно), и длительности у них разные по смыслу";
   }
   if (!dtend) return undefined;
   if ((formOf(start) === "date") !== (formOf(dtend) === "date")) {
-    return {
-      text: "начало записано датой, а конец — временем (RFC 5545 §3.8.2.2: формы DTSTART и DTEND совпадают)",
-      replaceable: true,
-    };
+    return "начало записано датой, а конец — временем (RFC 5545 §3.8.2.2: формы DTSTART и DTEND совпадают)";
   }
   const from = start.getFirstValue() as ICAL.Time;
   const to = dtend.getFirstValue() as ICAL.Time;
   if (instantOf(to, env) > instantOf(from, env)) return undefined;
-  return {
-    text:
-      `конец ${formatForModel(to, env, "time")} не позже начала ${formatForModel(from, env, "time")} ` +
-      "(RFC 5545 §3.6.1 требует конец позже начала)",
-    replaceable: true,
-  };
+  return (
+    `конец ${formatForModel(to, env, "time")} не позже начала ${formatForModel(from, env, "time")} ` +
+    "(RFC 5545 §3.6.1 требует конец позже начала)"
+  );
 }
 
-function brokenTimes(o: CalendarObject, components: readonly ICAL.Component[], replaced: boolean): string[] {
+function brokenTimes(o: CalendarObject, components: readonly ICAL.Component[], replaced: (c: ICAL.Component) => boolean): string[] {
   const found: string[] = [];
   for (const c of components) {
-    const broken = brokenTime(c, o.env);
-    if (broken === undefined || (replaced && broken.replaceable)) continue;
-    const reason = broken.text;
+    const reason = brokenTime(c, o.env);
+    if (reason === undefined || replaced(c)) continue;
     const rid = c.getFirstProperty("recurrence-id");
     const where = rid
       ? `у встречи ${formatForModel(rid.getFirstValue() as ICAL.Time, o.env, "instance")}`
@@ -1273,14 +1292,18 @@ function updateSingle(run: Run, patch: EventPatch, scope: EditScope): WritePlan 
   const key = slotKeyOf(o.master!.getFirstPropertyValue("dtstart") as ICAL.Time, o.form, o.env);
   if (roleOfKey(o, key) === "slot") return updateShownOverride(run, key, patch);
   // Как у серии: новое время считается от прежнего, правило раздаёт прежнюю
-  // длительность позициям. Правка одних полей времени не касается.
-  if (hasTimeFields(fieldsOf(patch)) || patch.recurrence !== undefined) {
-    refuseBrokenTime(o, [o.master!], fullTime(fieldsOf(patch)));
-  }
+  // длительность позициям. Правка одних полей времени не касается, а пустой
+  // план ничего не пишет — потому отказ стоит после проверки на пустоту.
+  const fields = fieldsOf(patch);
+  const refuseBroken = () => {
+    if (hasTimeFields(fields) || patch.recurrence !== undefined) {
+      refuseBrokenTime(o, [o.master!], (c) => replacesTime(fields, c));
+    }
+  };
   const work = copyOf(o);
   const master = work.master!;
   const touched = newTouched();
-  applyFieldPatch(master, fieldsOf(patch), patchContext(run, touched));
+  keepingBrokenTime(refuseBroken, () => applyFieldPatch(master, fields, patchContext(run, touched)));
   let ruleAdded = false;
   if (patch.recurrence !== undefined) {
     addRule(master, patch.recurrence, run.env, touched);
@@ -1288,6 +1311,7 @@ function updateSingle(run: Run, patch: EventPatch, scope: EditScope): WritePlan 
   }
   const expect = expectation("update", scope, requestedFields(patch), { target: key, touched });
   if (!touchedEvents(touched)) return { kind: "noop", expect, removed: [], notices: run.notices };
+  refuseBroken();
   stampTouched(run, [master], touched);
   const next = copyOf(work);
   // Скрытые компоненты (RECURRENCE-ID мимо начала) остаются скрытыми: новое начало или правило
@@ -1409,13 +1433,14 @@ function updateThis(run: Run, target: Target, patch: EventPatch): WritePlan {
   // испорченный компонент; копия в переопределение основной не чинит, и его
   // время остаётся в объекте таким же, каким было.
   const source = sourceComponent(o, target);
-  refuseBrokenTime(o, [source], fullTime(fields) && source !== o.master);
+  const refuseBroken = () => refuseBrokenTime(o, [source], (c) => source !== o.master && replacesTime(fields, c));
   const work = copyOf(o);
   const touched = newTouched();
   const component = targetComponent(work, target, touched);
-  applyFieldPatch(component, fields, patchContext(run, touched));
+  keepingBrokenTime(refuseBroken, () => applyFieldPatch(component, fields, patchContext(run, touched)));
   const expect = expectation("update", "this", requestedFields(patch), { target: target.key, touched });
   if (!touchedEvents(touched)) return { kind: "noop", expect, removed: [], notices: run.notices };
+  refuseBroken();
   stampTouched(run, [component], touched);
   return { kind: "put", ics: serializeObject(work), expect, removed: [], notices: run.notices };
 }
@@ -1566,10 +1591,16 @@ function updateAll(run: Run, patch: EventPatch, scope: EditScope, boundary?: Slo
   const toggle = fields.allDay !== undefined && fields.allDay !== (o.form === "date");
   if (toggle) refuseToggle(o, [...o.overrides.values()].flat().length > 0);
   // Новое время серии считается от прежнего, а новое правило раздаёт прежнюю
-  // длительность каждой позиции: испорченное время разошлось бы по всем
-  // встречам. Правка одних полей времени не касается — ей испорченное время
-  // не помеха.
-  if (hasTimeFields(fields) || recurrence !== undefined) refuseBrokenTime(o, allEvents(o), fullTime(fields));
+  // длительность каждой позиции: испорченное чужим клиентом время разошлось бы
+  // по всем встречам. Правка одних полей времени не касается, а пустой план
+  // ничего не пишет — потому отказ стоит после проверки на пустоту. Время
+  // целиком патч задаёт только основному компоненту: переопределения своё
+  // время хранят сами (О7), и их порча остаётся в объекте.
+  const refuseBroken = () => {
+    if (hasTimeFields(fields) || recurrence !== undefined) {
+      refuseBrokenTime(o, allEvents(o), (c) => c === source && replacesTime(fields, c));
+    }
+  };
   // Серия с несколькими RRULE сюда не доходит: она — испорченный объект (`refuseCorrupted`),
   // и правка любого scope в ней отвергается до разбора патча.
   const boundaryDate = boundary ? refuseForeignTimeOfDay(run, boundary, fields) : undefined;
@@ -1583,7 +1614,9 @@ function updateAll(run: Run, patch: EventPatch, scope: EditScope, boundary?: Slo
   const oldLength = lengthOf(master, env);
 
   // 1. Поля и время основного (Р1): время суток на прежней дате.
-  const applied = applyRebased(run, master, fields, touched, { place, literalLater: recurrence !== undefined, shownDate: boundaryDate });
+  const applied = keepingBrokenTime(refuseBroken, () =>
+    applyRebased(run, master, fields, touched, { place, literalLater: recurrence !== undefined, shownDate: boundaryDate }),
+  );
   const newLength = lengthOf(master, env);
   const startMoved = !sameTimeProperty(source.getFirstProperty("dtstart")!, master.getFirstProperty("dtstart")!);
   // Р1: начало вне первой позиции правила (другой клиент, BYHOUR) — отдельная
@@ -1663,6 +1696,7 @@ function updateAll(run: Run, patch: EventPatch, scope: EditScope, boundary?: Slo
 
   const expect = expectation("update", scope, requested, { target: boundary?.key, touched });
   if (!touchedEvents(touched)) return { kind: "noop", expect, removed: [], notices: run.notices };
+  refuseBroken();
   if (touched.names.get(master)?.has("rrule")) refuseDistorted(master, "менять правило или время серии");
   stampTouched(run, [master, ...infos.map((info) => info.component)], touched);
   const next = copyOf(work);
@@ -1881,15 +1915,31 @@ function prepareRule(run: Run, input: RuleStepInput): RuleStep {
       }
     } else if (role === "slot" || role === "detached") {
       step.drop.push(info.component);
-      step.traces.push({
-        instanceStart: keyLabel(input.source, info.oldKey, "instance"),
-        start: formatForModel(info.component.getFirstPropertyValue("dtstart") as ICAL.Time, env, "time"),
-        summary: summaryOf(info.component),
-        reason: "скрытый компонент (след прошлых правок) снят: в новом правиле он стал бы видимой встречей со старыми полями",
-      });
+      step.traces.push(hiddenTrace(input.source, info, env, "в новом правиле он стал бы видимой встречей со старыми полями"));
+    } else if (boundToSlot(input.source, info.oldKey, "hidden") && !boundToSlot(next, key, "hidden")) {
+      // Скрытый след стоял на слоте серии (закрытом EXDATE), а новое правило
+      // этого слота не даёт: его RECURRENCE-ID не совпадает больше ни с одной
+      // встречей, и на сервере он — сирота, из-за которой запись отвергается
+      // целиком. Адрес за правилом не двигается (`retime` ведёт его только по
+      // времени суток, дату задаёт правило), поэтому след снимается — как и
+      // всякая потеря сверх цели, с перечнем и confirm (О11).
+      step.drop.push(info.component);
+      step.traces.push(
+        hiddenTrace(input.source, info, env, "его адрес не совпадает ни с одной встречей нового правила, и запись была бы отвергнута"),
+      );
     }
   }
   return step;
+}
+
+/** Снятый скрытый след в перечне потерь: адрес, его время, заголовок и причина. */
+function hiddenTrace(source: CalendarObject, info: OverrideInfo, env: IcalEnv, reason: string): Loss {
+  return {
+    instanceStart: keyLabel(source, info.oldKey, "instance"),
+    start: formatForModel(info.component.getFirstPropertyValue("dtstart") as ICAL.Time, env, "time"),
+    summary: summaryOf(info.component),
+    reason: `скрытый компонент (след прошлых правок) снят: ${reason}`,
+  };
 }
 
 function commitRule(run: Run, root: ICAL.Component, step: RuleStep, touched: Touched): void {
@@ -1906,7 +1956,10 @@ function ruleConfirmMessage(step: RuleStep): string {
   return [
     step.lostParts.length > 0 ? `Правило задано заново (replace): теряются части прежнего правила ${step.lostParts.join(", ")}.` : "",
     step.losses.length > 0 ? "У изменённых или перенесённых встреч нет пары в новом правиле, и они будут удалены." : "",
-    step.traces.length > 0 ? "Скрытые компоненты серии в новом правиле стали бы видимыми встречами со старыми полями — они будут сняты." : "",
+    step.traces.length > 0
+      ? "Скрытые компоненты серии (следы прошлых правок) будут сняты: с новым правилом они стали бы видимыми встречами " +
+        "со старыми полями или остались бы без своей встречи вовсе."
+      : "",
   ].filter(Boolean).join(" ");
 }
 
@@ -1957,10 +2010,6 @@ type SlotTarget = Extract<Target, { kind: "single" | "slot" }>;
 function updateSplit(run: Run, target: SlotTarget, patch: EventPatch): WritePlan {
   const { o, env } = run;
   // Продолжение — копия основного компонента и переносимых переопределений:
-  // испорченное время ушло бы в новый объект, и сервер ответил бы 400. Время
-  // основного патч вправе задать целиком, время переопределений — нет.
-  refuseBrokenTime(o, [o.master!], fullTime(fieldsOf(patch)));
-  refuseBrokenTime(o, allEvents(o).filter((c) => c !== o.master));
   const boundary = target.key;
   const boundaryTime = target.slot.time;
   const label = target.instance.instanceStart;
@@ -2008,7 +2057,17 @@ function updateSplit(run: Run, target: SlotTarget, patch: EventPatch): WritePlan
   if (oldLength && master.hasProperty("dtend")) writeEnd(master, start, oldLength, env, contTouched, endFrame);
   const place = `у встреч с ${label}`;
   const settled = JSON.stringify(master.jCal);
-  const applied = applyRebased(run, master, fields, contTouched, { place, literalLater: recurrence !== undefined });
+  // Испорченное чужим клиентом время ушло бы в новый объект, и сервер ответил
+  // бы 400. Время основного патч вправе задать целиком, время
+  // переопределений — нет. Отказ стоит после проверки «патч ничего не
+  // меняет»: пустой план серию не делит и ничего не пишет (О13).
+  const refuseBroken = () => {
+    refuseBrokenTime(o, [o.master!], (c) => replacesTime(fields, c));
+    refuseBrokenTime(o, allEvents(o).filter((c) => c !== o.master));
+  };
+  const applied = keepingBrokenTime(refuseBroken, () =>
+    applyRebased(run, master, fields, contTouched, { place, literalLater: recurrence !== undefined }),
+  );
   // Меняет ли патч хоть что-то (О13): основной продолжения, встречу B или правило.
   let changed = JSON.stringify(master.jCal) !== settled;
 
@@ -2016,6 +2075,7 @@ function updateSplit(run: Run, target: SlotTarget, patch: EventPatch): WritePlan
   const rule = master.getFirstProperty("rrule");
   const count = rule ? ruleDict(rule).count : undefined;
   if (rule && count !== undefined) setRuleEnd(rule, { count: Number(count) - before }, contTouched);
+  if (rule) fixUntilForm(o, master, rule, env, contTouched);
 
   const mode = fields.start !== undefined || toggle ? "wall" : "moment";
   let retimed: Retimed;
@@ -2075,6 +2135,7 @@ function updateSplit(run: Run, target: SlotTarget, patch: EventPatch): WritePlan
     return { kind: "noop", expect: expectation("update", "this_and_following", requested, { target: boundary }), removed: [], notices: run.notices };
   }
 
+  refuseBroken();
   refuseUncuttable(o, boundary, "update");
   refusePeriodBoundary(o, target, oldLength);
   if (applied.literal) refuseEarlierContinuation(master, target);
@@ -2262,6 +2323,46 @@ function refuseEarlierContinuation(master: ICAL.Component, target: SlotTarget): 
     `Продолжение с ${target.instance.instanceStart} начиналось бы ${startDate}, раньше границы: его встречи легли бы на встречи, которые остаются в прежней серии.`,
     { hint: "Передайте start не раньше даты границы или измените всю серию (scope all_series)." },
   );
+}
+
+/**
+ * Конец правила продолжения — в форме, которой требует его DTSTART
+ * (RFC 5545 §3.3.10): у серии на весь день UNTIL — дата, у серии с TZID или
+ * в UTC — момент в UTC, у плавающей — плавающее время.
+ *
+ * Разрез копирует правило исходного объекта дословно, и UNTIL, записанный
+ * чужим клиентом не в той форме (датой или плавающим при DTSTART с TZID),
+ * переехал бы в продолжение как есть. Исходному объекту нарушение можно
+ * простить — оно там было и правка его не трогает; новорождённому
+ * продолжению оправдания нет: строгий сервер отвечает на такое правило 400.
+ *
+ * Значение приводится по смыслу, а не по буквам: берётся последняя встреча
+ * правила под прежним UNTIL — та самая, которой кончает серию ical.js и
+ * выдача (`lastSlotUpTo`), — и записывается в нужной форме, так что набор
+ * встреч не меняется. Если такой встречи нет или она дальше предела
+ * прохода, конец продолжения не вывести — отказ.
+ */
+function fixUntilForm(source: CalendarObject, master: ICAL.Component, rule: ICAL.Property, env: IcalEnv, touched: Touched): void {
+  const until = (rule.getFirstValue() as ICAL.Recur | null)?.until;
+  if (!until) return;
+  const form = formOf(master.getFirstProperty("dtstart")!);
+  if (untilFits(until, form)) return;
+
+  const last = lastSlotUpTo(source, until);
+  if (last.kind !== "slot") {
+    throw splitMismatch(
+      `Конец правила серии (UNTIL ${until.toString()}) записан не в той форме, что её начало (RFC 5545 §3.3.10), ` +
+        `и встречи, которой правило кончается, в серии не найти: конец продолжения не вывести`,
+    );
+  }
+  setRuleEnd(rule, { until: untilValue(last.slot.time, form) }, touched);
+}
+
+/** UNTIL записан в форме, которой требует форма DTSTART (RFC 5545 §3.3.10). */
+function untilFits(until: ICAL.Time, form: TimeForm): boolean {
+  if (form === "date") return until.isDate;
+  if (until.isDate) return false;
+  return formOf(until) === (form === "floating" ? "floating" : "utc");
 }
 
 function splitMismatch(message: string): EditRefusal {
@@ -3099,6 +3200,10 @@ function wallIn(run: Run, iso: string, frame: Frame, field: string): Wall | unde
     if (error instanceof ModelTimeError) throw new EditRefusal("invalid-time", `${field}: ${error.message}`);
     throw error;
   }
+  // Край года — до всякого счёта: год меньше 1000 ical.js пишет без
+  // дополнения до четырёх цифр, и в календарь ушло бы неразбираемое значение
+  // (patch.ts, checkYear).
+  checkYear(parsed.wall.year, field);
   if (frame.form === "date") {
     const { hour, minute, second } = parsed.wall;
     if (parsed.kind === "date" || (hour === 0 && minute === 0 && second === 0)) return { date: parsed.date, hour: 0, minute: 0, second: 0 };
