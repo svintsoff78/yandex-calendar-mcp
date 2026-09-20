@@ -6,7 +6,9 @@
 // Планировщик тут не участвует вовсе — проверяется сам измеритель
 // (semantics.ts, world.ts).
 import { describe, expect, it } from "vitest";
+import type { OraclePatch } from "./corpus.js";
 import { ORACLE_PATCHES, ORACLE_SEEDS } from "./corpus.js";
+import { isolatedRunner } from "./isolate.js";
 import { checkSemantics } from "./semantics.js";
 import { load, worldOf } from "./world.js";
 
@@ -151,6 +153,37 @@ describe("оракул ловит подделку", () => {
     expect(checkOn("email-alarm-moscow", moved, { scope: "all_series", entry: remindersPatch })).toEqual([]);
   });
 
+  // Р1: у серии из start и end берутся время суток И ДЛИТЕЛЬНОСТЬ. Разница
+  // дат между ними — часть длительности: прежний измеритель клал время суток
+  // конца на дату начала и объявлял верную правку нарушением.
+  it("конец на следующие сутки после начала — не нарушение", () => {
+    const overnight = ORACLE_PATCHES.find((p) => p.name === "start+end:через полночь")!;
+    // Серия 10:00–11:00 переехала на 23:00–01:00 следующих суток: даты слотов
+    // прежние (Р1), длительность — названные патчем два часа.
+    const moved = seed.ics
+      .replace("DTSTART;TZID=Europe/Moscow:20261019T100000", "DTSTART;TZID=Europe/Moscow:20261019T230000")
+      .replace("DTEND;TZID=Europe/Moscow:20261019T110000", "DTEND;TZID=Europe/Moscow:20261020T010000");
+    expect(check(moved, { scope: "all_series", entry: overnight })).toEqual([]);
+  });
+
+  it("конец на следующие сутки, записанный на дату начала, — нарушение", () => {
+    const overnight = ORACLE_PATCHES.find((p) => p.name === "start+end:через полночь")!;
+    // Тот же патч, но конец лёг на дату начала: встреча вышла вырожденной.
+    const collapsed = seed.ics
+      .replace("DTSTART;TZID=Europe/Moscow:20261019T100000", "DTSTART;TZID=Europe/Moscow:20261019T230000")
+      .replace("DTEND;TZID=Europe/Moscow:20261019T110000", "DTEND;TZID=Europe/Moscow:20261019T233000");
+    const problems = check(collapsed, { scope: "all_series", entry: overnight }).join(" ");
+    expect(problems).toContain("длительность встречи не прежняя");
+  });
+
+  it("end без start, перенесённый на следующие сутки, — не нарушение", () => {
+    // «end без start — ближайшее такое время суток после начала» (Р1): 01:00
+    // не позже 10:00, значит конец идёт на следующие сутки.
+    const entry: OraclePatch = { name: "end:01:00", patch: { end: "2026-11-05T01:00:00" }, kind: "time" };
+    const stretched = seed.ics.replace("DTEND;TZID=Europe/Moscow:20261019T110000", "DTEND;TZID=Europe/Moscow:20261020T010000");
+    expect(check(stretched, { scope: "all_series", entry })).toEqual([]);
+  });
+
   it("напоминание письмом, потерявшее адресата, — нарушение", () => {
     const alarms = named("email-alarm-moscow");
     const lost = alarms.ics
@@ -159,5 +192,57 @@ describe("оракул ловит подделку", () => {
     expect(checkOn("email-alarm-moscow", lost, { scope: "all_series", entry: remindersPatch }).join(" ")).toContain(
       "напоминание письмом осталось без адресата",
     );
+  });
+});
+
+// Сторожевое время — тоже часть измерителя: если зависший случай уносит весь
+// прогон, оракул молчит не потому, что нарушений нет, а потому, что до отчёта
+// дело не дошло.
+describe("сторожевое время обхода", () => {
+  /** Случай, который сам по себе считается мгновенно: ловится только предел. */
+  const spec = {
+    seedName: "weekly-count-moscow",
+    op: "update" as const,
+    scope: "all_series" as const,
+    role: "none",
+    patchName: "summary",
+  };
+
+  it("случай, не уложившийся в предел, — нарушение вида timeout", async () => {
+    const runner = isolatedRunner(1);
+    try {
+      const outcome = await runner.run(spec);
+      expect(outcome.findings).toHaveLength(1);
+      expect(outcome.findings[0].kind).toBe("timeout");
+      expect(outcome.findings[0].detail).toContain("не уложился в предел");
+      // Воспроизведение остаётся годным: по нему случай повторяют руками.
+      expect(outcome.findings[0].minimalRepro).toContain("planUpdate");
+    } finally {
+      await runner.close();
+    }
+  });
+
+  it("после обрыва обход идёт дальше — следующий случай считается в новом потоке", async () => {
+    const runner = isolatedRunner(1);
+    try {
+      const first = await runner.run(spec);
+      const second = await runner.run({ ...spec, patchName: "start" });
+      expect(first.findings[0].kind).toBe("timeout");
+      expect(second.findings[0].kind).toBe("timeout");
+      expect(second.findings[0].patch).toBe("start");
+    } finally {
+      await runner.close();
+    }
+  });
+
+  it("случай, уложившийся в предел, проходит через поток без следов", async () => {
+    const runner = isolatedRunner();
+    try {
+      const outcome = await runner.run(spec);
+      expect(outcome.findings.filter((f) => f.kind === "timeout")).toEqual([]);
+      expect(outcome.refused || outcome.noop || outcome.findings.length >= 0).toBe(true);
+    } finally {
+      await runner.close();
+    }
   });
 });

@@ -109,14 +109,50 @@ function wallOf(iso: string | undefined): Wall | undefined {
   };
 }
 
-/** Время суток патча поверх даты снимка (Р1: у серии берётся только время суток). */
-function timeOfDayOn(base: ICAL.Time, wall: Wall): ICAL.Time {
+/**
+ * Время суток патча поверх даты снимка, сдвинутой на `days` суток (Р1: у
+ * серии берётся только время суток). Сдвиг обязателен: без него конец,
+ * названный на следующие сутки после начала, ложился бы на дату начала и
+ * встреча выходила бы вырожденной — см. `seriesEnd`.
+ */
+function timeOfDayOn(base: ICAL.Time, wall: Wall, days = 0): ICAL.Time {
   const time = base.clone();
   time.isDate = false;
   time.hour = wall.hour;
   time.minute = wall.minute;
   time.second = wall.second;
+  if (days !== 0) time.adjust(days, 0, 0, 0);
   return time;
+}
+
+/** Номер дня стенной даты: разница дат считается без пояса процесса. */
+function dayNumber(wall: Wall): number {
+  const time = ICAL.Time.fromData(
+    { year: wall.year, month: wall.month, day: wall.day, hour: 0, minute: 0, second: 0, isDate: false },
+    ICAL.Timezone.utcTimezone,
+  );
+  return Math.round(time.toUnixTime() / 86_400);
+}
+
+/**
+ * Ожидаемый конец слота у серии (Р1: из патча берутся время суток и
+ * длительность, дата слота прежняя).
+ *
+ * - `start` и `end` вместе: у конца та же разница дат, что у них в патче, —
+ *   патч «23:00 → 01:00 следующих суток» задаёт двухчасовую встречу, а не
+ *   отрицательную. Прежний расчёт эту разницу терял и клал время суток конца
+ *   на дату начала;
+ * - `end` без `start`: дату конец выбирает сам — ближайшее такое время суток
+ *   после начала, то есть следующие сутки, когда названное время суток не
+ *   позже начала.
+ */
+function seriesEnd(start: ICAL.Time, patchStart: Wall | undefined, patchEnd: Wall): ICAL.Time {
+  const days = patchStart
+    ? dayNumber(patchEnd) - dayNumber(patchStart)
+    : secondsOfDay(patchEnd) <= secondsOfDay(start)
+      ? 1
+      : 0;
+  return timeOfDayOn(start, patchEnd, days);
 }
 
 /** Названный момент целиком в форме и поясе снимка (scope "this"). */
@@ -290,7 +326,7 @@ function allowedDurations(c: SemanticsCase, before: World): Set<number> {
     const startTime = start ? (whole ? wholeMoment(snap.startTime, start) : shifted(snap.startTime, shift)) : snap.startTime;
     const startMs = start ? msOf(startTime, ENV) : snap.startMs;
     let endMs: number;
-    if (end) endMs = msOf(whole ? wholeMoment(startTime, end) : timeOfDayOn(startTime, end), ENV);
+    if (end) endMs = msOf(whole ? wholeMoment(startTime, end) : seriesEnd(startTime, start, end), ENV);
     else if (start) endMs = whole ? startMs + (snap.endMs - snap.startMs) : msOf(shifted(snap.endTime, shift), ENV);
     else continue;
     if (endMs > startMs) out.add(endMs - startMs);
@@ -516,9 +552,10 @@ function checkTime(c: SemanticsCase, affected: Snap[], leftovers: string[], entr
     }
     if (end) {
       // Конец: у одиночного события и у "this" — названный момент, у серии —
-      // то же время суток на дате начала встречи.
+      // то же время суток на дате начала встречи, сдвинутой на разницу дат
+      // start и end в патче (seriesEnd).
       const base = startTime ?? snap.startTime;
-      const time = whole ? wholeMoment(base, end) : timeOfDayOn(base, end);
+      const time = whole ? wholeMoment(base, end) : seriesEnd(base, start, end);
       endMs = msOf(time, ENV);
     } else if (startTime) {
       // start без end сохраняет длительность: конец идёт тем же сдвигом.

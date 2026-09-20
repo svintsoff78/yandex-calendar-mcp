@@ -15,13 +15,18 @@ import { HORIZON_FROM, HORIZON_TO, NOW, PROBE, worldOf } from "./world.js";
 const FINDINGS = new URL("./findings.json", import.meta.url);
 const SUMMARY = new URL("./summary.md", import.meta.url);
 
-/** Обход целиком укладывается в минуту; предел с запасом (пункт 7). */
-const TIMEOUT = 180_000;
+/**
+ * Предел на весь обход. Случаи с краю значений (INTERVAL=1000000) не
+ * возвращают управление и каждый доживает до своего сторожевого предела
+ * (isolate.ts), поэтому обход идёт минутами, а не секундами; предел взят с
+ * запасом от замеренного времени.
+ */
+const TIMEOUT = 1_200_000;
 
 describe("оракул правки", () => {
   it("корпус покрывает всё, что перечислено в задании", () => {
-    expect(ORACLE_SEEDS.length).toBeGreaterThanOrEqual(31);
-    expect(ORACLE_PATCHES.length).toBeGreaterThanOrEqual(21);
+    expect(ORACLE_SEEDS.length).toBeGreaterThanOrEqual(33);
+    expect(ORACLE_PATCHES.length).toBeGreaterThanOrEqual(27);
     expect(ORACLE_SCOPES).toEqual(["this", "this_and_following", "all_series"]);
     // Пояса с переводом часов и без него — оба в корпусе.
     expect(ORACLE_SEEDS.some((seed) => seed.ics.includes("TZID:Europe/Moscow"))).toBe(true);
@@ -40,6 +45,29 @@ describe("оракул правки", () => {
     // Напоминания: патч в корпусе есть, и есть затравка с богатым письмом.
     expect(ORACLE_PATCHES.some((entry) => entry.name === "reminders")).toBe(true);
     expect(ORACLE_SEEDS.some((seed) => seed.ics.includes("ACTION:EMAIL") && seed.ics.includes("ATTACH"))).toBe(true);
+    // Испорченная форма UNTIL (RFC 5545 §3.3.10): в форме DATE при DTSTART со
+    // временем и без Z при DTSTART с TZID.
+    expect(ORACLE_SEEDS.some((seed) => /RRULE:[^\r\n]*UNTIL=\d{8}(?![T\d])/.test(seed.ics))).toBe(true);
+    expect(ORACLE_SEEDS.some((seed) => /RRULE:[^\r\n]*UNTIL=\d{8}T\d{6}(?!Z)/.test(seed.ics) && seed.ics.includes("DTSTART;TZID="))).toBe(true);
+  });
+
+  it("корпус берёт края значений и сочетания осей, а не одни середины", () => {
+    const patch = (name: string) => ORACLE_PATCHES.find((entry) => entry.name === name)?.patch;
+    // Края года по RFC 5545 §3.3.5 и край INTERVAL.
+    expect(patch("start:0001-01-01")).toEqual({ start: "0001-01-01T00:00:00" });
+    expect(patch("start:9999-12-31")).toEqual({ start: "9999-12-31T23:00:00" });
+    expect(patch("recurrence:interval=1000000")).toEqual({ recurrence: { interval: 1000000 } });
+    // Повтор и время в одном патче: поодиночке обе оси перебираются, вместе — тоже.
+    const both = ORACLE_PATCHES.filter(
+      (entry) =>
+        entry.patch.recurrence !== undefined &&
+        ["start", "end", "timeZone", "allDay"].some((field) => entry.patch[field as "start"] !== undefined),
+    );
+    expect(both.length).toBeGreaterThanOrEqual(2);
+    expect(both.some((entry) => entry.patch.start !== undefined && entry.patch.end !== undefined)).toBe(true);
+    expect(both.some((entry) => entry.patch.timeZone !== undefined)).toBe(true);
+    // Конец на следующие сутки после начала: разница дат — часть длительности (Р1).
+    expect(patch("start+end:через полночь")).toEqual({ start: "2026-11-05T23:00:00", end: "2026-11-06T01:00:00" });
   });
 
   it("горизонт разворота накрывает весь корпус и уходит дальше двух лет", () => {

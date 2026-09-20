@@ -14,19 +14,23 @@
 //     разворачивается чтением и сверяется с ожиданием, посчитанным из
 //     смысла scope (semantics.ts), а не из планировщика.
 //
+// Сам случай считает case.ts, а зовётся он через сторожевое время
+// (isolate.ts): зависание и обвал кучи становятся нарушением вида "timeout",
+// а не падением прогона.
+//
 // Детерминированность (пункт 7): фиксированный список затравок, фиксированный
 // порядок патчей и адресов, генератор случайных чисел mulberry32 с зерном
 // ORACLE_SEED. Повтор обхода даёт тот же список нарушений.
-import { planDelete, planUpdate } from "../../src/ical/edit.js";
-import { GuardError, verifyPlan } from "../../src/ical/guard.js";
-import { AddressError } from "../../src/ical/instances.js";
 import type { CalendarObject } from "../../src/ical/object.js";
-import { EditRefusal, type WritePlan } from "../../src/ical/plan.js";
 import type { EditScope } from "../../src/types.js";
-import { applyPlan, standWith, storedIcs } from "./apply.js";
-import { ADDRESS_ROLES, ORACLE_PATCHES, ORACLE_SCOPES, ORACLE_SEEDS, type OraclePatch, type OracleSeed } from "./corpus.js";
-import { checkSemantics } from "./semantics.js";
-import { NOW, addressesOf, load, worldOf, type World } from "./world.js";
+import type { CaseOutcome, CaseSpec } from "./case.js";
+import { ADDRESS_ROLES, ORACLE_PATCHES, ORACLE_SCOPES, ORACLE_SEEDS } from "./corpus.js";
+import { directRunner, isolatedRunner, type CaseRunner } from "./isolate.js";
+import { addressesOf, load } from "./world.js";
+
+export type { Finding, FindingKind } from "./case.js";
+export { CASE_LIMIT_MS } from "./isolate.js";
+import type { Finding } from "./case.js";
 
 /** Зерно генератора случайных чисел; записано и в summary.md. */
 export const ORACLE_SEED = 20260920;
@@ -42,19 +46,6 @@ function mulberry32(seed: number): () => number {
     t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
-}
-
-export type FindingKind = "disagreement" | "semantics" | "bare-error";
-
-export interface Finding {
-  kind: FindingKind;
-  seed: string;
-  patch: string;
-  scope: EditScope;
-  address: string;
-  op: "update" | "delete";
-  detail: string;
-  minimalRepro: string;
 }
 
 export interface RefusalStat {
@@ -112,210 +103,19 @@ function addressesFor(o: CalendarObject, scope: EditScope, random: () => number)
   );
 }
 
-function planSummary(plan: WritePlan): string {
-  if (plan.kind === "split") return `план split: продолжение ${plan.continuation.uid}, граница ${plan.boundary}`;
-  if (plan.kind === "put") return `план put, ${plan.ics.split("\r\n").length} строк`;
-  return `план ${plan.kind}`;
-}
-
-function icsOfPlan(plan: WritePlan): string {
-  if (plan.kind === "put") return plan.ics;
-  if (plan.kind === "split") return `ПРОДОЛЖЕНИЕ\n${plan.continuation.ics}\nУСЕЧЁННЫЙ\n${plan.truncated.ics}`;
-  return "";
-}
-
-function repro(
-  seed: OracleSeed,
-  op: "update" | "delete",
-  scope: EditScope,
-  address: string | undefined,
-  entry: OraclePatch | undefined,
-  tail: string,
-  confirmed: boolean,
-): string {
-  // Обход зовёт планировщик с etag и currentEtag всегда, а confirm ставит
-  // только при повторе подтверждённого отказа. Без этих трёх полей
-  // воспроизведение расходится с описанным исходом: неподтверждённый вызов
-  // упирается в confirm-required там, где обход шёл дальше.
-  const consent = `confirm: ${confirmed}, etag: ${confirmed ? "stand.etag" : "undefined"}, currentEtag: stand.etag`;
-  const call =
-    op === "update"
-      ? `const plan = planUpdate(o, { now: NOW, scope: ${JSON.stringify(scope)}, instanceStart: ${JSON.stringify(address)}, patch, ${consent} });`
-      : `const plan = planDelete(o, { now: NOW, scope: ${JSON.stringify(scope)}, instanceStart: ${JSON.stringify(address)}, ${consent} });`;
-  const guard =
-    op === "update"
-      ? `verifyPlan(ics, plan, ENV, { now: NOW, patch }); // как зовёт оркестрация: с патчем`
-      : `verifyPlan(ics, plan, ENV, { now: NOW });`;
-  return [
-    `import { ${op === "update" ? "planUpdate" : "planDelete"} } from "../../src/ical/edit.js";`,
-    `import { verifyPlan } from "../../src/ical/guard.js";`,
-    `import { ORACLE_SEEDS } from "./corpus.js";`,
-    `import { ENV, NOW, load, worldOf } from "./world.js";`,
-    `import { applyPlan, standWith, storedIcs } from "./apply.js";`,
-    ``,
-    `const seed = ORACLE_SEEDS.find((s) => s.name === ${JSON.stringify(seed.name)})!;`,
-    `const stand = standWith(seed);`,
-    `const ics = stand.fake.ics(stand.path);`,
-    `const o = load(ics);`,
-    ...(op === "update" ? [`const patch = ${JSON.stringify(entry?.patch ?? {})};`] : []),
-    call,
-    guard,
-    `await applyPlan(stand, plan);`,
-    `console.log(worldOf(storedIcs(stand)).snaps.map((s) => s.address + " " + s.summary));`,
-    `// ${tail}`,
-  ].join("\n");
-}
-
-interface CaseInput {
-  seed: OracleSeed;
-  op: "update" | "delete";
-  scope: EditScope;
-  address: CaseAddress;
-  entry?: OraclePatch;
-  before: World;
-  /** Повтор отказа с подтверждением потерь (confirm + etag). */
-  confirmed?: boolean;
-}
-
-interface CaseOutcome {
-  findings: Finding[];
-  refused: boolean;
-  code?: string;
-  needsConfirm: boolean;
-  message?: string;
-  noop: boolean;
-}
-
-async function runCase(input: CaseInput): Promise<CaseOutcome> {
-  const { seed, op, scope, address, entry, before, confirmed } = input;
-  const findings: Finding[] = [];
-  const name = entry ? entry.name : "—";
-  const addressLabel = `${address.role}${address.value === undefined ? "" : ` (${address.value})`}`;
-  const stand = standWith(seed);
-  const beforeIcs = stand.fake.ics(stand.path);
-  const o = load(beforeIcs);
-  const common = { seed: seed.name, patch: confirmed ? `${name} +confirm` : name, scope, address: addressLabel, op } as const;
-
-  let plan: WritePlan;
-  try {
-    plan =
-      op === "update"
-        ? planUpdate(o, {
-            now: NOW,
-            scope,
-            instanceStart: address.value,
-            patch: entry!.patch,
-            confirm: confirmed,
-            etag: confirmed ? stand.etag : undefined,
-            currentEtag: stand.etag,
-          })
-        : planDelete(o, {
-            now: NOW,
-            scope,
-            instanceStart: address.value,
-            confirm: confirmed,
-            etag: confirmed ? stand.etag : undefined,
-            currentEtag: stand.etag,
-          });
-  } catch (error) {
-    if (error instanceof EditRefusal) {
-      return { findings, refused: true, code: error.code, needsConfirm: error.needsConfirm, message: error.message, noop: false };
-    }
-    if (error instanceof AddressError) {
-      return { findings, refused: true, code: `address:${error.code}`, needsConfirm: false, message: error.message, noop: false };
-    }
-    const bare = error as Error;
-    findings.push({
-      ...common,
-      kind: "bare-error",
-      detail: `планировщик бросил ${bare.name ?? "ошибку"} вместо типизированного отказа: ${bare.message}`,
-      minimalRepro: repro(seed, op, scope, address.value, entry, `здесь ${bare.name}: ${bare.message.slice(0, 120)}`, confirmed === true),
-    });
-    return { findings, refused: false, needsConfirm: false, noop: false };
-  }
-
-  // (а) согласие пары: предохранитель обязан принять построенный план.
-  try {
-    verifyPlan(beforeIcs, plan, o.env, { now: NOW, patch: op === "update" ? entry!.patch : undefined });
-  } catch (error) {
-    const guard = error as Error;
-    const said =
-      guard instanceof GuardError ? guard.problems.map((p) => `[${p.code}] ${p.message}`).join(" ") : `${guard.name}: ${guard.message}`;
-    findings.push({
-      ...common,
-      kind: "disagreement",
-      detail: `планировщик построил ${planSummary(plan)}, предохранитель его отверг: ${said}\nПЛАН:\n${icsOfPlan(plan)}`,
-      minimalRepro: repro(
-        seed,
-        op,
-        scope,
-        address.value,
-        entry,
-        `здесь ${guard instanceof GuardError ? `GuardError ${guard.code}` : guard.name}`,
-        confirmed === true,
-      ),
-    });
-    return { findings, refused: false, needsConfirm: false, noop: plan.kind === "noop" };
-  }
-
-  if (plan.kind === "noop") return { findings, refused: false, needsConfirm: false, noop: true };
-
-  // (б) семантика: план пишется на стенд и разворачивается чтением.
-  const applied = await applyPlan(stand, plan);
-  if (!applied.ok) {
-    findings.push({
-      ...common,
-      kind: "semantics",
-      detail:
-        `подставной сервер не принял запись (${planSummary(plan)}): ${applied.error.message}` +
-        (applied.rejections.length > 0 ? ` Причины строгого режима: ${applied.rejections.join("; ")}.` : "") +
-        `\nПЛАН:\n${icsOfPlan(plan)}`,
-      minimalRepro: repro(seed, op, scope, address.value, entry, `здесь запись отклонена стендом: ${applied.error.message.slice(0, 120)}`, confirmed === true),
-    });
-    return { findings, refused: false, needsConfirm: false, noop: false };
-  }
-
-  let after: World;
-  try {
-    after = worldOf(storedIcs(stand));
-  } catch (error) {
-    findings.push({
-      ...common,
-      kind: "semantics",
-      detail: `после записи объект не читается: ${(error as Error).message}\nПЛАН:\n${icsOfPlan(plan)}`,
-      minimalRepro: repro(seed, op, scope, address.value, entry, `здесь объект после записи не читается`, confirmed === true),
-    });
-    return { findings, refused: false, needsConfirm: false, noop: false };
-  }
-
-  const problems = checkSemantics({
-    o,
-    before,
-    after,
-    op,
-    scope,
-    address: address.value,
-    entry,
-    declaredLosses: plan.removed.map((loss) => loss.instanceStart),
-    notices: plan.notices,
-  });
-  for (const problem of problems) {
-    findings.push({
-      ...common,
-      kind: "semantics",
-      detail: `${problem}\nПЛАН:\n${icsOfPlan(plan)}`,
-      minimalRepro: repro(seed, op, scope, address.value, entry, `здесь расходится со смыслом scope: ${problem.slice(0, 120)}`, confirmed === true),
-    });
-  }
-  return { findings, refused: false, needsConfirm: false, noop: false };
-}
-
 export interface SweepOptions {
   /** Ограничить обход этими затравками (по имени) — для отладки. */
   onlySeeds?: readonly string[];
   onlyPatches?: readonly string[];
   /** Повторять отказы с needsConfirm с подтверждением. */
   withConfirm?: boolean;
+  /**
+   * Выполнять случаи в том же потоке, без сторожевого времени. Только для
+   * отладки одного случая: зависание уронит прогон.
+   */
+  inProcess?: boolean;
+  /** Свой предел времени на случай (мс). */
+  limitMs?: number;
 }
 
 export async function runSweep(options: SweepOptions = {}): Promise<SweepResult> {
@@ -327,6 +127,7 @@ export async function runSweep(options: SweepOptions = {}): Promise<SweepResult>
   const seeds = ORACLE_SEEDS.filter((seed) => !options.onlySeeds || options.onlySeeds.includes(seed.name));
   const patches = ORACLE_PATCHES.filter((entry) => !options.onlyPatches || options.onlyPatches.includes(entry.name));
   const withConfirm = options.withConfirm ?? true;
+  const runner: CaseRunner = options.inProcess ? directRunner() : isolatedRunner(options.limitMs);
 
   const note = (outcome: CaseOutcome, key: string | undefined, clean: boolean) => {
     counts.cases += 1;
@@ -355,35 +156,40 @@ export async function runSweep(options: SweepOptions = {}): Promise<SweepResult>
     }
   };
 
-  for (const seed of seeds) {
-    // Своё зерно на затравку: выбор адресов не зависит от того, сколько
-    // затравок в обходе, и отладка одной затравки повторяет полный обход.
-    const random = mulberry32(ORACLE_SEED + ORACLE_SEEDS.indexOf(seed));
-    const before = worldOf([seed.ics]);
-    const o = load(seed.ics);
-    const clean = !seed.corrupted;
-    for (const scope of ORACLE_SCOPES) {
-      for (const address of addressesFor(o, scope, random)) {
-        // delete
-        const del = await runCase({ seed, op: "delete", scope, address, before });
-        counts.delete += 1;
-        note(del, `delete|${scope}`, clean);
-        if (withConfirm && del.refused && del.needsConfirm) {
-          const again = await runCase({ seed, op: "delete", scope, address, before, confirmed: true });
-          findings.push(...again.findings);
-        }
-        // update
-        for (const entry of patches) {
-          const outcome = await runCase({ seed, op: "update", scope, address, entry, before });
-          counts.update += 1;
-          note(outcome, `${entry.name}|${scope}`, clean);
-          if (withConfirm && outcome.refused && outcome.needsConfirm) {
-            const again = await runCase({ seed, op: "update", scope, address, entry, before, confirmed: true });
+  try {
+    for (const seed of seeds) {
+      // Своё зерно на затравку: выбор адресов не зависит от того, сколько
+      // затравок в обходе, и отладка одной затравки повторяет полный обход.
+      const random = mulberry32(ORACLE_SEED + ORACLE_SEEDS.indexOf(seed));
+      const o = load(seed.ics);
+      const clean = !seed.corrupted;
+      for (const scope of ORACLE_SCOPES) {
+        for (const address of addressesFor(o, scope, random)) {
+          const common: CaseSpec = { seedName: seed.name, op: "delete", scope, role: address.role, address: address.value };
+          // delete
+          const del = await runner.run(common);
+          counts.delete += 1;
+          note(del, `delete|${scope}`, clean);
+          if (withConfirm && del.refused && del.needsConfirm) {
+            const again = await runner.run({ ...common, confirmed: true });
             findings.push(...again.findings);
+          }
+          // update
+          for (const entry of patches) {
+            const spec: CaseSpec = { ...common, op: "update", patchName: entry.name };
+            const outcome = await runner.run(spec);
+            counts.update += 1;
+            note(outcome, `${entry.name}|${scope}`, clean);
+            if (withConfirm && outcome.refused && outcome.needsConfirm) {
+              const again = await runner.run({ ...spec, confirmed: true });
+              findings.push(...again.findings);
+            }
           }
         }
       }
     }
+  } finally {
+    await runner.close();
   }
 
   return { findings, refusals, codes, counts, seedsUsed: seeds.length, ms: Date.now() - started };

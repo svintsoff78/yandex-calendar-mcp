@@ -5,7 +5,7 @@
 import { writeFileSync } from "node:fs";
 import { CAUSES, groupByCause } from "./causes.js";
 import { ORACLE_PATCHES, ORACLE_SCOPES, ORACLE_SEEDS } from "./corpus.js";
-import { ORACLE_SEED, type Finding, type SweepResult } from "./sweep.js";
+import { CASE_LIMIT_MS, ORACLE_SEED, type Finding, type FindingKind, type SweepResult } from "./sweep.js";
 import { HORIZON_CAP, HORIZON_FROM, HORIZON_TO, PROBE } from "./world.js";
 
 /** Сколько знаков плана оставлять в detail: файл нарушений должен читаться. */
@@ -23,7 +23,32 @@ export interface ReportPaths {
   summary: URL | string;
 }
 
+/** Виды нарушений в порядке таблицы отчёта и то, что каждый из них значит. */
+const KINDS: ReadonlyArray<{ kind: FindingKind; means: string }> = [
+  { kind: "disagreement", means: "планировщик построил план, предохранитель его отверг" },
+  { kind: "semantics", means: "записанный результат разошёлся со смыслом scope или сервер не принял запись" },
+  { kind: "bare-error", means: "планировщик бросил голую ошибку вместо типизированного отказа" },
+  { kind: "bare-guard", means: "предохранитель бросил голую ошибку библиотеки вместо GuardError" },
+  { kind: "timeout", means: "случай не уложился в сторожевое время или исчерпал кучу" },
+];
+
+function countKinds(findings: readonly Finding[]): Record<FindingKind, number> {
+  const out = {} as Record<FindingKind, number>;
+  for (const { kind } of KINDS) out[kind] = findings.filter((f) => f.kind === kind).length;
+  return out;
+}
+
 const date = (ms: number) => new Date(ms).toISOString().slice(0, 10);
+
+/** «1 нарушение», «3 нарушения», «12 нарушений». */
+function violations(n: number): string {
+  const tail = n % 100;
+  if (tail >= 11 && tail <= 14) return `${n} нарушений`;
+  const last = n % 10;
+  if (last === 1) return `${n} нарушение`;
+  if (last >= 2 && last <= 4) return `${n} нарушения`;
+  return `${n} нарушений`;
+}
 
 function refusalTable(result: SweepResult): string[] {
   const lines = [
@@ -73,11 +98,7 @@ export function writeReport(result: SweepResult, paths: ReportPaths): void {
         патчей: ORACLE_PATCHES.length,
         случаев: result.counts.cases,
         нарушений: findings.length,
-        по_видам: {
-          disagreement: findings.filter((f) => f.kind === "disagreement").length,
-          semantics: findings.filter((f) => f.kind === "semantics").length,
-          "bare-error": findings.filter((f) => f.kind === "bare-error").length,
-        },
+        по_видам: countKinds(findings),
         findings,
       },
       null,
@@ -87,11 +108,7 @@ export function writeReport(result: SweepResult, paths: ReportPaths): void {
   );
 
   const groups = groupByCause(result.findings);
-  const kinds = {
-    disagreement: findings.filter((f) => f.kind === "disagreement").length,
-    semantics: findings.filter((f) => f.kind === "semantics").length,
-    "bare-error": findings.filter((f) => f.kind === "bare-error").length,
-  };
+  const kinds = countKinds(findings);
 
   const md: string[] = [
     "# Оракул правки: итог обхода",
@@ -105,6 +122,9 @@ export function writeReport(result: SweepResult, paths: ReportPaths): void {
     "   (или `AddressError` по адресу) — либо план построен и `verifyPlan` его принял. Исход «план построен,",
     "   предохранитель отверг» — дефект без разбирательства: двое несогласны между собой. `verifyPlan`",
     "   зовётся так, как обязана звать оркестрация: с патчем в `GuardOptions.patch` у каждого update.",
+    "   Отдельно от разногласия считается `bare-guard` — предохранитель бросил не `GuardError`, а голую",
+    "   ошибку библиотеки: это нарушение договора одного участника, наружу ушло бы не «правка отклонена»,",
+    "   а внутренний сбой, и чинится оно не там, где законный отказ предохранителя.",
     "2. **Семантика scope.** План пишется на подставной сервер (`tests/support/fakeCaldav.ts`, поведение по",
     "   умолчанию — яндексовское, Ж13–Ж16), результат разворачивается чтением и сверяется с ожиданием,",
     "   посчитанным из смысла scope независимо от планировщика (`semantics.ts`).",
@@ -112,6 +132,10 @@ export function writeReport(result: SweepResult, paths: ReportPaths): void {
     "   `scope: this`, конец строго позже начала, а длительность — либо прежняя, либо ровно та, которую назвал",
     "   патч; перенесённая встреча (своё `DTSTART` мимо слота) под патчем времени серии остаётся на своём",
     "   времени, если план не назвал её в потерях или пояснениях; напоминание письмом не остаётся без адресата.",
+    "4. **Сторожевое время и память.** Каждый случай выполняется в отдельном потоке (`isolate.ts`) под",
+    `   пределом ${CASE_LIMIT_MS} мс и пределом кучи: планировщик и предохранитель работают синхронно, и без`,
+    "   потока зацикленный разворот правила или разогнанная куча роняли бы весь прогон — не нарушением, а",
+    "   падением процесса без отчёта. Теперь это нарушение вида `timeout`, и обход идёт дальше.",
     "",
     "## Цифры прогона",
     "",
@@ -128,9 +152,7 @@ export function writeReport(result: SweepResult, paths: ReportPaths): void {
     "",
     "| вид | сколько | что значит |",
     "| --- | ---: | --- |",
-    `| disagreement | ${kinds.disagreement} | планировщик построил план, предохранитель его отверг |`,
-    `| semantics | ${kinds.semantics} | записанный результат разошёлся со смыслом scope или сервер не принял запись |`,
-    `| bare-error | ${kinds["bare-error"]} | планировщик бросил голую ошибку вместо типизированного отказа |`,
+    ...KINDS.map(({ kind, means }) => `| ${kind} | ${kinds[kind]} | ${means} |`),
     `| **всего** | **${findings.length}** | |`,
     "",
     "## Первопричины",
@@ -145,7 +167,7 @@ export function writeReport(result: SweepResult, paths: ReportPaths): void {
     const seeds = [...new Set(list.map((f) => f.seed))];
     const patches = [...new Set(list.map((f) => f.patch))];
     md.push(
-      `### ${cause.id}. ${cause.title} — ${list.length} нарушени${list.length === 1 ? "е" : "й"}`,
+      `### ${cause.id}. ${cause.title} — ${violations(list.length)}`,
       "",
       cause.detail,
       "",
@@ -193,9 +215,15 @@ export function writeReport(result: SweepResult, paths: ReportPaths): void {
     "- `allDay:true × this` и `allDay:true+start+end × this` — «весь день» у одной встречи серии запрещён",
     "  формой времени (RFC 5545 §3.8.4.4): у переопределения форма обязана совпадать с серией. Отказ",
     "  `invalid-time` с внятным hint «передайте scope: all_series».",
-    "- `recurrence:* × this` — повтор у одной встречи не меняется по смыслу операции; отказ приходит с кодом",
+    "- `recurrence:* × this` (в том числе патчи, называющие повтор вместе со временем и поясом, и патч с",
+    "  `interval: 1000000`) — повтор у одной встречи не меняется по смыслу операции; отказ приходит с кодом",
     "  `invalid-scope` и подсказкой про all_series и this_and_following. Код говорит ровно то, что есть: поле",
     "  известное, а в названной области не меняется.",
+    "- `start:0001-01-01 × this` — 87 отказов `invalid-time` с одним и тем же поводом: «времени 0001-01-01T00:00",
+    "  в поясе Europe/Moscow нет — часы в этот день переводятся». Сам отказ законен (момент первого года в поясе",
+    "  с TZID не записать), а вот повод назван не тот: часы в этот день не переводятся, просто в первом году у",
+    "  пояса ещё среднее солнечное время (LMT), и ical.js читает его как разрыв перевода. Это не нарушение",
+    "  договора — правка отказала типизированно, — но пользователю объяснено неверно.",
     "- `recurrence:replace × this_and_following` и `× all_series` — почти всё это `confirm-required`:",
     "  `replace` собирает правило только из патча, и потерянные части (BYDAY, COUNT, INTERVAL) обязаны быть",
     "  подтверждены (О11). Отказ снимается повтором с confirm — оракул такой повтор делает и нарушений в нём",
@@ -217,6 +245,13 @@ export function writeReport(result: SweepResult, paths: ReportPaths): void {
     "  встречами.",
     "- У бесконечной серии края упора в 400 встреч у миров «до» и «после» не совпадают на одну встречу:",
     "  счёт там сверяется с допуском в единицу, а адресов у самого упора обход не берёт.",
+    "- Встреча, которую патч уводит за горизонт разворота (край года — 0001 или 9999), оракулу не видна, и он",
+    "  считает её пропавшей. Пока это не промах измерителя: у всех таких записей значение времени и так",
+    "  негодное (П9) — но если край года начнёт записываться по грамматике, горизонт придётся расширять или",
+    "  такие встречи считать отдельно.",
+    `- Случай, оборванный по сторожевому времени (${CASE_LIMIT_MS} мс), дальше не проверяется вовсе: что бы`,
+    "  планировщик ни построил, до предохранителя и записи дело не дошло. Нарушение вида `timeout` говорит",
+    "  только одно — управление не вернулось.",
     "",
     "## Как перезапустить",
     "",
