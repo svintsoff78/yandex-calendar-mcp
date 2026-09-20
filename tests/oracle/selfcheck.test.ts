@@ -6,6 +6,7 @@
 // Планировщик тут не участвует вовсе — проверяется сам измеритель
 // (semantics.ts, world.ts).
 import { describe, expect, it } from "vitest";
+import { bannedRefusal } from "./case.js";
 import type { OraclePatch } from "./corpus.js";
 import { ORACLE_PATCHES, ORACLE_SEEDS } from "./corpus.js";
 import { isolatedRunner } from "./isolate.js";
@@ -229,6 +230,94 @@ describe("оракул ловит подделку", () => {
     );
   });
 
+  // Край года — не только значение в патче, но и сам объект. Окно разворота у
+  // такой затравки своё (world.ts, horizonOf), и первое, что должен уметь
+  // измеритель, — вообще её видеть: окном 2026–2029 её встреч нет ни одной, и
+  // любая подделка прошла бы молча.
+  const EDGE = "year-edge-9999";
+  const edgeSeed = named(EDGE);
+
+  it("верная правка серии у края года проходит молча", () => {
+    const renamed = edgeSeed.ics.replace("SUMMARY:Планёрка у края календаря", `SUMMARY:${NEW_TITLE}`);
+    expect(checkOn(EDGE, renamed, { scope: "all_series" })).toEqual([]);
+  });
+
+  it("встреча, пропавшая у края года, — нарушение", () => {
+    const shortened = edgeSeed.ics
+      .replace("SUMMARY:Планёрка у края календаря", `SUMMARY:${NEW_TITLE}`)
+      .replace("RRULE:FREQ=WEEKLY;BYDAY=TU;COUNT=3", "RRULE:FREQ=WEEKLY;BYDAY=TU;COUNT=2");
+    expect(checkOn(EDGE, shortened, { scope: "all_series" }).join(" ")).toContain("должно было остаться");
+  });
+
+  it("незаписанная правка у края года — нарушение", () => {
+    expect(checkOn(EDGE, edgeSeed.ics, { scope: "all_series" }).join(" ")).toContain("не применён");
+  });
+
+  // Скрытый след, которого разрез лишает прячущего EXDATE. Усечённая серия
+  // кончается раньше следа, и RECURRENCE-ID оказывается мимо всех её слотов —
+  // но встречи по этому адресу как не было, так и нет, и след остаётся
+  // адресуемым (guard.ts: «усечение серии прячет переопределение за её
+  // конец»). Измеритель такой разрез принимает — и обязан назвать тот, где
+  // след стал встречей.
+  const TRACE = "hidden-exdate-tail-moscow";
+  const traceSeed = named(TRACE);
+  const CRLF = "\r\n";
+
+  /** Усечённый исходный объект: правило до 27.10, EXDATE снят с хвостом, след остался. */
+  const traceTruncated = traceSeed.ics
+    .replace("RRULE:FREQ=WEEKLY;BYDAY=TU;COUNT=6", "RRULE:FREQ=WEEKLY;BYDAY=TU;COUNT=2")
+    .replace(`EXDATE;TZID=Europe/Moscow:20261117T150000${CRLF}`, "");
+
+  /** Продолжение разреза: новый UID, начало 03.11, EXDATE перешёл, следа в нём нет. */
+  const traceContinuation = [
+    "BEGIN:VCALENDAR",
+    "PRODID:-//Yandex LLC//Yandex Calendar//EN",
+    "VERSION:2.0",
+    "CALSCALE:GREGORIAN",
+    "BEGIN:VTIMEZONE",
+    "TZID:Europe/Moscow",
+    "X-LIC-LOCATION:Europe/Moscow",
+    "BEGIN:STANDARD",
+    "TZNAME:MSK",
+    "TZOFFSETFROM:+0300",
+    "TZOFFSETTO:+0300",
+    "DTSTART:19700101T000000",
+    "END:STANDARD",
+    "END:VTIMEZONE",
+    "BEGIN:VEVENT",
+    "UID:ycm-продолжение-разреза",
+    "DTSTAMP:20261001T090000Z",
+    "DTSTART;TZID=Europe/Moscow:20261103T150000",
+    "DTEND;TZID=Europe/Moscow:20261103T160000",
+    "RRULE:FREQ=WEEKLY;BYDAY=TU;COUNT=4",
+    "EXDATE;TZID=Europe/Moscow:20261117T150000",
+    `SUMMARY:${NEW_TITLE}`,
+    "END:VEVENT",
+    "END:VCALENDAR",
+  ].join(CRLF) + CRLF;
+
+  it("след, оставшийся скрытым после усечения, нарушением не считается", () => {
+    const problems = checkSemantics({
+      o: load(traceSeed.ics),
+      before: worldOf([traceSeed.ics]),
+      after: worldOf([traceTruncated, traceContinuation]),
+      op: "update",
+      scope: "this_and_following",
+      address: "2026-11-03T15:00:00+03:00",
+      entry: summaryPatch,
+    });
+    expect(problems).toEqual([]);
+  });
+
+  it("след, ставший встречей после снятия EXDATE, — нарушение", () => {
+    // Тот же снятый EXDATE, но правило не усечено: адрес следа снова попадает
+    // на слот, и невидимая встреча становится видимой.
+    const revived = traceSeed.ics
+      .replace(`SUMMARY:Вторничная серия${CRLF}`, `SUMMARY:${NEW_TITLE}${CRLF}`)
+      .replace(`EXDATE;TZID=Europe/Moscow:20261117T150000${CRLF}`, "");
+    expect(checkOn(TRACE, revived, { scope: "all_series" }).join(" ")).toContain("должно было остаться");
+  });
+
   it("напоминание письмом, потерявшее адресата, — нарушение", () => {
     const alarms = named("email-alarm-moscow");
     const lost = alarms.ics
@@ -237,6 +326,66 @@ describe("оракул ловит подделку", () => {
     expect(checkOn("email-alarm-moscow", lost, { scope: "all_series", entry: remindersPatch }).join(" ")).toContain(
       "напоминание письмом осталось без адресата",
     );
+  });
+});
+
+// Запрет отказа — единственное место, где обход считает отказ нарушением.
+// Отказ сам по себе законный исход, и проверять его строгость обход не
+// берётся: он смотрит только туда, где корпус назвал код и объяснил, почему
+// правка обязана была пройти.
+describe("запрет отказа", () => {
+  const step = ORACLE_PATCHES.find((entry) => entry.name === "recurrence:interval=1001")!;
+
+  it("у конечной серии отказ по правилу незаконен, у бесконечной — законен", () => {
+    // Ровно те два исхода, ради которых патч и заведён.
+    expect(bannedRefusal(named("weekly-count-moscow"), step, "invalid-rule")?.why).toContain("конечной серии");
+    expect(bannedRefusal(named("until-berlin"), step, "invalid-rule")).toBeDefined();
+    expect(bannedRefusal(named("infinite-weekly-moscow"), step, "invalid-rule")).toBeUndefined();
+    expect(bannedRefusal(named("infinite-daily-berlin"), step, "invalid-rule")).toBeUndefined();
+  });
+
+  it("запрет именной: отказ с другим кодом он не задевает", () => {
+    // Повтор у одной встречи не меняется (invalid-scope), потери требуют
+    // подтверждения (confirm-required) — оба отказа законны и под запрет не идут.
+    expect(bannedRefusal(named("weekly-count-moscow"), step, "invalid-scope")).toBeUndefined();
+    expect(bannedRefusal(named("weekly-count-moscow"), step, "confirm-required")).toBeUndefined();
+    // Правило, которое Яндекс исказит (Ж6), отказывает своим кодом — и законно.
+    expect(bannedRefusal(named("bysetpos-moscow"), step, "unsupported-rule")).toBeUndefined();
+  });
+
+  it("запрет затравки действует при любом патче и при удалении", () => {
+    expect(bannedRefusal(named("year-edge-9999"), step, "series-too-long")).toBeDefined();
+    // У delete патча нет вовсе — запрет затравки от этого не слабее.
+    expect(bannedRefusal(named("year-edge-9999"), undefined, "series-too-long")).toBeDefined();
+    expect(bannedRefusal(named("year-edge-9999"), undefined, "until-too-far")).toBeDefined();
+    // Отказ по существу патча запретом не задет.
+    expect(bannedRefusal(named("year-edge-9999"), undefined, "invalid-time")).toBeUndefined();
+    expect(bannedRefusal(named("weekly-count-moscow"), undefined, "series-too-long")).toBeUndefined();
+  });
+
+  it("отказ под запретом обход называет нарушением, а не законным исходом", async () => {
+    const runner = isolatedRunner();
+    try {
+      const outcome = await runner.run({
+        seedName: "weekly-count-moscow",
+        op: "update",
+        scope: "all_series",
+        role: "none",
+        patchName: "recurrence:interval=1001",
+      });
+      const over = outcome.findings.filter((finding) => finding.kind === "over-strict");
+      if (outcome.refused && outcome.code === "invalid-rule") {
+        // Пока предел шага стоит на самом числе, отказ приходит — и назван.
+        expect(over).toHaveLength(1);
+        expect(over[0].detail).toContain("обязана была пройти");
+        expect(over[0].minimalRepro).toContain("planUpdate");
+      } else {
+        // Предел научился смотреть на конец серии: отказа нет, и называть нечего.
+        expect(over).toEqual([]);
+      }
+    } finally {
+      await runner.close();
+    }
   });
 });
 

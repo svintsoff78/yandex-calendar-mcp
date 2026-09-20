@@ -12,7 +12,7 @@ import { AddressError } from "../../src/ical/instances.js";
 import { EditRefusal, type WritePlan } from "../../src/ical/plan.js";
 import type { EditScope } from "../../src/types.js";
 import { applyPlan, standWith, storedIcs } from "./apply.js";
-import { ORACLE_PATCHES, ORACLE_SEEDS, type OraclePatch, type OracleSeed } from "./corpus.js";
+import { ORACLE_PATCHES, ORACLE_SEEDS, type OraclePatch, type OracleSeed, type RefusalBan } from "./corpus.js";
 import { checkSemantics } from "./semantics.js";
 import { NOW, load, worldOf, type World } from "./world.js";
 
@@ -28,10 +28,15 @@ import { NOW, load, worldOf, type World } from "./world.js";
  *   библиотеки: наружу ушло бы не «правка отклонена», а внутренний сбой.
  *   Это нарушение договора одного участника, а не разногласие пары, поэтому
  *   считается отдельно от `disagreement`;
+ * - `over-strict` — отказ с кодом, который корпус объявил здесь незаконным
+ *   (`bannedRefusals` затравки или патча): правка обязана была пройти или
+ *   отказать по другому поводу. Отказ сам по себе — законный исход, и
+ *   прочие проверки его не разбирают вовсе; этот вид — единственное место,
+ *   где отказ считается нарушением, и только там, где корпус назвал, почему;
  * - `timeout` — случай не уложился в предел времени или исчерпал кучу:
  *   планировщик или предохранитель зациклился либо разогнал память.
  */
-export type FindingKind = "disagreement" | "semantics" | "bare-error" | "bare-guard" | "timeout";
+export type FindingKind = "disagreement" | "semantics" | "bare-error" | "bare-guard" | "over-strict" | "timeout";
 
 export interface Finding {
   kind: FindingKind;
@@ -136,6 +141,20 @@ export function repro(spec: CaseSpec, tail: string): string {
   ].join("\n");
 }
 
+/**
+ * Запрет, под который попал отказ: первый по порядку (сперва запреты
+ * затравки, затем патча). `undefined` — отказ законен, как и всякий другой.
+ *
+ * Отказ по адресу (`AddressError`) сюда не попадает вовсе: он про то, что
+ * адреса у затравки нет, а не про строгость правки. Отказ, снимаемый
+ * подтверждением (`needsConfirm`), тоже не в счёт: обход повторяет его с
+ * confirm, и исход считается по повтору.
+ */
+export function bannedRefusal(seed: OracleSeed, entry: OraclePatch | undefined, code: string): RefusalBan | undefined {
+  const bans = [...(seed.bannedRefusals ?? []), ...(entry?.bannedRefusals ?? [])];
+  return bans.find((ban) => ban.code === code && (ban.where === undefined || ban.where(seed)));
+}
+
 /** Общие поля нарушения по описанию случая. */
 export function labelOf(spec: CaseSpec): Pick<Finding, "seed" | "patch" | "scope" | "address" | "op"> {
   const name = spec.patchName ?? "—";
@@ -186,6 +205,17 @@ export async function runCase(spec: CaseSpec): Promise<CaseOutcome> {
           });
   } catch (error) {
     if (error instanceof EditRefusal) {
+      const ban = error.needsConfirm ? undefined : bannedRefusal(seed, entry, error.code);
+      if (ban) {
+        findings.push({
+          ...common,
+          kind: "over-strict",
+          detail:
+            `правка отказала кодом ${error.code}, хотя обязана была пройти: ${ban.why}\n` +
+            `ОТКАЗ: ${error.message}`,
+          minimalRepro: repro(spec, `здесь отказ ${error.code}, а правка обязана проходить: ${ban.why.slice(0, 120)}`),
+        });
+      }
       return { findings, refused: true, code: error.code, needsConfirm: error.needsConfirm, message: error.message, noop: false };
     }
     if (error instanceof AddressError) {

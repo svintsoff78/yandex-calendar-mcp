@@ -24,6 +24,57 @@ export const HORIZON_TO = Date.parse("2029-01-01T00:00:00Z");
 export const HORIZON_CAP = 400;
 export const PROBE = Date.parse("2028-06-01T00:00:00Z");
 
+/** Окно разворота одного объекта: что считается видимым и где проба «за концом». */
+export interface Horizon {
+  fromMs: number;
+  toMs: number;
+  /** Встреча позже пробы — серия за окно уходит. */
+  probeMs: number;
+}
+
+/** Обычное окно: им накрыт весь корпус, кроме затравки у края года. */
+export const HORIZON: Horizon = { fromMs: HORIZON_FROM, toMs: HORIZON_TO, probeMs: PROBE };
+
+const DAY_MS = 86_400_000;
+/** Сколько суток от конца своего окна отстоит проба «за концом». */
+const PROBE_BACK_DAYS = 60;
+
+/**
+ * Окно разворота под объект. Обычное окно — 2026–2029 — накрывает весь
+ * корпус, кроме затравки у КРАЯ ГОДА: её встречи стоят в 9999 году, и
+ * обычным окном их не видно вовсе. У такой серии окно своё — её собственный
+ * год целиком.
+ *
+ * Окно выбирается по НАЧАЛУ СЕРИИ (DTSTART основного компонента), а не по
+ * меньшему DTSTART объекта. Иначе оно менялось бы между «до» и «после»:
+ * переопределение правка вправе увести куда угодно (`scope: this` с патчем
+ * времени), и встречи, которых окно «до» не видело, объявлялись бы
+ * появившимися, а те, что видело, — пропавшими. Встречу со своим компонентом
+ * вне окна берёт `beyondHorizon` — ей окно и не нужно.
+ *
+ * Окном в один год обойтись можно потому, что у края года затравка одна и
+ * конечная. Растянуть обычное окно до 9999-го нельзя: разворот правила до
+ * него — сотни тысяч шагов на каждый случай.
+ */
+export function horizonOf(o: CalendarObject): Horizon {
+  const start = seriesStartMs(o);
+  if (start === undefined || start < HORIZON_TO) return HORIZON;
+  const year = new Date(start).getUTCFullYear();
+  const toMs = Date.UTC(year + 1, 0, 1) - 1;
+  return { fromMs: Date.UTC(year, 0, 1), toMs, probeMs: toMs - PROBE_BACK_DAYS * DAY_MS };
+}
+
+/** Момент начала серии: DTSTART основного компонента, а без него — меньший DTSTART объекта. */
+function seriesStartMs(o: CalendarObject): number | undefined {
+  const components = o.master ? [o.master] : o.root.getAllSubcomponents("vevent");
+  let ms = Number.POSITIVE_INFINITY;
+  for (const component of components) {
+    const dtstart = component.getFirstPropertyValue("dtstart") as ICAL.Time | null;
+    if (dtstart) ms = Math.min(ms, instantOf(dtstart, o.env));
+  }
+  return Number.isFinite(ms) ? ms : undefined;
+}
+
 export function load(ics: string): CalendarObject {
   const object = loadObject(ics, ENV);
   if (isUnparsable(object)) throw new Error(`объект не разобран: ${object.error}`);
@@ -173,22 +224,31 @@ function beyondHorizon(o: CalendarObject, inside: readonly Instance[]): Instance
   return out;
 }
 
-/** Развернуть несколько объектов (после разреза их два) в один мир. */
+/**
+ * Развернуть несколько объектов (после разреза их два) в один мир. Окно у
+ * каждого своё (`horizonOf`), и признаки окна считаются по объекту: серия
+ * кончается в пределах мира, если кончается у каждого из объектов.
+ */
 export function worldOf(icsList: readonly string[]): World {
   const snaps: Snap[] = [];
   const beyond: Snap[] = [];
   let capped = false;
+  let ends = true;
   for (const ics of icsList) {
     const o = load(ics);
-    const instances = instancesBetween(o, HORIZON_FROM, HORIZON_TO);
-    if (instances.length >= HORIZON_CAP) capped = true;
-    for (const instance of instances.slice(0, HORIZON_CAP)) snaps.push(snapOf(instance));
+    const horizon = horizonOf(o);
+    const instances = instancesBetween(o, horizon.fromMs, horizon.toMs);
+    const cappedHere = instances.length >= HORIZON_CAP;
+    if (cappedHere) capped = true;
+    const inside = instances.slice(0, HORIZON_CAP);
+    for (const instance of inside) snaps.push(snapOf(instance));
     for (const instance of beyondHorizon(o, instances)) beyond.push(snapOf(instance));
+    const last = inside[inside.length - 1];
+    if (cappedHere || (last !== undefined && last.startMs >= horizon.probeMs)) ends = false;
   }
   snaps.sort(order);
   beyond.sort(order);
-  const last = snaps.length === 0 ? undefined : snaps[snaps.length - 1];
-  return { snaps, beyond, capped, ends: !capped && (last === undefined || last.startMs < PROBE), objects: icsList.length };
+  return { snaps, beyond, capped, ends, objects: icsList.length };
 }
 
 /** Строка снимка целиком — для сравнения множеств. */
@@ -244,7 +304,8 @@ function pastEndAddress(o: CalendarObject, last: Instance | undefined): string |
 
 /** Адреса затравки по ролям (пункт 3 задания). */
 export function addressesOf(o: CalendarObject): Map<string, string | undefined> {
-  const instances = instancesBetween(o, HORIZON_FROM, HORIZON_TO).slice(0, HORIZON_CAP);
+  const horizon = horizonOf(o);
+  const instances = instancesBetween(o, horizon.fromMs, horizon.toMs).slice(0, HORIZON_CAP);
   const map = new Map<string, string | undefined>();
   map.set("none", undefined);
   // У бесконечной серии (упор сработал) последней встречи нет, а «средняя»
@@ -281,7 +342,7 @@ export function addressesOf(o: CalendarObject): Map<string, string | undefined> 
   // Адрес «за концом серии» есть только у серии, которая в горизонте
   // кончается: у бесконечной любой поздний адрес — обычный слот.
   const last = instances[instances.length - 1];
-  if (!capped && last && last.startMs < PROBE) {
+  if (!capped && last && last.startMs < horizon.probeMs) {
     map.set("past-end", pastEndAddress(o, last));
   }
   return map;
