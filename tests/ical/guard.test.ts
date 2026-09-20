@@ -1813,8 +1813,10 @@ describe("verifyPlan: скрытое переопределение, котор�
     expect(guardCodes(WITH_TRACE, rulePlan({ count: 6 }, false))).toEqual([]);
   });
 
-  it("{interval:2}: слота на 9.11 нет, скрытое остаётся следом и снимается молча", () => {
-    expect(guardCodes(WITH_TRACE, rulePlan({ interval: 2 }, true))).toEqual([]);
+  it("{interval:2}: слота на 9.11 новое правило не даёт, но и такое скрытое снимается только названным", () => {
+    expect(guardCodes(WITH_TRACE, rulePlan({ interval: 2 }, true))).toEqual(["override-lost"]);
+    expect(guardCodes(WITH_TRACE, rulePlan({ interval: 2 }, true, [lossOf(TRACE)]))).toEqual([]);
+    expect(guardCodes(WITH_TRACE, rulePlan({ interval: 2 }, false))).toEqual([]);
   });
 });
 
@@ -1883,6 +1885,430 @@ describe("verifyPlan: расхождения с планировщиком, ре
     const plan = putPlan(o, { op: "update", scope: "all_series", fields: ["allDay"],
       keyMap: (k) => images.get(k) ?? k, ruleChanged: true, datesFixed: true, touched: t });
     expect(guardCodesWith(ics, plan, {}, NY)).toEqual([]);
+  });
+});
+
+// ─────────────────────── правка по разрушителю: инварианты вместо разрешений ───────────────────────
+
+describe("verifyPlan: конец правила сверяется при любом патче повтора (Р4, §3)", () => {
+  /** Серия 10:00–11:00 МСК с 19.10 (понедельник) с правилом `rule`. */
+  const withRule = (rule: string) =>
+    calendar(MOSCOW, vevent(["DTSTART;TZID=Europe/Moscow:20261019T100000", "DTEND;TZID=Europe/Moscow:20261019T110000",
+      `RRULE:${rule}`, "SUMMARY:Планёрка"]));
+
+  /**
+   * Правка всей серии, в которой планировщик записал правило `dict` целиком.
+   * `tail` — честный, посчитанный по записанному объекту (у бесконечной серии
+   * его нет): своим числом план себя не опровергнет, и конец правила без
+   * сверки самого правила не проверяет никто.
+   */
+  function ruleWritten(ics: string, dict: Record<string, RuleValue>): WritePlan {
+    const o = load(ics);
+    const t = newTouched();
+    setRuleDict(o.master!.getFirstProperty("rrule")!, dict);
+    mark(t, o.master!, "rrule");
+    touchMetadata(o.master!, NOW, true, ENV, t);
+    const extent = seriesExtent(o);
+    const tail = extent.kind === "finite" && extent.last
+      ? { count: extent.count, lastDate: wallDateOf(extent.last.time, ENV) }
+      : undefined;
+    return putPlan(o, { op: "update", scope: "all_series", fields: ["recurrence"], ruleChanged: true, tail, touched: t });
+  }
+
+  const codes = (ics: string, dict: Record<string, RuleValue>, recurrence: RecurrencePatch): GuardCode[] =>
+    guardCodesWith(ics, ruleWritten(ics, dict), { patch: { recurrence } });
+
+  it("{frequency} не переписывает COUNT: из трёх встреч осталась одна", () => {
+    const ics = withRule("FREQ=WEEKLY;COUNT=3");
+    expect(codes(ics, { freq: "DAILY", count: 1 }, { frequency: "daily" })).toEqual(["untouched-changed"]);
+    expect(codes(ics, { freq: "DAILY", count: 3 }, { frequency: "daily" })).toEqual([]);
+  });
+
+  it("{frequency} не подменяет COUNT датой UNTIL: вместо трёх встреч 365", () => {
+    const ics = withRule("FREQ=WEEKLY;COUNT=3");
+    expect(codes(ics, { freq: "DAILY", until: "2027-10-19T06:59:59Z" }, { frequency: "daily" })).toEqual(["untouched-changed"]);
+  });
+
+  it("{interval} не переписывает COUNT: восемь встреч из десяти исчезли", () => {
+    const ics = withRule("FREQ=WEEKLY;COUNT=10");
+    expect(codes(ics, { freq: "WEEKLY", interval: 2, count: 2 }, { interval: 2 })).toEqual(["untouched-changed"]);
+    expect(codes(ics, { freq: "WEEKLY", interval: 2, count: 10 }, { interval: 2 })).toEqual([]);
+  });
+
+  it("{byWeekday} не переписывает COUNT и не подменяет его UNTIL", () => {
+    const ics = withRule("FREQ=WEEKLY;BYDAY=MO,WE;COUNT=20");
+    expect(codes(ics, { freq: "WEEKLY", byday: "MO", count: 2 }, { byWeekday: ["MO"] })).toEqual(["untouched-changed"]);
+    expect(codes(ics, { freq: "WEEKLY", byday: "MO", until: "2026-10-26T20:59:59Z" }, { byWeekday: ["MO"] })).toEqual(["untouched-changed"]);
+    expect(codes(ics, { freq: "WEEKLY", byday: "MO", count: 20 }, { byWeekday: ["MO"] })).toEqual([]);
+  });
+
+  it("снятый COUNT делает конечную серию бесконечной; {count: null} снимает его законно", () => {
+    const ics = withRule("FREQ=WEEKLY;BYDAY=MO;COUNT=3");
+    expect(codes(ics, { freq: "WEEKLY", byday: "MO" }, { byWeekday: ["MO"] }).sort())
+      .toEqual(["extent-mismatch", "untouched-changed"]);
+    expect(codes(ics, { freq: "WEEKLY", byday: "MO" }, { count: null })).toEqual([]);
+  });
+
+  it("{count} и {until} заменяют друг друга: прежний конец не считается потерянным", () => {
+    const counted = withRule("FREQ=WEEKLY;BYDAY=MO;COUNT=3");
+    expect(codes(counted, { freq: "WEEKLY", byday: "MO", until: "2026-11-16T20:59:59Z" }, { until: "2026-11-16" })).toEqual([]);
+    const dated = withRule("FREQ=WEEKLY;BYDAY=MO;UNTIL=20261116T205959Z");
+    expect(codes(dated, { freq: "WEEKLY", byday: "MO", count: 3 }, { count: 3 })).toEqual([]);
+  });
+
+  it("одиночное событие становится серией: первое правило сверяется с патчем", () => {
+    const single = calendar(MOSCOW, vevent(["DTSTART;TZID=Europe/Moscow:20261019T100000",
+      "DTEND;TZID=Europe/Moscow:20261019T110000", "SUMMARY:Планёрка"]));
+    const plan = (rule: string): WritePlan => {
+      const a = load(withRule(rule));
+      const t = newTouched();
+      mark(t, a.master!, "rrule");
+      return putPlan(a, { op: "update", scope: "all_series", fields: ["recurrence"], ruleChanged: true, tail: tailOf(a), touched: t });
+    };
+    const patch: EventPatch = { recurrence: { frequency: "weekly", count: 3 } };
+    expect(guardCodesWith(single, plan("FREQ=WEEKLY;COUNT=3"), { patch })).toEqual([]);
+    expect(guardCodesWith(single, plan("FREQ=WEEKLY;COUNT=5"), { patch })).toEqual(["untouched-changed"]);
+    expect(guardCodesWith(single, plan("FREQ=DAILY;COUNT=3"), { patch })).toEqual(["untouched-changed"]);
+  });
+
+  it("патч времени и повтора сразу: UNTIL пересчитывается (Р1), но не появляется и не пропадает", () => {
+    const ics = calendar(MOSCOW, vevent(["DTSTART;TZID=Europe/Moscow:20261019T100000",
+      "DTEND;TZID=Europe/Moscow:20261019T110000", "RRULE:FREQ=WEEKLY;BYDAY=MO;UNTIL=20261116T205959Z", "SUMMARY:Планёрка"]));
+    const patch: EventPatch = { start: "2026-10-19T11:00:00+03:00", recurrence: { interval: 2 } };
+    /** Сдвиг на 11:00 с шагом в две недели; `until` — что планировщик записал концом правила. */
+    const plan = (until: string | undefined): WritePlan => {
+      const o = load(ics);
+      const t = newTouched();
+      applyFieldPatch(o.master!, { start: patch.start }, { env: ENV, touched: t });
+      const rule = o.master!.getFirstProperty("rrule")!;
+      setRuleDict(rule, until === undefined ? { freq: "WEEKLY", byday: "MO", interval: 2 } : { freq: "WEEKLY", byday: "MO", interval: 2, until });
+      mark(t, o.master!, "rrule");
+      touchMetadata(o.master!, NOW, true, ENV, t);
+      const extent = seriesExtent(o);
+      return putPlan(o, {
+        op: "update", scope: "all_series", fields: ["start", "recurrence"], keyMap: later(3600), ruleChanged: true,
+        datesFixed: true, touched: t,
+        tail: extent.kind === "finite" && extent.last ? { count: extent.count, lastDate: wallDateOf(extent.last.time, ENV) } : undefined,
+      });
+    };
+    // Р1: U' — новое время на дате последнего прежнего слота (16.11 11:00 МСК = 08:00Z).
+    expect(guardCodesWith(ics, plan("2026-11-16T08:00:00Z"), { patch })).toEqual([]);
+    // Конец правила выброшен вовсе — серия стала бесконечной.
+    expect(guardCodesWith(ics, plan(undefined), { patch }).sort()).toEqual(["extent-mismatch", "untouched-changed"]);
+  });
+});
+
+describe("verifyPlan: replace собирает правило из патча, а не любое (Р4)", () => {
+  const ics = calendar(MOSCOW, vevent(["DTSTART;TZID=Europe/Moscow:20261019T100000",
+    "DTEND;TZID=Europe/Moscow:20261019T110000", "RRULE:FREQ=WEEKLY;COUNT=3", "SUMMARY:Планёрка"]));
+
+  function replaceWritten(dict: Record<string, RuleValue>): WritePlan {
+    const o = load(ics);
+    const t = newTouched();
+    setRuleDict(o.master!.getFirstProperty("rrule")!, dict);
+    mark(t, o.master!, "rrule");
+    touchMetadata(o.master!, NOW, true, ENV, t);
+    const extent = seriesExtent(o);
+    const tail = extent.kind === "finite" && extent.last
+      ? { count: extent.count, lastDate: wallDateOf(extent.last.time, ENV) }
+      : undefined;
+    return putPlan(o, { op: "update", scope: "all_series", fields: ["recurrence"], ruleChanged: true, tail, touched: t });
+  }
+
+  const codes = (dict: Record<string, RuleValue>, recurrence: RecurrencePatch): GuardCode[] =>
+    guardCodesWith(ics, replaceWritten(dict), { patch: { recurrence } });
+
+  it("{replace, count: 5}: частота без патча — прежняя, а записана MINUTELY", () => {
+    expect(codes({ freq: "MINUTELY", count: 5 }, { replace: true, count: 5 })).toEqual(["untouched-changed"]);
+    expect(codes({ freq: "WEEKLY", count: 5 }, { replace: true, count: 5 })).toEqual([]);
+  });
+
+  it("{replace, count: 5}: записан COUNT=1 — удалено на две встречи больше, чем подтвердил пользователь", () => {
+    expect(codes({ freq: "WEEKLY", count: 1 }, { replace: true, count: 5 })).toEqual(["untouched-changed"]);
+  });
+
+  it("{replace}: части сверх патча план собрал сам", () => {
+    expect(codes({ freq: "WEEKLY", byday: "MO", count: 5 }, { replace: true, count: 5 })).toEqual(["untouched-changed"]);
+    // Законный replace: правило только из патча, серия становится бесконечной.
+    expect(codes({ freq: "WEEKLY" }, { replace: true, frequency: "weekly" })).toEqual([]);
+  });
+});
+
+describe("verifyPlan: скрытое переопределение под EXDATE — настоящие данные (О11)", () => {
+  /**
+   * Пн 10:00 с 19.10, COUNT=4 (19, 26 окт., 2, 9 нояб.), EXDATE на 2.11 и
+   * компонент с RECURRENCE-ID 2.11: роль hidden, своё время 14:00 и свой
+   * заголовок. Пользователь видит его в get_event.exceptions.
+   */
+  const HIDDEN = calendar(
+    MOSCOW,
+    vevent(["DTSTART;TZID=Europe/Moscow:20261019T100000", "DTEND;TZID=Europe/Moscow:20261019T110000",
+      "RRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=4", "EXDATE;TZID=Europe/Moscow:20261102T100000", "SUMMARY:Планёрка"]),
+    override("20261102T100000", "20261102T140000", "20261102T150000", "SUMMARY:Разбор года"),
+  );
+  const TRACE = "2026-11-02T10:00:00+03:00";
+
+  function rulePlan(rp: RecurrencePatch, drop: boolean, losses: Loss[] = []): WritePlan {
+    const o = load(HIDDEN);
+    const t = newTouched();
+    patchRule(o.master!.getFirstProperty("rrule")!, rp, { env: ENV, touched: t });
+    if (drop) for (const ref of o.overrides.get(key(o, TRACE))!) dropComponent(t, o.root, ref.component);
+    touchMetadata(o.master!, NOW, true, ENV, t);
+    return putPlan(o, { op: "update", scope: "all_series", fields: ["recurrence"], ruleChanged: true, tail: tailOf(o), touched: t }, losses);
+  }
+
+  it("роль переопределения 2.11 (под EXDATE) — hidden", () => {
+    const o = load(HIDDEN);
+    expect(o.roles.get(o.overrides.get(key(o, TRACE))![0].component)?.role).toBe("hidden");
+  });
+
+  it("{count:6} выбросил скрытое под EXDATE молча — override-lost; названное в ответе снимается", () => {
+    expect(guardCodes(HIDDEN, rulePlan({ count: 6 }, true))).toEqual(["override-lost"]);
+    expect(guardCodes(HIDDEN, rulePlan({ count: 6 }, true, [lossOf(TRACE)]))).toEqual([]);
+    expect(guardCodes(HIDDEN, rulePlan({ count: 6 }, false))).toEqual([]);
+  });
+
+  it("{interval:2}: слота на 2.11 новое правило не даёт, но и такое скрытое молча не выбрасывается", () => {
+    expect(guardCodes(HIDDEN, rulePlan({ interval: 2 }, true))).toEqual(["override-lost"]);
+    expect(guardCodes(HIDDEN, rulePlan({ interval: 2 }, true, [lossOf(TRACE)]))).toEqual([]);
+    expect(guardCodes(HIDDEN, rulePlan({ interval: 2 }, false))).toEqual([]);
+  });
+});
+
+describe("verifyPlan: встреча из RDATE;VALUE=PERIOD несёт свой конец", () => {
+  /** Пн 10:00–11:00 МСК (19 и 26 окт.) и встреча 1.11 14:00–17:00, заданная периодом. */
+  const periodic = (start: string, end: string, rule: string, rdate: string) =>
+    calendar(MOSCOW, vevent([`DTSTART;TZID=Europe/Moscow:${start}`, `DTEND;TZID=Europe/Moscow:${end}`,
+      `RRULE:${rule}`, rdate, "SUMMARY:Планёрка"]));
+
+  const PERIOD = "RDATE;TZID=Europe/Moscow;VALUE=PERIOD:20261101T140000/PT3H";
+  const BEFORE = periodic("20261019T100000", "20261019T110000", "FREQ=WEEKLY;COUNT=2", PERIOD);
+
+  /** Сдвиг всей серии на 11:00 (Р1): записываемый объект задан текстом, `rdate` — как его записал план. */
+  function shiftPlan(rdate: string): WritePlan {
+    const a = load(periodic("20261019T110000", "20261019T120000", "FREQ=WEEKLY;COUNT=2", rdate));
+    const t = newTouched();
+    mark(t, a.master!, "dtstart", "dtend", "rdate");
+    return putPlan(a, { op: "update", scope: "all_series", fields: ["start"], keyMap: later(3600),
+      ruleChanged: true, datesFixed: true, tail: tailOf(a), touched: t });
+  }
+
+  it("сдвиг серии укоротил период: трёхчасовая встреча стала десятиминутной", () => {
+    expect(guardCodes(BEFORE, shiftPlan("RDATE;TZID=Europe/Moscow;VALUE=PERIOD:20261101T150000/PT3H"))).toEqual([]);
+    expect(guardCodes(BEFORE, shiftPlan("RDATE;TZID=Europe/Moscow;VALUE=PERIOD:20261101T150000/PT10M"))).toEqual(["time-changed"]);
+  });
+
+  it("сдвиг серии потерял VALUE=PERIOD: свой конец встречи исчез", () => {
+    expect(guardCodes(BEFORE, shiftPlan("RDATE;TZID=Europe/Moscow:20261101T150000"))).toEqual(["time-changed"]);
+  });
+
+  it("патч {end}: конец периода остаётся своим или становится концом серии, третьего нет", () => {
+    const plan = (rdate: string): WritePlan => {
+      const a = load(periodic("20261019T100000", "20261019T120000", "FREQ=WEEKLY;COUNT=2", rdate));
+      const t = newTouched();
+      mark(t, a.master!, "dtend", "rdate");
+      return putPlan(a, { op: "update", scope: "all_series", fields: ["end"], ruleChanged: true, tail: tailOf(a), touched: t });
+    };
+    expect(guardCodes(BEFORE, plan(PERIOD))).toEqual([]);
+    expect(guardCodes(BEFORE, plan("RDATE;TZID=Europe/Moscow;VALUE=PERIOD:20261101T140000/PT2H"))).toEqual([]);
+    expect(guardCodes(BEFORE, plan("RDATE;TZID=Europe/Moscow;VALUE=PERIOD:20261101T140000/PT10M"))).toEqual(["time-changed"]);
+  });
+
+  it("смена повтора времени не трогает, а период укорочен", () => {
+    const plan = (rdate: string): WritePlan => {
+      const a = load(periodic("20261019T100000", "20261019T110000", "FREQ=WEEKLY;COUNT=3", rdate));
+      const t = newTouched();
+      mark(t, a.master!, "rrule", "rdate");
+      return putPlan(a, { op: "update", scope: "all_series", fields: ["recurrence"], ruleChanged: true, tail: tailOf(a), touched: t });
+    };
+    const patch: EventPatch = { recurrence: { count: 3 } };
+    expect(guardCodesWith(BEFORE, plan(PERIOD), { patch })).toEqual([]);
+    expect(guardCodesWith(BEFORE, plan("RDATE;TZID=Europe/Moscow;VALUE=PERIOD:20261101T140000/PT10M"), { patch })).toEqual(["time-changed"]);
+  });
+});
+
+describe("verifyPlan: своя длительность неперенесённого переопределения (О8)", () => {
+  /** Пн 10:00–11:00 МСК, COUNT=3, и встреча 26.10 на свои два часа (не перенесена). */
+  const own = (masterStart: string, masterEnd: string, rule: string, rid: string, start: string, end: string) =>
+    calendar(MOSCOW,
+      vevent([`DTSTART;TZID=Europe/Moscow:${masterStart}`, `DTEND;TZID=Europe/Moscow:${masterEnd}`, `RRULE:${rule}`, "SUMMARY:Планёрка"]),
+      override(rid, start, end, "SUMMARY:Планёрка с гостем"));
+
+  const BEFORE = own("20261019T100000", "20261019T110000", "FREQ=WEEKLY;BYDAY=MO;COUNT=3",
+    "20261026T100000", "20261026T100000", "20261026T120000");
+
+  it("сдвиг серии на 11:00: двухчасовая встреча 26.10 стала пятиминутной", () => {
+    const plan = (end: string): WritePlan => {
+      const a = load(own("20261019T110000", "20261019T120000", "FREQ=WEEKLY;BYDAY=MO;COUNT=3",
+        "20261026T110000", "20261026T110000", end));
+      const t = newTouched();
+      mark(t, a.master!, "dtstart", "dtend");
+      for (const c of overridesOf(a)) mark(t, c, "recurrence-id", "dtstart", "dtend");
+      return putPlan(a, { op: "update", scope: "all_series", fields: ["start"], keyMap: later(3600),
+        ruleChanged: true, datesFixed: true, tail: tailOf(a), touched: t });
+    };
+    expect(guardCodes(BEFORE, plan("20261026T130000"))).toEqual([]);
+    expect(guardCodes(BEFORE, plan("20261026T110500"))).toEqual(["time-changed"]);
+  });
+
+  it("смена пояса: встреча 26.10 идёт за слотом и сохраняет свои два часа", () => {
+    const YEKB = ["BEGIN:VTIMEZONE", "TZID:Asia/Yekaterinburg", "BEGIN:STANDARD", "TZNAME:+05", "TZOFFSETFROM:+0500",
+      "TZOFFSETTO:+0500", "DTSTART:19700101T000000", "END:STANDARD", "END:VTIMEZONE"];
+    /** Те же моменты в поясе +05 (О8): 10:00 МСК — это 12:00 в Екатеринбурге. */
+    const plan = (end: string): WritePlan => {
+      const zoned = (line: string) => line.replace(/Europe\/Moscow/g, "Asia/Yekaterinburg");
+      const a = load([...calendar([...MOSCOW, ...YEKB],
+        vevent([zoned("DTSTART;TZID=Europe/Moscow:20261019T120000"), zoned("DTEND;TZID=Europe/Moscow:20261019T130000"),
+          "RRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=3", "SUMMARY:Планёрка"]),
+        vevent([zoned("RECURRENCE-ID;TZID=Europe/Moscow:20261026T120000"), zoned("DTSTART;TZID=Europe/Moscow:20261026T120000"),
+          zoned(`DTEND;TZID=Europe/Moscow:${end}`), "SUMMARY:Планёрка с гостем"]))].join(""));
+      const t = newTouched();
+      mark(t, a.master!, "dtstart", "dtend");
+      for (const c of overridesOf(a)) mark(t, c, "recurrence-id", "dtstart", "dtend");
+      return putPlan(a, { op: "update", scope: "all_series", fields: ["timeZone"], ruleChanged: true, tail: tailOf(a), touched: t });
+    };
+    expect(guardCodes(BEFORE, plan("20261026T140000"))).toEqual([]);
+    expect(guardCodes(BEFORE, plan("20261026T120500"))).toEqual(["time-changed"]);
+  });
+
+  it("патч {end}: конец встречи 26.10 остаётся своим или становится концом серии, третьего нет", () => {
+    const plan = (end: string): WritePlan => {
+      const a = load(own("20261019T100000", "20261019T130000", "FREQ=WEEKLY;BYDAY=MO;COUNT=3",
+        "20261026T100000", "20261026T100000", end));
+      const t = newTouched();
+      mark(t, a.master!, "dtend");
+      for (const c of overridesOf(a)) mark(t, c, "dtend");
+      return putPlan(a, { op: "update", scope: "all_series", fields: ["end"], tail: tailOf(a), touched: t });
+    };
+    expect(guardCodes(BEFORE, plan("20261026T120000"))).toEqual([]);
+    expect(guardCodes(BEFORE, plan("20261026T130000"))).toEqual([]);
+    expect(guardCodes(BEFORE, plan("20261026T101000"))).toEqual(["time-changed"]);
+  });
+
+  it("правка правила времени не трогает, а конец встречи 26.10 уехал", () => {
+    const plan = (end: string): WritePlan => {
+      const a = load(own("20261019T100000", "20261019T110000", "FREQ=WEEKLY;BYDAY=MO;COUNT=4",
+        "20261026T100000", "20261026T100000", end));
+      const t = newTouched();
+      mark(t, a.master!, "rrule");
+      for (const c of overridesOf(a)) mark(t, c, "dtend");
+      return putPlan(a, { op: "update", scope: "all_series", fields: ["recurrence"], ruleChanged: true, tail: tailOf(a), touched: t });
+    };
+    const patch: EventPatch = { recurrence: { count: 4 } };
+    expect(guardCodesWith(BEFORE, plan("20261026T120000"), { patch })).toEqual([]);
+    expect(guardCodesWith(BEFORE, plan("20261026T100500"), { patch })).toEqual(["time-changed"]);
+  });
+});
+
+describe("verifyPlan: разрез — конец правила, период RDATE и скрытое в продолжении", () => {
+  /** Пн и Ср 10:00–11:00 МСК с 19.10, COUNT=6: 19, 21, 26, 28 окт., 2, 4 нояб. */
+  const PLAIN = calendar(MOSCOW, vevent([...SERIES]));
+  const CONT_UID = "ycm-0123456789abcdef0123456789abcdef";
+
+  /** Продолжение разреза: клон `base` с новым UID, началом на B и правкой `edit`. */
+  function continuation(base: string, b: SlotKey, edit: (c: CalendarObject) => void): { uid: string; ics: string } {
+    const c = load(base);
+    const cm = c.master!;
+    for (const [k, refs] of c.overrides) {
+      for (const ref of refs) {
+        if (compareSlotKeys(k, b) < 0) c.root.removeSubcomponent(ref.component);
+        else ref.component.getFirstProperty("uid")!.setValue(CONT_UID);
+      }
+    }
+    cm.getFirstProperty("uid")!.setValue(CONT_UID);
+    const start = findSlot(c, b)!.time.clone();
+    const end = start.clone();
+    end.adjust(0, 1, 0, 0);
+    setTimeProperty(cm, "dtstart", start);
+    setTimeProperty(cm, "dtend", end);
+    for (const name of ["sequence", "created"]) {
+      for (const p of cm.getAllProperties(name)) cm.removeProperty(p);
+    }
+    edit(c);
+    touchMetadata(cm, NOW, false, ENV);
+    return { uid: CONT_UID, ics: serializeObject(c) };
+  }
+
+  it("смена повтора: COUNT продолжения пересчитан по построению — план проходит", () => {
+    const o = load(PLAIN);
+    const b = key(o, "2026-10-26T10:00:00+03:00");
+    const t = truncate(o, b);
+    const cont = continuation(PLAIN, b, (c) => {
+      const rule = c.master!.getFirstProperty("rrule")!;
+      patchRule(rule, { interval: 2 }, { env: ENV });
+      setRuleEnd(rule, { count: 4 });
+    });
+    const plan: WritePlan = {
+      kind: "split", continuation: cont, truncated: { ics: serializeObject(o) }, boundary: b,
+      expect: expectation({ op: "update", scope: "this_and_following", target: b, fields: ["recurrence"], ruleChanged: true,
+        tail: tailOf(load(cont.ics)), touched: t }),
+      removed: [], notices: [],
+    };
+    expect(guardCodesWith(PLAIN, plan, { patch: { recurrence: { interval: 2 } } })).toEqual([]);
+  });
+
+  it("периоды RDATE: свой конец цел и в усечённой серии, и в продолжении", () => {
+    // Слоты: 19.10, 20.10 (период), 26.10, 1.11 (период), 2.11; граница — 26.10.
+    const base = calendar(MOSCOW, vevent(["DTSTART;TZID=Europe/Moscow:20261019T100000", "DTEND;TZID=Europe/Moscow:20261019T110000",
+      "RRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=3", "RDATE;TZID=Europe/Moscow;VALUE=PERIOD:20261020T140000/PT3H",
+      "RDATE;TZID=Europe/Moscow;VALUE=PERIOD:20261101T140000/PT3H", "SUMMARY:Планёрка"]));
+    /** Укорачивает единственный оставшийся период на `hours` часов — ошибка планировщика. */
+    const shorten = (x: CalendarObject, hours: number) => {
+      const period = x.master!.getAllProperties("rdate")[0].getFirstValue() as ICAL.Period;
+      const end = period.getEnd().clone();
+      end.adjust(0, hours, 0, 0);
+      removeListValues(x.master!, "rdate", () => true, x);
+      addListValue(x.master!, "rdate", new ICAL.Period({ start: period.start.clone(), end }));
+    };
+    const plan = (truncHours: number, contHours: number): WritePlan => {
+      const o = load(base);
+      const b = key(o, "2026-10-26T10:00:00+03:00");
+      const t = newTouched();
+      setRuleEnd(o.master!.getFirstProperty("rrule")!, { count: positionsBefore(o, b) }, t);
+      removeListValues(o.master!, "rdate", (k) => compareSlotKeys(k, b) >= 0, o);
+      if (truncHours !== 0) shorten(o, truncHours);
+      mark(t, o.master!, "rdate");
+      touchMetadata(o.master!, NOW, true, ENV, t);
+      const cont = continuation(base, b, (c) => {
+        setRuleEnd(c.master!.getFirstProperty("rrule")!, { count: 2 });
+        removeListValues(c.master!, "rdate", (k) => compareSlotKeys(k, b) < 0, c);
+        if (contHours !== 0) shorten(c, contHours);
+      });
+      return {
+        kind: "split", continuation: cont, truncated: { ics: serializeObject(o) }, boundary: b,
+        expect: expectation({ op: "update", scope: "this_and_following", target: b, fields: ["summary"], ruleChanged: true,
+          tail: tailOf(load(cont.ics)), touched: t }),
+        removed: [], notices: [],
+      };
+    };
+    expect(guardCodes(base, plan(0, 0))).toEqual([]);
+    expect(guardCodes(base, plan(0, -2))).toEqual(["time-changed"]);
+    expect(guardCodes(base, plan(-2, 0))).toEqual(["time-changed"]);
+  });
+
+  it("скрытое переопределение за концом серии не теряется в продолжении молча", () => {
+    const base = calendar(MOSCOW, vevent([...SERIES]), override("20261109T100000", "20261109T140000", "20261109T150000", "SUMMARY:Разбор года"));
+    const trace = "2026-11-09T10:00:00+03:00";
+    const plan = (drop: boolean, losses: Loss[] = []): WritePlan => {
+      const o = load(base);
+      const b = key(o, "2026-10-26T10:00:00+03:00");
+      const t = truncate(o, b);
+      const cont = continuation(base, b, (c) => {
+        setRuleEnd(c.master!.getFirstProperty("rrule")!, { count: 4 });
+        if (drop) for (const ref of c.overrides.get(key(c, trace)) ?? []) c.root.removeSubcomponent(ref.component);
+      });
+      return {
+        kind: "split", continuation: cont, truncated: { ics: serializeObject(o) }, boundary: b,
+        expect: expectation({ op: "update", scope: "this_and_following", target: b, fields: ["summary"], ruleChanged: true,
+          tail: tailOf(load(cont.ics)), touched: t }),
+        removed: losses, notices: [],
+      };
+    };
+    const loaded = load(base);
+    expect(loaded.roles.get(loaded.overrides.get(key(loaded, trace))![0].component)?.role).toBe("hidden");
+    expect(guardCodes(base, plan(false))).toEqual([]);
+    expect(guardCodes(base, plan(true))).toEqual(["override-lost"]);
+    expect(guardCodes(base, plan(true, [lossOf(trace)]))).toEqual([]);
   });
 });
 

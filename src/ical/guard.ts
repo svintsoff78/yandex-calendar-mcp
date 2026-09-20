@@ -15,6 +15,7 @@ import {
   formOf,
   formatForModel,
   instantOf,
+  listEntries,
   listKeys,
   parseModelTime,
   ruleDict,
@@ -22,6 +23,7 @@ import {
   timeInForm,
   wallDateOf,
   type IcalEnv,
+  type ListEntry,
   type SlotKey,
 } from "./values.js";
 
@@ -55,7 +57,9 @@ import {
  *   объекта из доменной модели. Внутри разрешённого свойства тоже не всё
  *   можно: правка без recurrence меняет в RRULE только конец (UNTIL,
  *   COUNT), а со сменой повтора — только части, названные в патче
- *   оркестрации, и ровно на его значения (Р4, checkRuleParts); у
+ *   оркестрации, и ровно на его значения; конец правила поблажки не имеет —
+ *   патч, который его не называет, его и не меняет, и `replace: true` тоже
+ *   собирает правило только из патча (Р4, checkRuleParts); у
  *   оставшихся участников — только PARTSTAT (О9). Поля
  *   переопределений — по О7: своё значение (не равное прежнему основному)
  *   остаётся, унаследованное следует за новым основным (у скрытого —
@@ -64,13 +68,17 @@ import {
  *   (у продолжения — на B, и при смене повтора), длительность основного; у
  *   цели правки и у основного при `start` без `end` — прежняя
  *   длительность, а без `start` — прежнее начало, с `timeZone` — тот же
- *   момент (О8);
+ *   момент (О8). Скрытое переопределение — настоящие данные пользователя
+ *   (get_event.exceptions): снять его молча нельзя ни при каком патче,
+ *   только названным в ответе (mayRemove, О11);
  * - (в) видимые встречи после записи — прежние через `keyMap` минус
  *   `removed`: ни одна не пропала и не появилась, переопределение осталось
  *   переопределением, EXDATE не снят; без правки повтора даты встреч
  *   прежние (Р1: из `start` берётся только время суток — даже если план не
  *   поднял `datesFixed`); перенесённая встреча стоит, где стояла, а
- *   неперенесённая идёт за серией (О7). При смене повтора RDATE прежние, а
+ *   неперенесённая идёт за серией и сохраняет свою длительность (О7, О8).
+ *   Встреча из `RDATE;VALUE=PERIOD` несёт свой конец, и он сверяется наравне
+ *   с началом (checkRdatePeriods). При смене повтора RDATE прежние, а
  *   новых EXDATE нет (таблица §3). Горизонт — от первого слота до
  *   max(сейчас, цель, последний явный ключ) + 400 дней и ещё 5 видимых
  *   слотов (О12в); явные ключи — RECURRENCE-ID, EXDATE и RDATE обеих
@@ -142,8 +150,11 @@ import {
  * - `date-shifted` — дата встречи сдвинулась, когда даты должны остаться;
  * - `moved-shifted` — перенесённая встреча сдвинута, или неперенесённая
  *   отстала от серии (О7);
- * - `time-changed` — у клона основного или у основного продолжения начало
- *   не на слоте или длительность не та, хотя патч время не трогает (О6, О8);
+ * - `time-changed` — начало или конец встречи изменены там, где патч этого
+ *   не просил: у клона основного и у основного продолжения начало не на
+ *   слоте или длительность не та (О6), у прежнего компонента сдвинуто
+ *   начало или подменена своя длительность (О8), у встречи из
+ *   `RDATE;VALUE=PERIOD` потерян свой конец;
  * - `override-field-lost` — своё значение поля переопределения (не равное
  *   прежнему основному) затёрто правкой серии (О7);
  * - `override-field-stale` — поле переопределения, равное прежнему
@@ -262,13 +273,13 @@ const LIST_LIMIT = 8;
  *   должна быть там строкой с адресом по Р10: у t&f — встреча с
  *   RECURRENCE-ID от B, перенесённая раньше B (у delete), и спрятанная
  *   усечением оторванная; у смены повтора — видимое переопределение без
- *   пары в новом правиле и скрытое переопределение, которому новое правило
- *   даёт встречу (О11: такие потери — только с confirm, и пользователь о
- *   них узнаёт). Ключа такого скрытого в `expect.removed` быть не должно:
- *   встреча на его слоте после записи остаётся, теряются только её
- *   собственные время и поля. И наоборот: встречи, которую операция не
- *   убирает, там быть не должно — ответ не объявляет удалённым то, что
- *   останется в календаре;
+ *   пары в новом правиле и любое снятое скрытое переопределение, дало ему
+ *   новое правило встречу или нет (О11: такие потери — только с confirm, и
+ *   пользователь о них узнаёт). Когда новое правило даёт скрытому встречу,
+ *   ключа в `expect.removed` быть не должно: встреча на его слоте после
+ *   записи остаётся, теряются только её собственные время и поля. И
+ *   наоборот: встречи, которую операция не убирает, там быть не должно —
+ *   ответ не объявляет удалённым то, что останется в календаре;
  * - `touched.names` — по компоненту дерева после правки: имена изменённых
  *   свойств и подкомпонентов; `touched.components` — снятые и добавленные
  *   VEVENT. Компоненты сопоставляются по UID и RECURRENCE-ID как записаны;
@@ -817,6 +828,7 @@ function checkPut(ctx: Ctx, ics: string): void {
   compareTrees(ctx, after);
   if (before.master && after.master) {
     checkRuleParts(ctx, before.master, after.master, "основного компонента");
+    checkRdatePeriods(ctx, before, after, () => true, "после записи");
     if (ctx.recurrence) checkDateLists(ctx, before, after, () => true, "после записи");
   }
 
@@ -923,64 +935,165 @@ function sameSlotDefinition(before: CalendarObject, after: CalendarObject): bool
  * (recur.js, _stringToData; values.ts, ruleDict), порядок частей не важен.
  * Протяжённость после смены конца сверяет (д).
  *
+ * Конец правила (COUNT, UNTIL) — часть правила, а не исключение из него:
+ * патч, который его не называет, его и не меняет. Свободен он ровно там, где
+ * его меняет само построение записи: без патча повтора (Р1 пересчитывает
+ * UNTIL при сдвиге времени, усечение и продолжение считают COUNT), в
+ * продолжении разреза (`endFree`) и когда патч называет `count` или `until` —
+ * они взаимоисключающие и заменяют друг друга на одном месте. При сдвиге
+ * времени вместе со сменой повтора UNTIL пересчитывается по Р1, но не
+ * появляется и не пропадает: сверяется его наличие, а не значение.
+ *
  * `always` — сверять как без патча: усечённая исходная серия при разрезе
  * меняет только конец, повтор патча — дело продолжения. Без патча из
  * оркестрации при смене повтора сверять не с чем: план волен написать любое
- * правило (контракт `GuardOptions.patch` — З13 передаёт патч всегда).
- * `replace: true` задаёт правило заново целиком и требует confirm с
- * перечнем теряемых частей (Р4) — сверять нечего.
+ * правило (контракт `GuardOptions.patch` — З13 передаёт патч всегда); число
+ * свойств RRULE сверяется и тогда. `replace: true` правило не освобождает:
+ * confirm по Р4 покрывает потерю невыразимых частей, а не подмену правила
+ * другим (checkReplacedRule).
  */
-function checkRuleParts(ctx: Ctx, beforeMaster: ICAL.Component, afterMaster: ICAL.Component, label: string, always = false): void {
+function checkRuleParts(
+  ctx: Ctx,
+  beforeMaster: ICAL.Component,
+  afterMaster: ICAL.Component,
+  label: string,
+  options: { always?: boolean; endFree?: boolean } = {},
+): void {
+  const { always = false, endFree = false } = options;
   const patched = ctx.recurrence && !always;
   const rp = patched ? ctx.patch?.recurrence : undefined;
-  if (patched && (rp === undefined || rp.replace === true)) return;
-  const named = namedRuleParts(rp);
+  const wasProperties = beforeMaster.getAllProperties("rrule");
+  const nowProperties = afterMaster.getAllProperties("rrule");
+  // Одиночное событие, которому патч повтора даёт первое правило (таблица
+  // §3, «одиночное — как this»): прежнего правила нет, и сверять новое можно
+  // только с патчем.
+  const creating = patched && wasProperties.length === 0 && nowProperties.length === 1;
+  if (!creating && wasProperties.length !== nowProperties.length) {
+    ctx.findings.add(
+      "untouched-changed",
+      `У ${label} было ${wasProperties.length} RRULE, а записано ${nowProperties.length}: правка правила их не сливает и не добавляет (Р4).`,
+    );
+    return;
+  }
+  if (patched && rp === undefined) return;
+  if (creating) {
+    checkPatchedParts(ctx, nowProperties[0], rp!, label);
+    return;
+  }
+  // Значения названных частей сверяются у одного правила: у объекта с
+  // несколькими RRULE (аномалия чужого клиента) неизвестно, какое из них
+  // патч меняет, и остаётся сверка прежних частей и числа правил.
+  const single = wasProperties.length === 1 && nowProperties.length === 1;
+  if (rp?.replace === true) {
+    if (single) {
+      checkReplacedRule(ctx, wasProperties[0], nowProperties[0], rp, endFree, label);
+      checkPatchedParts(ctx, nowProperties[0], rp, label);
+    }
+    return;
+  }
+  const { named, loose } = ruleFreeParts(rp, ctx.time, endFree);
   const strip = (property: ICAL.Property): string => {
     const [name, params, type, value, ...rest] = property.jCal as unknown[];
     let core: unknown = value;
     if (value && typeof value === "object" && !Array.isArray(value)) {
       core = Object.entries(value as Record<string, unknown>)
         .filter(([part]) => !named.has(part))
+        // Пересчитываемая часть: значение свободно, а наличие — нет.
+        .map(([part, own]): [string, unknown] => [part, loose.has(part) ? "(пересчитано)" : own])
         .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
     }
     return JSON.stringify([name, params, type, core, rest]);
   };
-  const wasProperties = beforeMaster.getAllProperties("rrule");
-  const nowProperties = afterMaster.getAllProperties("rrule");
   const was = wasProperties.map(strip);
   const now = nowProperties.map(strip);
-  if (was.length !== now.length) {
-    ctx.findings.add(
-      "untouched-changed",
-      `У ${label} было ${was.length} RRULE, а записано ${now.length}: правка правила их не сливает и не добавляет (Р4).`,
-    );
-  } else if (JSON.stringify(was) !== JSON.stringify(now)) {
+  if (JSON.stringify(was) !== JSON.stringify(now)) {
+    const free = [...named, ...loose].map((part) => part.toUpperCase()).join(", ");
     ctx.findings.add(
       "untouched-changed",
       rp === undefined
         ? `У ${label} изменены части RRULE сверх конца правила (UNTIL, COUNT): ${ctx.expect.op} ${ctx.expect.scope} без recurrence их не меняет (Р1, Р4).`
-        : `У ${label} изменены части RRULE сверх названных патчем (${[...named].map((part) => part.toUpperCase()).join(", ")}): ` +
-          "patch.recurrence меняет только переданные части, прочие остаются дословно (Р4).",
+        : `У ${label} изменены части RRULE сверх названных патчем (${free || "ни одной"}): ` +
+          "patch.recurrence меняет только переданные части, прочие — вместе с концом правила — остаются дословно (Р4).",
     );
   }
-  // Значения названных частей сверяются у одного правила: у объекта с
-  // несколькими RRULE (аномалия чужого клиента) неизвестно, какое из них
-  // патч меняет, и остаётся сверка прежних частей и числа правил.
-  if (rp !== undefined && named.size > 0 && wasProperties.length === 1 && nowProperties.length === 1) {
-    checkPatchedParts(ctx, nowProperties[0], rp, label);
-  }
+  if (rp !== undefined && single) checkPatchedParts(ctx, nowProperties[0], rp, label);
 }
 
-/** Части правила, названные патчем повтора (Р4): их значения задаёт патч, прежние не сверяются. */
-function namedRuleParts(rp: RecurrencePatch | undefined): Set<string> {
-  // Конец правила свободен и без патча: UNTIL пересчитывается при сдвиге
-  // времени (Р1), COUNT — при усечении и в продолжении разреза.
-  const named = new Set(["until", "count"]);
-  if (rp === undefined) return named;
+/**
+ * Части правила, которые сверке не подлежат (Р4):
+ * - `named` — названные патчем (их значения сверяет checkPatchedParts) и
+ *   конец правила там, где его меняет само построение записи;
+ * - `loose` — пересчитываемые: значение свободно, наличие сверяется.
+ */
+function ruleFreeParts(rp: RecurrencePatch | undefined, time: boolean, endFree: boolean): { named: Set<string>; loose: Set<string> } {
+  const named = new Set<string>();
+  const loose = new Set<string>();
+  // Без патча повтора конец правила меняет само построение: UNTIL
+  // пересчитывается при сдвиге времени (Р1), COUNT — при усечении (delete
+  // t&f, исходный объект разреза) и в продолжении. Что встречи при этом не
+  // потеряны, сверяет протяжённость (checkExtent), а не эта сверка.
+  if (rp === undefined) {
+    named.add("count");
+    named.add("until");
+    return { named, loose };
+  }
   if (rp.frequency !== undefined) named.add("freq");
   if (rp.interval !== undefined) named.add("interval");
   if (rp.byWeekday !== undefined) named.add("byday");
-  return named;
+  // COUNT и UNTIL взаимоисключающи: назвав одно, патч снимает другое
+  // (patch.ts, patchRule — замена на том же месте).
+  if (rp.count !== undefined || rp.until !== undefined || endFree) {
+    named.add("count");
+    named.add("until");
+  } else if (time) {
+    loose.add("until");
+  }
+  return { named, loose };
+}
+
+/**
+ * `replace: true` (Р4): правило собирается только из патча — FREQ (из патча,
+ * а без него прежняя) и названные части, больше ничего. Проверяемого здесь
+ * больше, чем на обычном пути, а не меньше: confirm по Р4 говорит о потере
+ * невыразимых частей, а не о праве написать любое другое правило.
+ * `endFree` — продолжение разреза: конец правила там считает само построение.
+ */
+function checkReplacedRule(
+  ctx: Ctx,
+  was: ICAL.Property,
+  now: ICAL.Property,
+  rp: RecurrencePatch,
+  endFree: boolean,
+  label: string,
+): void {
+  let wasDict: Record<string, unknown>;
+  let nowDict: Record<string, unknown>;
+  try {
+    wasDict = ruleDict(was) as unknown as Record<string, unknown>;
+    nowDict = ruleDict(now) as unknown as Record<string, unknown>;
+  } catch {
+    return; // Правило без словаря ловит (а) как непригодное.
+  }
+  const allowed = new Set(["freq"]);
+  if (typeof rp.interval === "number") allowed.add("interval");
+  if (Array.isArray(rp.byWeekday) && rp.byWeekday.length > 0) allowed.add("byday");
+  if (typeof rp.count === "number" || endFree) allowed.add("count");
+  if (typeof rp.until === "string" || endFree) allowed.add("until");
+
+  const problems: string[] = [];
+  const extra = Object.keys(nowDict).filter((part) => !allowed.has(part) && nowDict[part] !== undefined && nowDict[part] !== null);
+  if (extra.length > 0) problems.push(`части ${extra.map((part) => part.toUpperCase()).join(", ")} патч не называл`);
+  if (rp.frequency === undefined) {
+    const want = String(wasDict.freq ?? "");
+    const got = String(nowDict.freq ?? "");
+    if (want !== "" && got.toUpperCase() !== want.toUpperCase()) problems.push(`FREQ=${got || "—"} вместо прежней ${want}`);
+  }
+  if (problems.length > 0) {
+    ctx.findings.add(
+      "untouched-changed",
+      `У ${label} правило с replace собрано не из патча: ${problems.join("; ")} (Р4: replace берёт части только из патча, частота без патча — прежняя).`,
+    );
+  }
 }
 
 const RULE_FREQUENCIES: Readonly<Record<string, string>> = { daily: "DAILY", weekly: "WEEKLY", monthly: "MONTHLY", yearly: "YEARLY" };
@@ -1116,6 +1229,63 @@ function checkDateLists(
   }
 }
 
+/**
+ * Встреча, заданная `RDATE;VALUE=PERIOD`, несёт свой конец: values.ts кладёт
+ * его в `Slot.periodEnd`, instances.ts выдаёт его пользователю как end
+ * встречи. Сверка ключей (checkDateLists) и сверка видимых встреч знают
+ * только начало, поэтому конец периода сверяется отдельно и на каждом пути:
+ * у прежнего значения и его образа (keyMap) та же длительность и та же форма
+ * (был период — остался периодом). Иначе любая правка, которой permitted
+ * даёт RDATE (патч времени или повтора), молча укоротила бы встречу или
+ * потеряла бы VALUE=PERIOD, а конец встречи вернулся бы к длительности серии.
+ *
+ * Пропавшее значение здесь не разбирается — это дело сверки видимых встреч
+ * (у delete this встреча из RDATE убирается снятием значения). С `end` в
+ * патче конец либо остаётся своим, либо становится концом серии (О7: своё
+ * значение остаётся, унаследованное идёт за новым) — третьего плану не дано.
+ * С `allDay` форма значений меняется целиком, и длительность не сверяется.
+ */
+function checkRdatePeriods(
+  ctx: Ctx,
+  before: CalendarObject,
+  after: CalendarObject,
+  participates: (key: SlotKey) => boolean,
+  where: string,
+): void {
+  if (!before.master || !after.master) return;
+  if (ctx.fields.has("allDay")) return;
+  const images = new Map<SlotKey, ListEntry>();
+  for (const entry of listEntries(after.master, "rdate", after)) {
+    if (!images.has(entry.key)) images.set(entry.key, entry);
+  }
+  const span = (entry: ListEntry): number | undefined =>
+    entry.periodEnd === undefined ? undefined : instantOf(entry.periodEnd, ctx.env) - instantOf(entry.time, ctx.env);
+  const series = ctx.fields.has("end") ? componentSpanMs(after.master, ctx.env) : undefined;
+
+  const problems: string[] = [];
+  for (const entry of listEntries(before.master, "rdate", before)) {
+    if (!participates(entry.key)) continue;
+    const image = images.get(entry.key) ?? images.get(ctx.softMapKey(entry.key) ?? entry.key);
+    if (image === undefined) continue;
+    const was = span(entry);
+    const now = span(image);
+    if (was === undefined && now === undefined) continue;
+    if (was === undefined || now === undefined) {
+      problems.push(
+        `${describeKey(before, entry.key)} ${was === undefined ? "получила VALUE=PERIOD" : "потеряла VALUE=PERIOD, и её конец стал концом серии"}`,
+      );
+    } else if (was !== now && now !== series) {
+      problems.push(`${describeKey(before, entry.key)} длится ${now / 1000} с вместо ${was / 1000} с`);
+    }
+  }
+  if (problems.length > 0) {
+    ctx.findings.add(
+      "time-changed",
+      `Встречи из RDATE ${where} потеряли свой конец: ${listed(problems)}. Период RDATE несёт конец встречи, и поля патча [${[...ctx.fields].join(", ")}] его не задают.`,
+    );
+  }
+}
+
 // ─────────────────────────────── разрез ───────────────────────────────
 
 function checkSplit(ctx: Ctx, plan: Extract<WritePlan, { kind: "split" }>): void {
@@ -1136,10 +1306,18 @@ function checkSplit(ctx: Ctx, plan: Extract<WritePlan, { kind: "split" }>): void
   checkInvariants(ctx, continuation, "продолжение", plan.continuation.uid);
   compareTrees(ctx, truncated, { boundary: b });
   compareContinuation(ctx, continuation, b);
-  if (truncated.master) checkRuleParts(ctx, before.master, truncated.master, "основного компонента усечённой серии", true);
+  const beforeBoundary = (key: SlotKey) => !sameKind(key, b) || compareSlotKeys(key, b) < 0;
+  const fromBoundary = (key: SlotKey) => !sameKind(key, b) || compareSlotKeys(key, b) >= 0;
+  if (truncated.master) {
+    checkRuleParts(ctx, before.master, truncated.master, "основного компонента усечённой серии", { always: true });
+    checkRdatePeriods(ctx, before, truncated, beforeBoundary, "в усечённой серии");
+  }
   if (continuation.master) {
-    checkRuleParts(ctx, before.master, continuation.master, "основного компонента продолжения");
-    if (ctx.recurrence) checkDateLists(ctx, before, continuation, (key) => !sameKind(key, b) || compareSlotKeys(key, b) >= 0, "в продолжении");
+    // Конец правила продолжения считает само построение (таблица §3: «COUNT
+    // минус позиции»), прочие части сверяются с патчем, как у всей серии.
+    checkRuleParts(ctx, before.master, continuation.master, "основного компонента продолжения", { endFree: true });
+    checkRdatePeriods(ctx, before, continuation, fromBoundary, "в продолжении");
+    if (ctx.recurrence) checkDateLists(ctx, before, continuation, fromBoundary, "в продолжении");
   }
   checkTruncation(ctx, truncated, b, "усечённый исходный объект");
   checkNotEmptied(ctx, truncated, "Усечение");
@@ -1473,19 +1651,16 @@ function compareTrees(ctx: Ctx, after: CalendarObject, options: TreeOptions = {}
           checkKeptSpan(ctx, ref.component, pair.component, label);
         }
         if (inherit && !target) checkInheritedFields(ctx, inherit.from, inherit.to, ref.component, pair.component, label, role);
+      } else if (mayRemove(ctx, key, role)) {
+        requireTouchedRemoval(ctx, ref.component, label);
+      } else if (role === "hidden") {
+        findings.add(
+          "override-lost",
+          `${capital(label)} снято молча: скрытое переопределение — настоящие данные пользователя (он видит их в ` +
+            "get_event.exceptions и удаляет delete this по этому адресу), и снять его можно только названным в ответе (О11).",
+        );
       } else {
-        const revived = hiddenRevived(ctx, key, role, after);
-        if (mayRemove(ctx, key, role, revived)) {
-          requireTouchedRemoval(ctx, ref.component, label);
-        } else if (revived) {
-          findings.add(
-            "override-lost",
-            `${capital(label)} снято, а новое правило даёт встречу на его месте: скрытое переопределение — настоящие данные ` +
-              "(пользователь видит их в get_event.exceptions), и снять его можно только названным в removed и в ответе (О11).",
-          );
-        } else {
-          findings.add("override-lost", `${capital(label)} снято, а операция ${expect.op} ${expect.scope} его снимать не может.`);
-        }
+        findings.add("override-lost", `${capital(label)} снято, а операция ${expect.op} ${expect.scope} его снимать не может.`);
       }
     }
   }
@@ -1528,52 +1703,34 @@ function pairsFor(
   return image === undefined ? undefined : free(after.overrides.get(image));
 }
 
-function mayRemove(ctx: Ctx, key: SlotKey, role: string | undefined, revived: boolean): boolean {
+/**
+ * Операция вправе снять этот компонент (О11, таблица §3).
+ *
+ * Правка: смена повтора «по ключу» (Р1) снимает переопределения без пары в
+ * новом правиле — только названные в `removed`. Скрытое (`hidden` — RID под
+ * EXDATE или вне протяжённости серии) — тоже настоящие данные пользователя,
+ * а не след прежнего кода: он видит его в `get_event.exceptions` и удаляет
+ * delete this по своему RID (поправка плана от 19.09.2026). Поэтому снять
+ * его молча нельзя ни при каком патче — ни когда новое правило даёт встречу
+ * на его ключе, ни когда не даёт: названо в ответе (`plan.removed`, значит
+ * планировщик просил confirm) — снимается, не названо — `override-lost`.
+ * Прежде здесь стояло условие «нет живого слота на его ключе», и каждая
+ * такая поблажка (сначала за концом серии, потом под EXDATE) оказывалась
+ * шире, чем нужно.
+ *
+ * Ключа скрытого в `expect.removed` быть не должно, когда новое правило даёт
+ * встречу на его слоте: встреча там остаётся (теряются только её собственные
+ * время и поля), и сверка видимых сказала бы meeting-added.
+ */
+function mayRemove(ctx: Ctx, key: SlotKey, role: string | undefined): boolean {
   const { op, scope } = ctx.expect;
   if (op === "delete") {
     if (scope === "this") return key === ctx.target;
     if (scope === "this_and_following") return (ctx.target !== undefined && compareSlotKeys(key, ctx.target) >= 0) || ctx.removed.has(key);
     return true;
   }
-  // Правка: смена повтора «по ключу» (Р1) снимает переопределения без пары —
-  // только названные в removed; скрытое (след прошлого удаления) — молча,
-  // пока новое правило не даёт встречи на его ключе (hiddenRevived), а
-  // такое — только названным в ответе (О11: пользователь узнаёт о потере, и
-  // планировщик просит confirm). В `expect.removed` его ключа быть не
-  // должно: встреча на этом слоте после записи остаётся — своей у неё
-  // больше нет, но она видна (иначе сверка видимых сказала бы
-  // meeting-added).
   if (ctx.recurrence && scope !== "this") {
-    return ctx.removed.has(key) || (role === "hidden" && (!revived || ctx.reported.has(key)));
-  }
-  return false;
-}
-
-/**
- * Скрытое переопределение (`hidden` — RID под EXDATE или вне протяжённости
- * серии), которому записываемое правило даёт живую встречу на его ключе.
- *
- * По поправке плана скрытое — не след прежнего кода, а настоящие данные:
- * пользователь видит такое переопределение в `get_event.exceptions`, и как
- * только на его RECURRENCE-ID появляется слот, это обычное переопределение
- * слота — встреча со своим временем и заголовком. Выбросить её молча
- * нельзя (О11): сверка видимых встреч при смене повтора её не поймает
- * (explicitOnly: до записи скрытого в встречах нет, после записи слот есть,
- * но без своего компонента он пропускается).
- *
- * Скрытое под EXDATE остаётся скрытым: EXDATE при правке не снимаются
- * (таблица §3, checkDateLists), и его снятие ничего не меняет для
- * пользователя — такой след планировщик вправе убрать молча.
- */
-function hiddenRevived(ctx: Ctx, key: SlotKey, role: string | undefined, after: CalendarObject): boolean {
-  if (role !== "hidden" || ctx.expect.op !== "update" || !ctx.recurrence || ctx.expect.scope === "this") return false;
-  for (const option of new Set<SlotKey>([key, ctx.softMapKey(key) ?? key])) {
-    try {
-      const slot = findSlot(after, option);
-      if (slot !== undefined && !slot.excluded) return true;
-    } catch (error) {
-      if (!(error instanceof SlotScanError)) throw error; // Дальше предела прохода — не нам судить.
-    }
+    return role === "hidden" ? ctx.reported.has(key) : ctx.removed.has(key);
   }
   return false;
 }
@@ -1834,8 +1991,9 @@ function checkKeptStart(ctx: Ctx, was: ICAL.Component, now: ICAL.Component, labe
  * проверяется: по О8 она сохраняет моменты, а DURATION одиночной встречи
  * или переопределения при этом пересчитывается, чтобы конец остался тем же
  * (patch.ts, resolveTimes), — «прежняя длительность» там не инвариант.
- * Длительность переопределений, которые не цель, стоит на О7
- * (checkMovedStays: перенесённые остаются, где стояли).
+ * Конец переопределений, которые не цель, сверяет checkMovedStays:
+ * перенесённые остаются, где стояли, у неперенесённых цела своя длительность
+ * (checkKeptEnd).
  */
 function checkKeptSpan(ctx: Ctx, was: ICAL.Component, now: ICAL.Component, label: string): void {
   const fields = ctx.fields;
@@ -1912,6 +2070,16 @@ function spanProblem(
     }
   }
   return undefined;
+}
+
+// Длительность компонента, мс; undefined — конца нет или он записан дважды
+// (DTEND вместе с DURATION, нарушение RFC 5545 §3.6.1: его ловит (а)).
+function componentSpanMs(c: ICAL.Component, env: IcalEnv): number | undefined {
+  const kind = endKind(c);
+  if (kind === "none" || kind === "both") return undefined;
+  const start = c.getFirstPropertyValue("dtstart");
+  if (!(start instanceof ICAL.Time)) return undefined;
+  return endMs(c, env) - instantOf(start, env);
 }
 
 // Конец компонента, мс: DTEND или DTSTART плюс DURATION, как складывает
@@ -2095,15 +2263,15 @@ function compareContinuation(ctx: Ctx, cont: CalendarObject, b: SlotKey): void {
           checkKeptSpan(ctx, ref.component, pair.component, `${label} в продолжении`);
         }
         if (!target) checkInheritedFields(ctx, before.master, cont.master, ref.component, pair.component, `${label} в продолжении`, role);
-        // Скрытое переопределение продолжение вправе не принять — но не то,
-        // которому новое правило даёт встречу: такая потеря называется в
-        // ответе (О11), как и при правке всей серии (mayRemove).
-      } else if (!ctx.removed.has(key) && (role !== "hidden" || (hiddenRevived(ctx, key, role, cont) && !ctx.reported.has(key)))) {
+        // Скрытое переопределение продолжение обязано принять — или его
+        // потеря называется в ответе (О11), как и при правке всей серии
+        // (mayRemove): молча выбрасывать его нельзя ни при каком патче.
+      } else if (role === "hidden" ? !ctx.reported.has(key) : !ctx.removed.has(key)) {
         findings.add(
           "override-lost",
           role === "hidden"
-            ? `${capital(label)} не перенесено в продолжение, а его правило даёт встречу на этом месте: скрытое переопределение — ` +
-              "настоящие данные, и снять его можно только названным в ответе (О11)."
+            ? `${capital(label)} не перенесено в продолжение и не названо в ответе: скрытое переопределение — настоящие данные ` +
+              "пользователя (get_event.exceptions), и молча терять их нельзя (О11)."
             : `${capital(label)} не перенесено в продолжение (таблица §3: RID ≥ B — в продолжение).`,
         );
       }
@@ -2119,10 +2287,16 @@ function compareContinuation(ctx: Ctx, cont: CalendarObject, b: SlotKey): void {
 }
 
 /**
- * О7: перенесённая встреча стоит, где стояла (те же моменты начала и
- * конца), неперенесённая остаётся неперенесённой — идёт за серией. Цель
- * update this и граница t&f («B получает патч») — исключение; у all_series
- * исключения нет (isTarget).
+ * О7 и О8: перенесённая встреча стоит, где стояла (те же моменты начала и
+ * конца), неперенесённая остаётся неперенесённой — идёт за серией — и
+ * сохраняет свою длительность. Цель update this и граница t&f («B получает
+ * патч») — исключение; у all_series исключения нет (isTarget).
+ *
+ * Длительность неперенесённого переопределения — его собственная: встреча
+ * серии бывает длиннее или короче прочих. permitted даёт каждому
+ * переопределению DTSTART, DTEND и DURATION, как только патч трогает время
+ * или повтор, поэтому без этой сверки конец неперенесённой встречи не
+ * проверял бы никто (checkKeptSpan зовётся только у основного и у цели).
  */
 function checkMovedStays(
   ctx: Ctx,
@@ -2148,8 +2322,49 @@ function checkMovedStays(
     if (!same("dtstart") || !same("dtend") || !same("duration")) {
       ctx.findings.add("moved-shifted", `Перенесённая встреча (${label}) сдвинута: перенесённые остаются, где стоят (О7).`);
     }
-  } else if (nowMoved) {
+    return;
+  }
+  if (nowMoved) {
     ctx.findings.add("moved-shifted", `Неперенесённая встреча (${label}) отстала от серии: её начало не совпадает с новым адресом (О7).`);
+  }
+  checkKeptEnd(ctx, after, ref.component, pair.component, label);
+}
+
+/**
+ * Конец неперенесённого переопределения, когда поля патча его не задают
+ * (О7, О8): прежняя длительность в прежней форме конца — начало идёт за
+ * своим адресом, а длительность у встречи своя. Момент конца при этом
+ * инвариантом не является: у смены пояса неперенесённая встреча следует за
+ * слотом, то есть за стенным временем новой серии, и за переходом на зимнее
+ * время её момент сдвигается вместе со слотом (форма конца сверяется как
+ * есть, sameForm = false: вместе с поясом меняется и TZID у DTEND).
+ * С `end` в патче конец либо остаётся своим, либо становится концом новой
+ * серии (О7: своё значение остаётся, унаследованное идёт за новым
+ * основным) — третьего плану не дано. С `allDay` форма времени меняется
+ * целиком, и длительность не сверяется.
+ */
+function checkKeptEnd(ctx: Ctx, after: CalendarObject, was: ICAL.Component, now: ICAL.Component, label: string): void {
+  const fields = ctx.fields;
+  if (fields.has("allDay")) return;
+  if (fields.has("end")) {
+    const wasSpan = componentSpanMs(was, ctx.env);
+    const nowSpan = componentSpanMs(now, ctx.env);
+    const series = after.master ? componentSpanMs(after.master, ctx.env) : undefined;
+    if (wasSpan !== undefined && nowSpan !== undefined && nowSpan !== wasSpan && nowSpan !== series) {
+      ctx.findings.add(
+        "time-changed",
+        `У ${label} длительность ${nowSpan / 1000} с: ни прежняя своя (${wasSpan / 1000} с), ни новая длительность серии ` +
+          `(${series === undefined ? "—" : `${series / 1000} с`}) — патч конца ставит одно из двух (О7).`,
+      );
+    }
+    return;
+  }
+  const problem = spanProblem(ctx, was, now, undefined, false);
+  if (problem !== undefined) {
+    ctx.findings.add(
+      "time-changed",
+      `У ${label} ${problem}, а поля патча [${[...fields].join(", ")}] конца встречи не задают (О8: своя длительность переопределения не подменяется длительностью серии).`,
+    );
   }
 }
 
@@ -2375,12 +2590,14 @@ function compareVisible(ctx: Ctx, b: Scan, a: Scan, rule: VisibleRule): void {
       continue;
     }
     if (rule.explicitOnly && !entry.own) continue;
-    // Слот нового правила на ключе прежнего скрытого переопределения: сама
-    // встреча — обычная новая встреча нового правила (их explicitOnly не
-    // сверяет), а её компонент был и до записи и сверен по дереву
-    // (compareTrees). Оставить его или снять с confirm — дело плана
-    // (mayRemove), лишней встречей он не становится.
-    if (rule.explicitOnly && entry.own && !entry.detached && roleOf(ctx.before, ctx.before.overrides.get(entry.key) ?? []) === "hidden") continue;
+    // Встреча на ключе прежнего скрытого переопределения: новое правило дало
+    // ему слот или, изменив протяжённость серии, сделало его оторванным
+    // (роль detached). Её компонент был и до записи и сверен по дереву
+    // (compareTrees), так что лишней встречей, придуманной планом, она не
+    // становится: план вправе и сохранить его, и снять, назвав потерю
+    // (mayRemove, О11). Считать её лишней значило бы не оставить плану ни
+    // одного исхода, кроме потери данных.
+    if (rule.explicitOnly && entry.own && roleOf(ctx.before, ctx.before.overrides.get(entry.key) ?? []) === "hidden") continue;
     if (!entry.detached && rule.cutoff !== undefined && sameKind(entry.key, rule.cutoff) && compareSlotKeys(entry.key, rule.cutoff) > 0) continue;
     added.push(describeEntry(a.o, entry));
   }
@@ -2465,8 +2682,10 @@ function checkNothingBeforeBoundary(ctx: Ctx): void {
  * (д) у правки. Без правки повтора даты — прежние (Р1), значит у конечной
  * серии прежние число слотов и последняя встреча (через keyMap), у
  * бесконечной — бесконечность; у продолжения разреза — прежний хвост от B.
- * С правкой повтора сверять не с чем, кроме `expect.tail`, и он обязателен
- * у конечной серии. `tail`, если задан, сверяется всегда.
+ * С правкой повтора число позиций задаёт новое правило, и сверяется оно с
+ * `expect.tail` (он обязателен у конечной серии); сверх того конечная серия
+ * не становится бесконечной молча — конец снимает только патч. `tail`, если
+ * задан, сверяется всегда.
  */
 function checkExtent(ctx: Ctx, b: Scan, a: Scan, where: string, boundary?: SlotKey): void {
   const { findings } = ctx;
@@ -2485,6 +2704,19 @@ function checkExtent(ctx: Ctx, b: Scan, a: Scan, where: string, boundary?: SlotK
             `${lastKey === undefined ? "—" : describeKey(a.o, lastKey)} — последняя встреча потеряна или добавлена (UNTIL, COUNT).`,
         );
       }
+    }
+  } else if (b.extent.kind === "finite" && a.extent.kind === "infinite") {
+    // Конец серии снимается только тогда, когда патч об этом просит: count:
+    // null, until: null или replace без конца (Р4). Иначе серия, у которой
+    // был конец, молча стала бы бесконечной, а `tail` этого не показывает —
+    // у бесконечной серии его нет. Без патча из оркестрации судить не о чем:
+    // что просил пользователь, предохранителю неизвестно (GuardOptions.patch).
+    const rp = ctx.patch?.recurrence;
+    if (ctx.patch !== undefined && !(rp !== undefined && (rp.count === null || rp.until === null || rp.replace === true))) {
+      findings.add(
+        "extent-mismatch",
+        `Конечная серия ${where} стала бесконечной, а патч повтора её конца не снимал (count: null, until: null или replace).`,
+      );
     }
   }
   const finite = a.extent.kind === "finite";
