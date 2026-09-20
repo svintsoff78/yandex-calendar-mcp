@@ -326,14 +326,26 @@ function refuseBlocking(anomalies: readonly Anomaly[]): void {
  * Более узкие блокировки О14 (duplicate-override в целевом слоте, несколько
  * RRULE при разрезе) остаются в `blockingAnomalies` — здесь отказ наступает
  * раньше и одинаково для всех scope.
+ *
+ * Исключение поправки: удаление, план которого — удаление объекта целиком,
+ * ничего не пишет и ничего не угадывает, поэтому не блокируется. Это
+ * одиночное событие при любом scope и `this_and_following` по первой видимой
+ * встрече. Поэтому вызовы стоят не в начале планирования, а там, где уже
+ * видно, что план — запись: `deletePlan` (скрытый компонент одиночного
+ * события и scope this), `deleteDetachedFollowing`, `deleteFollowing` (путь
+ * усечения) и `updatePlan`.
  */
 const CORRUPTED: ReadonlyMap<AnomalyCode, string> = new Map([
   ["duplicate-override", "какая из копий встречи настоящая, по объекту не определить"],
   ["multiple-rrules", "правка легла бы только на первое правило, остальные остались бы прежними"],
 ]);
 
+// Что веб-интерфейс Яндекса делает с испорченным объектом, живой сверкой не
+// проверялось (docs/yandex-caldav-capabilities.md: среди Ж1–Ж18 такого факта
+// нет), поэтому подсказка не обещает механизма — только совет и выход, который
+// работает наверняка.
 const CORRUPTED_HINT =
-  "Поправьте эту встречу в веб-интерфейсе Яндекс Календаря: он перезапишет объект целиком, и править его снова станет можно. " +
+  "Исправить событие можно в веб-интерфейсе Яндекс Календаря. " +
   "Удалить событие целиком можно и сейчас: delete_event со scope all_series.";
 
 function refuseCorrupted(o: CalendarObject, op: EditOp, scope: EditScope): void {
@@ -527,7 +539,6 @@ function unparsableDelete(input: Unparsable, scope: EditScope, request: DeleteRe
 
 function deletePlan(run: Run, scope: EditScope, instanceStart: string | undefined): WritePlan {
   const { o } = run;
-  refuseCorrupted(o, "delete", scope);
   if (scope === "all_series") {
     if (instanceStart !== undefined) resolveTarget(o, instanceStart, "delete", { confirm: true });
     const notices = o.kind === "detached"
@@ -542,8 +553,12 @@ function deletePlan(run: Run, scope: EditScope, instanceStart: string | undefine
     refuseBlocking(blockingAnomalies(o, "delete", scope).filter((anomaly) => anomaly.code !== "unknown-tzid"));
     const resolved = instanceStart !== undefined ? resolveTarget(o, instanceStart, "delete", { confirm: run.confirmed }) : undefined;
     // Скрытый компонент одиночного события (RECURRENCE-ID мимо его начала) адресуется своим
-    // RECURRENCE-ID и снимается сам, как в серии (Р5): само событие остаётся.
-    if (resolved?.target.kind === "hidden") return deleteThis(run, resolved.target);
+    // RECURRENCE-ID и снимается сам, как в серии (Р5): само событие остаётся. Это запись,
+    // поэтому испорченный объект здесь блокируется, а удаление события целиком — нет.
+    if (resolved?.target.kind === "hidden") {
+      refuseCorrupted(o, "delete", scope);
+      return deleteThis(run, resolved.target);
+    }
     const instance = resolved ? addressedInstance(resolved) : singleInstance(o);
     return {
       kind: "delete-object",
@@ -559,6 +574,7 @@ function deletePlan(run: Run, scope: EditScope, instanceStart: string | undefine
   noteAmbiguity(run, resolved, "удалена");
   const target = resolved.target;
   if (scope === "this") {
+    refuseCorrupted(o, "delete", scope);
     refuseBlocking(blockingAnomalies(o, "delete", "this", { key: target.key }));
     return deleteThis(run, target);
   }
@@ -645,8 +661,7 @@ function deleteFollowing(run: Run, target: Target): WritePlan {
 
   // Встречи хвоста (адрес после B), перенесённые раньше B: для пользователя они до границы —
   // потеря сверх цели (C50). Сама B — названная цель, куда бы её ни перенесли.
-  const early = ownMeetingsFrom(o, boundary)
-    .filter((instance) => instance.key !== boundary && instance.startMs < boundaryMs)
+  const early = movedBefore(o, boundary)
     .map((instance) => lossOf(env, instance, `её адрес позже ${target.instance.instanceStart}, а перенесена она раньше — удаляется вместе с хвостом`));
   const earlyMessage = early.length > 0
     ? `Встречи ${early.map((loss) => loss.instanceStart).join(", ")} из удаляемого хвоста перенесены раньше ${target.instance.instanceStart} и тоже будут удалены.`
@@ -656,6 +671,7 @@ function deleteFollowing(run: Run, target: Target): WritePlan {
 
   const tail = meetingsFrom(o, boundary, run.now, "удалена вместе со следующими");
   if (!hasVisibleBefore(o, boundary)) {
+    // Здесь план — удаление объекта целиком: записи нет, испорченный объект не блокируется.
     refuseBlocking(blockingAnomalies(o, "delete", "this_and_following", { key: boundary }));
     if (early.length > 0 && !run.confirmed) throw needConfirm(early, earlyMessage);
     return {
@@ -666,6 +682,7 @@ function deleteFollowing(run: Run, target: Target): WritePlan {
     };
   }
 
+  refuseCorrupted(o, "delete", "this_and_following");
   refuseBlocking(blockingAnomalies(o, "delete", "this_and_following", { key: boundary, split: true }));
   refuseUncuttable(o, boundary, "delete");
   const work = copyOf(o);
@@ -696,6 +713,7 @@ function deleteFollowing(run: Run, target: Target): WritePlan {
 /** Р6: объект из одних переопределений — снимаются компоненты с RECURRENCE-ID не раньше границы. */
 function deleteDetachedFollowing(run: Run, boundary: SlotKey, early: Loss[], earlyMessage: string): WritePlan {
   const { o, env } = run;
+  refuseCorrupted(o, "delete", "this_and_following");
   if (early.length > 0 && !run.confirmed) throw needConfirm(early, earlyMessage);
   const work = copyOf(o);
   const touched = newTouched();
@@ -763,8 +781,19 @@ function dropListValues(c: ICAL.Component, name: ListName, ctx: KeyContext, drop
   return removed;
 }
 
-/** Есть ли видимая встреча с адресом раньше `boundary` (Р2): незакрытый слот или detached. */
-function hasVisibleBefore(o: CalendarObject, boundary: SlotKey): boolean {
+/**
+ * Есть ли видимая встреча до границы `boundary` (Р2): незакрытый слот или
+ * detached с адресом раньше неё, а при `moved` — ещё и встреча с адресом не
+ * раньше границы, но перенесённая раньше неё («включая перенесённые» в Р2).
+ *
+ * `moved` включается у правки: встреча хвоста, перенесённая раньше B,
+ * остаётся в объекте, и правка всей серии одним put переписала бы её — это и
+ * проверяет предохранитель (guard.ts, `checkNothingBeforeBoundary`). У
+ * удаления такая встреча сама входит в удаляемый хвост, названа в потерях
+ * (`early`) и требует confirm: после удаления до границы не остаётся ничего,
+ * и удаление объекта целиком верно — поэтому `moved` там выключен.
+ */
+function hasVisibleBefore(o: CalendarObject, boundary: SlotKey, moved = false): boolean {
   let seen = 0;
   for (const slot of iterateSlots(o, { until: boundary })) {
     if (compareSlotKeys(slot.key, boundary) >= 0) break;
@@ -774,7 +803,22 @@ function hasVisibleBefore(o: CalendarObject, boundary: SlotKey): boolean {
   for (const [key, refs] of o.overrides) {
     if (compareSlotKeys(key, boundary) < 0 && o.roles.get(refs[0].component)?.role === "detached") return true;
   }
-  return false;
+  return moved && movedBefore(o, boundary).length > 0;
+}
+
+/**
+ * Встречи со своим компонентом, чей адрес не раньше границы, а начало —
+ * раньше: для пользователя они стоят до границы (Р2, C50). Сама граница —
+ * названная цель, куда бы её ни перенесли.
+ */
+function movedBefore(o: CalendarObject, boundary: SlotKey): Instance[] {
+  const boundaryMs = instantOf(timeOfKey(boundary), o.env);
+  return ownMeetingsFrom(o, boundary).filter((instance) => instance.key !== boundary && instance.startMs < boundaryMs);
+}
+
+/** «адрес (перенесена на начало)» — перечнем для сообщений об отказе. */
+function movedLabels(o: CalendarObject, moved: readonly Instance[]): string {
+  return moved.map((instance) => `${instance.instanceStart} (перенесена на ${formatForModel(instance.start, o.env, "time")})`).join(", ");
 }
 
 function roleOfKey(o: CalendarObject, key: SlotKey): OverrideRole | undefined {
@@ -822,11 +866,15 @@ const HIDDEN_MESSAGE = "Встречи до границы остались бы
  * (`becameHidden`): с confirm — потеря видимости, данные остаются. Но если
  * после усечения в объекте не осталось бы ни одной видимой встречи, отказ:
  * пустой объект не записывается (Р3), а удалить его целиком — значит
- * удалить и встречи до границы, которых удалять не просили.
+ * удалить и встречи до границы, которых удалять не просили. Пусто бывает и
+ * без таких встреч: когда до границы видна только встреча хвоста,
+ * перенесённая раньше неё, — она уходит в продолжение (у правки; у удаления
+ * этот путь не встречается, там до границы есть встреча по адресу).
  */
 function hiddenAfterCut(o: CalendarObject, next: CalendarObject, boundary: SlotKey, op: EditOp): Array<{ key: SlotKey; loss: Loss }> {
   const hidden = becameHidden(o, next, boundary);
-  if (hidden.length > 0 && isEmpty(next)) {
+  if (!isEmpty(next)) return hidden;
+  if (hidden.length > 0) {
     throw cutRefusal(
       o,
       boundary,
@@ -835,7 +883,19 @@ function hiddenAfterCut(o: CalendarObject, next: CalendarObject, boundary: SlotK
         "за концом серии: в объекте не осталось бы ни одной видимой встречи",
     );
   }
-  return hidden;
+  // До границы видны только встречи хвоста, перенесённые раньше неё (Р2 «включая
+  // перенесённые»): их адрес в хвосте, они уходят в продолжение, и усечённая серия
+  // остаётся без единой видимой встречи — пустой объект не записывается (Р3).
+  const moved = movedBefore(o, boundary);
+  throw cutRefusal(
+    o,
+    boundary,
+    op,
+    moved.length > 0
+      ? `до неё видны только встречи ${movedLabels(o, moved)}, чей адрес лежит в хвосте: они уходят в продолжение, ` +
+        "и в усечённой серии не осталось бы ни одной видимой встречи"
+      : "после усечения в объекте не осталось бы ни одной видимой встречи",
+  );
 }
 
 /**
@@ -843,7 +903,8 @@ function hiddenAfterCut(o: CalendarObject, next: CalendarObject, boundary: SlotK
  * испортив правило (таблица §3, t&f):
  * - B позже DTSTART: DTSTART не снять ни UNTIL, ни COUNT, а EXDATE оставил бы
  *   в усечённой серии закрытый слот от B (так бывает, когда раньше DTSTART
- *   стоят значения RDATE);
+ *   стоят значения RDATE, и когда до B видна только встреча хвоста,
+ *   перенесённая раньше неё, — тогда отказ называет именно её);
  * - у правила есть позиции раньше B: иначе UNTIL перед B дал бы правило без
  *   позиций (аномалия no-positions), а снять RRULE целиком правка без
  *   recurrence не вправе (О12б; так бывает при DTSTART вне правила).
@@ -852,7 +913,13 @@ function refuseUncuttable(o: CalendarObject, boundary: SlotKey, op: EditOp): voi
   const master = o.master!;
   const startKey = slotKeyOf(master.getFirstPropertyValue("dtstart") as ICAL.Time, o.form, o.env);
   if (compareSlotKeys(boundary, startKey) <= 0) {
-    throw cutRefusal(o, boundary, op, "это начало серии (DTSTART), а раньше него есть встречи из RDATE: отрезать начало, оставив их, нельзя");
+    // До границы видна только перенесённая раньше неё встреча хвоста: про RDATE
+    // говорить нечего, и чинится это правкой всей серии, а не разрезом.
+    const moved = hasVisibleBefore(o, boundary) ? [] : movedBefore(o, boundary);
+    const reason = moved.length > 0
+      ? `это начало серии (DTSTART), а встречи ${movedLabels(o, moved)} перенесены раньше него: отрезать начало, оставив их, нельзя`
+      : "это начало серии (DTSTART), а раньше него есть встречи из RDATE: отрезать начало, оставив их, нельзя";
+    throw cutRefusal(o, boundary, op, reason);
   }
   if (master.hasProperty("rrule") && positionsBefore(o, boundary) === 0) {
     throw cutRefusal(o, boundary, op, `начало серии стоит вне правила, а у правила нет встреч раньше ${keyLabel(o, boundary, "instance")}: усечённое правило не дало бы ни одной встречи`);
@@ -1052,7 +1119,9 @@ function updatePlan(run: Run, scope: EditScope, request: UpdateRequest): WritePl
       hint: "Передайте instanceStart встречи серии или измените эту встречу отдельно (scope this).",
     });
   }
-  if (!hasVisibleBefore(o, target.key)) {
+  // Р2 у правки: «включая перенесённые» — встреча хвоста, перенесённая раньше B,
+  // тоже стоит до границы, и правка всей серии одним put переписала бы её.
+  if (!hasVisibleBefore(o, target.key, true)) {
     refuseBlocking(blockingAnomalies(o, "update", "this_and_following", { key: target.key }));
     run.notices.push(`До ${target.instance.instanceStart} встреч нет: изменена вся серия, событие то же (разреза нет).`);
     return updateAll(run, patch, "this_and_following", target);
@@ -1998,6 +2067,11 @@ function retime(input: RetimeInput): Retimed {
   for (const info of input.overrides) {
     const c = info.component;
     const ridProperty = c.getFirstProperty("recurrence-id")!;
+    // Кадры читаются до правки адреса и начала: они сверяются с прежним
+    // RECURRENCE-ID (в прежней форме и поясе серии), а после записи нового
+    // адреса такой сверки уже не сделать.
+    const startFrame = ownStartFrame(c, env);
+    const endFrame = ownEndFrame(c, env);
     const mapped = mapper.slotTime(info.oldKey);
     let rid: ICAL.Time;
     if (info.role === "slot") {
@@ -2012,10 +2086,12 @@ function retime(input: RetimeInput): Retimed {
     if (info.moved) continue;
     const own = lengthOf(c, env);
     const length = sameLength(own, input.lengths.old) && input.lengths.new ? input.lengths.new : own;
-    const endFrame = ownEndFrame(c, env);
+    // Момент неперенесённого начала равен адресу, но записывается он в своём
+    // кадре: пояс, выбранный для этой встречи, за поясом серии не идёт.
+    const start = startFrame && !rid.isDate ? timeInForm(rid, startFrame.form, startFrame.zone, env) : rid;
     const startProp = c.getFirstProperty("dtstart")!;
-    if (!sameTimeValue(startProp, rid)) markProperty(touched, c, setTimeProperty(c, "dtstart", rid));
-    if (length) writeEnd(c, rid, length, env, touched, endFrame);
+    if (!sameTimeValue(startProp, start)) markProperty(touched, c, setTimeProperty(c, "dtstart", start));
+    if (length) writeEnd(c, start, length, env, touched, endFrame);
   }
 
   const shiftedAt = shiftedDate(source, from ?? input.anchorKey, from !== undefined, mapper, run.now);
@@ -2339,6 +2415,24 @@ function writeEnd(c: ICAL.Component, start: ICAL.Time, length: Length, env: Ical
     duration.setValue(value);
     markProperty(touched, c, duration);
   }
+}
+
+/**
+ * Форма и пояс DTSTART переопределения, если они не как у его RECURRENCE-ID
+ * (читать до правки адреса): такое начало сохраняет свой пояс — его выбрал
+ * тот, кто эту встречу переносил или писал (в том числе наш же update this с
+ * timeZone), и к поясу серии оно отношения не имеет. Начало в форме адреса
+ * идёт за новой формой и поясом серии, как раньше шло всё.
+ */
+function ownStartFrame(c: ICAL.Component, env: IcalEnv): Frame | undefined {
+  const dtstart = c.getFirstProperty("dtstart");
+  const rid = c.getFirstProperty("recurrence-id");
+  if (!dtstart || !rid) return undefined;
+  const startForm = formOf(dtstart);
+  const ridForm = formOf(rid);
+  if (startForm === "date" || ridForm === "date") return undefined;
+  if (startForm === ridForm && (startForm !== "zoned" || String(dtstart.getParameter("tzid")) === String(rid.getParameter("tzid")))) return undefined;
+  return { form: startForm, zone: startForm === "zoned" ? seriesZoneOf(dtstart, env) : undefined };
 }
 
 /**
