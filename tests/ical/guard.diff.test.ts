@@ -1,12 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { GuardError, verifyPlan, type GuardCode, type GuardOptions } from "../../src/ical/guard2.js";
-import { verifyPlan as verifyPlanV1 } from "../../src/ical/guard.js";
+import { GuardError, verifyPlan, type GuardCode, type GuardOptions } from "../../src/ical/guard.js";
 import { isUnparsable, loadObject, serializeObject, type CalendarObject } from "../../src/ical/object.js";
 import { newTouched } from "../../src/ical/patch.js";
 import type { Expectation, Loss, PatchField, Touched, WritePlan } from "../../src/ical/plan.js";
 import { instantOf, parseModelTime, type IcalEnv, type SlotKey } from "../../src/ical/values.js";
 
-// Разностный предохранитель (src/ical/guard2.ts): дерево ДО и дерево ПОСЛЕ
+// Разностный предохранитель (src/ical/guard.ts): дерево ДО и дерево ПОСЛЕ
 // разворачиваются в наборы встреч, и всякое расхождение обязано быть
 // оправдано планом и патчем.
 //
@@ -122,17 +121,6 @@ function guardCodes(beforeIcs: string, plan: WritePlan, options: GuardOptions = 
     if (!(error instanceof GuardError)) throw error;
     expect(error.problems.length).toBeGreaterThan(0);
     expect(error.code).toBe(error.problems[0].code);
-    return [...new Set(error.problems.map((problem) => problem.code))];
-  }
-}
-
-/** То же прежним предохранителем (guard.ts) — для случаев, где он расходится с разностным. */
-function guardCodesV1(beforeIcs: string, plan: WritePlan, options: GuardOptions = {}): string[] {
-  try {
-    verifyPlanV1(beforeIcs, plan, ENV, { now: NOW, ...options });
-    return [];
-  } catch (error) {
-    if (!(error instanceof GuardError)) throw error;
     return [...new Set(error.problems.map((problem) => problem.code))];
   }
 }
@@ -380,9 +368,6 @@ describe("скрытые переопределения", () => {
       [lossOf("2026-10-28T10:00:00+03:00")],
     );
     expect(guardCodes(WITH_HIDDEN, plan, { patch: { start: "2026-10-19T11:00:00+03:00" } })).toEqual([]);
-    // Прежний предохранитель и это снятие отвергает: адрес в ответе он ищет
-    // среди ключей, которые правка уже переписала.
-    expect(guardCodesV1(WITH_HIDDEN, plan, { patch: { start: "2026-10-19T11:00:00+03:00" } })).not.toEqual([]);
   });
 
   it("снятый EXDATE, от которого скрытое стало встречей, отвергается", () => {
@@ -514,9 +499,6 @@ describe("первое правило", () => {
         target: scope === "this" || scope === "this_and_following" ? timeKey("2026-10-19T10:00:00+03:00") : undefined,
       });
       expect(guardCodes(SINGLE, plan, { patch: firstRule })).toEqual([]);
-      // Тот самый Critical прошлого круга: прежний предохранитель считает,
-      // что «конечная серия стала бесконечной», и законную запись отвергает.
-      expect(guardCodesV1(SINGLE, plan, { patch: firstRule })).toContain("extent-mismatch");
     });
   }
 
@@ -526,7 +508,6 @@ describe("первое правило", () => {
       "RDATE;TZID=Europe/Moscow:20261021T100000", "RDATE;TZID=Europe/Moscow:20261026T100000"]));
     const plan = putPlan(after, { op: "update", scope: "all_series", fields: ["recurrence"], ruleChanged: true });
     expect(guardCodes(RDATE_ONLY, plan, { patch: firstRule })).toEqual([]);
-    expect(guardCodesV1(RDATE_ONLY, plan, { patch: firstRule })).toContain("extent-mismatch");
   });
 });
 
@@ -549,8 +530,6 @@ describe("разрез серии", () => {
       ruleChanged: true,
     });
     expect(guardCodes(RDATE_ONLY, plan, { patch: { summary: "Разбор" } })).toEqual([]);
-    // Прежний предохранитель этот законный разрез отвергает.
-    expect(guardCodesV1(RDATE_ONLY, plan, { patch: { summary: "Разбор" } })).not.toEqual([]);
   });
 
   it("разрез, потерявший встречу хвоста, отвергается", () => {
