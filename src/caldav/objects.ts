@@ -107,8 +107,27 @@ export async function getObject(client: CaldavClient, href: string): Promise<Raw
   };
 }
 
-// putObject и deleteObject уходят на сервер ровно один раз: транспорт не
-// повторяет PUT и DELETE (src/caldav/request.ts, решение Р8 плана
+/**
+ * Успешный ответ на PUT: код и ETag из заголовка.
+ *
+ * Код нужен слою домена. Яндекс не отклоняет PUT с If-Match по
+ * отсутствующему пути, а создаёт объект и отвечает 201 (Ж16
+ * docs/yandex-caldav-capabilities.md): для записи, которая должна была
+ * заменить прочитанный объект, 201 значит, что объекта к этому времени уже
+ * не было — событие удалил другой клиент, а наша запись создала его заново.
+ * Замена существующего объекта даёт 204 (или 200). У создания
+ * (If-None-Match) 201 — обычный исход и ничего особенного не значит.
+ */
+export interface PutResponse {
+  /** Код ответа: 201 — объект создан, 200 и 204 — заменён существующий. */
+  status: number;
+  /** ETag из заголовка ответа; "" — сервер его не прислал. */
+  etag: string;
+}
+
+// Запись (putObjectWithStatus, putObject) и deleteObject уходят на сервер
+// ровно один раз: транспорт не повторяет PUT и DELETE
+// (src/caldav/request.ts, решение Р8 плана
 // docs/superpowers/plans/2026-09-19-recurring-events-rework.md). Сбой
 // доходит до вызывающего как CaldavError без обёрток: status — код ответа
 // (0, если ответа нет), applied — "no" (сервер ответил 4xx, запись не
@@ -116,12 +135,12 @@ export async function getObject(client: CaldavClient, href: string): Promise<Raw
 // По applied слой домена решает, перечитывать ли объект (З12); здесь
 // ошибки не перехватываются и не переименовываются, чтобы applied и status
 // не потерялись по дороге.
-export async function putObject(
+export async function putObjectWithStatus(
   client: CaldavClient,
   href: string,
   ics: string,
   options: { ifMatch?: string; ifNoneMatch?: boolean },
-): Promise<string> {
+): Promise<PutResponse> {
   const headers: Record<string, string> = {
     "Content-Type": "text/calendar; charset=utf-8",
   };
@@ -129,7 +148,17 @@ export async function putObject(
   if (options.ifMatch) headers["If-Match"] = options.ifMatch;
 
   const response = await client.request({ method: "PUT", path: href, body: ics, headers });
-  return response.headers.get("etag") ?? "";
+  return { status: response.status, etag: response.headers.get("etag") ?? "" };
+}
+
+/** Тот же PUT для вызывающих, которым от ответа нужен только ETag. */
+export async function putObject(
+  client: CaldavClient,
+  href: string,
+  ics: string,
+  options: { ifMatch?: string; ifNoneMatch?: boolean },
+): Promise<string> {
+  return (await putObjectWithStatus(client, href, ics, options)).etag;
 }
 
 export async function deleteObject(

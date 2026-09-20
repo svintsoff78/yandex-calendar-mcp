@@ -1,10 +1,10 @@
 import type ICAL from "ical.js";
-import { deleteObject, putObject, queryEventByUid, type RawObject } from "../caldav/objects.js";
+import { deleteObject, putObjectWithStatus, queryEventByUid, type RawObject } from "../caldav/objects.js";
 import { CaldavError } from "../caldav/request.js";
 import { isUnparsable, loadObject, semanticDigest, shownOverride, type CalendarObject } from "../ical/object.js";
 import { SERIES_CAP, SlotScanError, iterateSlots } from "../ical/slots.js";
 import { compareSlotKeys, formatForModel, type IcalEnv, type SlotKey } from "../ical/values.js";
-import type { Calendar, Context, ObjectIO, PutOutcome, RemoveOutcome, WriteFailure } from "../types.js";
+import type { Calendar, Context, ObjectIO, RemoveOutcome, WriteCondition, WriteFailure } from "../types.js";
 import { hrefFor } from "./events.js";
 
 /**
@@ -14,9 +14,24 @@ import { hrefFor } from "./events.js";
  * Ж12–Ж16).
  *
  * - PUT и DELETE уходят на сервер ровно один раз (транспорт их не
- *   повторяет, src/caldav/request.ts). Если исход неизвестен (сеть, таймаут,
- *   5xx), объект перечитывается по UID и правила проверяются строго по
- *   порядку (Р8):
+ *   повторяет, src/caldav/request.ts). Ответ разбирается так:
+ *   – 2xx на правке (PUT с If-Match прочитанного ETag) — успех, но только
+ *     если это 204 или 200, то есть заменён существующий объект. Ответ 201
+ *     значит, что объекта по пути не было: Яндекс такой PUT не отклоняет, а
+ *     создаёт объект нашим текстом (Ж16). Между нашим чтением и записью
+ *     событие удалил другой клиент, и мы его воскресили — уже с правкой.
+ *     Это конфликт, а не успех: `DeliveryError` с кодом conflict и пометкой
+ *     `recreated`, в тексте сказано и про удаление, и про то, что событие
+ *     создано заново. Компенсирующего DELETE нет: в воскрешённом объекте
+ *     лежит правка пользователя, а удалять вслепую — стирать данные, которых
+ *     мы не читали (тот же запрет, что при разрезе серии, J-B1, J-B8).
+ *     У создания (PUT с If-None-Match) 201 — обычный исход и ничего не
+ *     значит: там объекта и не должно было быть;
+ *   – 412 на правке — событие изменили после чтения (Ж14), 404 — объекта по
+ *     пути нет; обе записи не выполнены, обе — конфликт;
+ *   – прочий 4xx — отказ сервера, ничего не изменено.
+ *   Если исход неизвестен (сеть, таймаут, 5xx), объект перечитывается по
+ *   UID и правила проверяются строго по порядку (Р8):
  *   1. объекта нет — DELETE «уже удалено», правка — конфликт, создание —
  *      одна повторная попытка с If-None-Match;
  *   2. ETag и смысл прежние — запись не дошла, одна повторная попытка;
@@ -47,24 +62,43 @@ import { hrefFor } from "./events.js";
 // ─────────────────────────────── порт ввода-вывода ───────────────────────────────
 
 /**
- * Порт `ObjectIO` для контекста: `Context.io`, если задан, иначе — CalDAV
- * через `queryEventByUid`, `putObject` и `deleteObject`. Путь и ETag берутся
- * из ответа сервера, а не собираются из UID (Ж2 в «Особенностях»
- * docs/yandex-caldav-capabilities.md). `put` и `remove` не бросают: исход
- * записи — значение.
+ * Исход PUT с одной добавкой к `PutOutcome`: `created` — сервер ответил 201,
+ * то есть объекта по пути не было и он создан этой записью. Поле
+ * необязательное, поэтому обычный `ObjectIO` этому порту удовлетворяет:
+ * подставной ввод-вывод, который кода ответа не знает, просто его не ставит,
+ * и всё работает как раньше.
+ */
+export type DeliveryPutOutcome = { status: "applied"; etag: string; created?: true } | WriteFailure;
+
+/** Порт `ObjectIO`, чей `put` отличает создание объекта от замены (Ж16). */
+export interface DeliveryIO extends Omit<ObjectIO, "put"> {
+  put(href: string, ics: string, condition: WriteCondition): Promise<DeliveryPutOutcome>;
+}
+
+/**
+ * Порт `DeliveryIO` для контекста: `Context.io`, если задан, иначе — CalDAV
+ * через `queryEventByUid`, `putObjectWithStatus` и `deleteObject`. Путь и
+ * ETag берутся из ответа сервера, а не собираются из UID (Ж2 в
+ * «Особенностях» docs/yandex-caldav-capabilities.md). `put` и `remove` не
+ * бросают: исход записи — значение.
  *
  * Пустой ETag (сервер его не прислал) транспорт в If-Match не ставит: запись
- * тогда безусловная (src/caldav/objects.ts, putObject и deleteObject).
+ * тогда безусловная (src/caldav/objects.ts, putObjectWithStatus и
+ * deleteObject).
  */
-export function ioFor(ctx: Context): ObjectIO {
+export function ioFor(ctx: Context): DeliveryIO {
   if (ctx.io) return ctx.io;
   const client = ctx.client;
   return {
     find: (calendar, uid) => queryEventByUid(client, calendar.href, uid),
-    async put(href, ics, condition): Promise<PutOutcome> {
+    async put(href, ics, condition): Promise<DeliveryPutOutcome> {
       const options = condition.ifMatch !== undefined ? { ifMatch: condition.ifMatch } : { ifNoneMatch: true };
       try {
-        return { status: "applied", etag: await putObject(client, href, ics, options) };
+        const { status, etag } = await putObjectWithStatus(client, href, ics, options);
+        // 201 Created: по пути ничего не лежало, объект создан этой записью.
+        // Что это значит, решает вызывающий: у создания — ничего, у правки —
+        // что событие успели удалить (Ж16).
+        return status === 201 ? { status: "applied", etag, created: true } : { status: "applied", etag };
       } catch (error) {
         return failureOf(error);
       }
@@ -138,7 +172,10 @@ export interface Delivered {
 
 /**
  * Коды неудачи доставки:
- * - conflict — событие изменили или удалили после чтения; запись не выполнена;
+ * - conflict — событие изменили или удалили после чтения; запись не
+ *   выполнена, и только в одном случае выполнена не так, как задумано:
+ *   правка ушла по пути удалённого события и создала его заново (Ж16) —
+ *   у такой ошибки стоит `recreated`, и об этом сказано в тексте;
  * - rejected — сервер отклонил запись (4xx), ничего не изменено;
  * - not-delivered — запись не дошла и после одной повторной попытки;
  *   объект на сервере прежний;
@@ -165,6 +202,8 @@ export interface DeliveryErrorDetails {
   current?: RawObject;
   continuation?: { uid: string; href: string };
   differences?: readonly string[];
+  /** Правка создала удалённое событие заново (ответ 201, Ж16). */
+  recreated?: true;
   cause?: unknown;
 }
 
@@ -180,6 +219,12 @@ export class DeliveryError extends Error {
   readonly continuation?: { uid: string; href: string };
   /** Чем продолжение на сервере отличается от плана (split-stale-continuation). */
   readonly differences?: readonly string[];
+  /**
+   * Запись не просто не удалась: она ушла по пути события, удалённого после
+   * нашего чтения, и сервер создал его заново нашим текстом (Ж16). Объект на
+   * сервере есть, но это уже не то событие, которое мы правили.
+   */
+  readonly recreated?: true;
 
   constructor(code: DeliveryErrorCode, reason: string, details: DeliveryErrorDetails = {}) {
     super(details.advice ? `${reason} ${details.advice}` : reason, details.cause === undefined ? undefined : { cause: details.cause });
@@ -190,6 +235,7 @@ export class DeliveryError extends Error {
     if (details.current) this.current = details.current;
     if (details.continuation) this.continuation = details.continuation;
     if (details.differences) this.differences = details.differences;
+    if (details.recreated) this.recreated = details.recreated;
   }
 }
 
@@ -201,7 +247,7 @@ export class DeliveryError extends Error {
  * для `create` не нужно. Успех — `Delivered`, неудача — `DeliveryError`.
  */
 export async function deliver(
-  io: ObjectIO,
+  io: DeliveryIO,
   calendar: Calendar,
   write: Write,
   before: KnownState | undefined,
@@ -220,7 +266,7 @@ const RETRY_FRESH = "Перечитайте событие и повторите
 const RETRY_DELETE = "Перечитайте событие и повторите удаление с новым etag.";
 
 async function deliverPut(
-  io: ObjectIO,
+  io: DeliveryIO,
   calendar: Calendar,
   write: Extract<Write, { kind: "put" }>,
   before: KnownState,
@@ -232,6 +278,9 @@ async function deliverPut(
     const outcome = await io.put(before.href, write.ics, { ifMatch: before.etag });
     switch (outcome.status) {
       case "applied":
+        // Ответ 201 на замену прочитанного объекта: по пути ничего не было,
+        // и Яндекс не отказал, а создал событие нашим текстом (Ж16).
+        if (outcome.created) throw recreatedError(before.href);
         return { href: before.href, etag: outcome.etag, confirmedByReread: false, retried };
       case "precondition-failed":
         throw new DeliveryError("conflict", "Событие изменили после того, как его прочитали: запись не выполнена.", { advice: RETRY_FRESH });
@@ -264,7 +313,7 @@ async function deliverPut(
 }
 
 async function deliverCreate(
-  io: ObjectIO,
+  io: DeliveryIO,
   calendar: Calendar,
   write: Extract<Write, { kind: "create" }>,
   env: IcalEnv,
@@ -314,7 +363,7 @@ async function deliverCreate(
   }
 }
 
-async function deliverDelete(io: ObjectIO, calendar: Calendar, before: KnownState, env: IcalEnv): Promise<Delivered> {
+async function deliverDelete(io: DeliveryIO, calendar: Calendar, before: KnownState, env: IcalEnv): Promise<Delivered> {
   // Ж15: If-Match на DELETE Яндекс не соблюдает — ETag сверяется здесь, по
   // свежему чтению. Сбой этого чтения бросается как есть: ничего не записано.
   const found = await io.find(calendar, before.uid);
@@ -387,7 +436,7 @@ function judge(current: RawObject | undefined, before: KnownState, expected: (()
   return "other";
 }
 
-async function reread(io: ObjectIO, calendar: Calendar, uid: string, outcome: WriteFailure): Promise<RawObject | undefined> {
+async function reread(io: DeliveryIO, calendar: Calendar, uid: string, outcome: WriteFailure): Promise<RawObject | undefined> {
   try {
     return await io.find(calendar, uid);
   } catch (error) {
@@ -407,6 +456,21 @@ async function reread(io: ObjectIO, calendar: Calendar, uid: string, outcome: Wr
       advice: REREAD,
     });
   }
+}
+
+// Правка ушла по пути события, удалённого после нашего чтения, и сервер
+// создал его заново (Ж16). Компенсирующего DELETE нет: в объекте лежит
+// правка пользователя, а между нашим PUT и таким DELETE объект мог успеть
+// измениться — стереть его вслепую значит потерять чужие данные.
+function recreatedError(href: string): DeliveryError {
+  return new DeliveryError(
+    "conflict",
+    `Событие удалили после того, как его прочитали: по пути ${href} его уже не было, и сервер не отклонил запись, а создал событие заново — сейчас оно снова на сервере, уже с вашими изменениями.`,
+    {
+      advice: "Проверьте событие: если его удаляли намеренно, удалите заново; если нет — изменения уже на месте.",
+      recreated: true,
+    },
+  );
 }
 
 function rejectedError(error: Error): DeliveryError {
@@ -464,10 +528,12 @@ export interface SplitDelivered {
  *    после того, как продолжение подтверждено.
  * Сорвалось усечение — `split-incomplete`: продолжение названо, хвост виден
  * дважды, повтор того же вызова дописывает только усечение. Компенсирующего
- * DELETE нет.
+ * DELETE нет. Отдельно назван случай, когда исходную серию удалили до
+ * усечения и наша запись создала её заново (Ж16): дописывать нечего, но
+ * серия, которую удалили, вернулась — об этом сказано в отказе.
  */
 export async function writeSplit(
-  io: ObjectIO,
+  io: DeliveryIO,
   calendar: Calendar,
   current: KnownState,
   plan: SplitWrite,
@@ -502,14 +568,22 @@ export async function writeSplit(
     // Исходная серия точно прежняя, только если усечение не дошло или сервер
     // его отклонил; иначе её, похоже, изменил или удалил другой клиент.
     const intact = error.code === "not-delivered" || error.code === "rejected";
+    // Особый случай: исходную серию удалили до нашего усечения, и сервер
+    // создал её заново усечённым текстом (Ж16). Усечение на сервере есть, но
+    // это уже не та серия, которую читал разрез.
     const state = intact
       ? "Исходная серия не тронута, поэтому встречи от границы разреза сейчас видны дважды — в ней и в продолжении; ничего не потеряно."
-      : "Продолжение осталось на сервере; ничего не удалено.";
+      : error.recreated
+        ? "Ничего не удалено: на сервере сейчас и продолжение, и заново созданная усечённая серия."
+        : "Продолжение осталось на сервере; ничего не удалено.";
+    const what = error.recreated ? "усечение создало исходную серию заново" : "исходную серию усечь не удалось";
     throw new DeliveryError(
       "split-incomplete",
-      `Продолжение серии создано (id ${uid}), но исходную серию усечь не удалось: ${nested(error.reason)} ${state}`,
+      `Продолжение серии создано (id ${uid}), но ${what}: ${nested(error.reason)} ${state}`,
       {
-        advice: "Повторите тот же вызов: он перечитает серию, найдёт продолжение и, если оно совпадает с планом, допишет только усечение.",
+        advice: error.recreated
+          ? "Проверьте серию: если её удаляли намеренно, удалите заново и её, и продолжение; если нет — разрез дописывать не нужно."
+          : "Повторите тот же вызов: он перечитает серию, найдёт продолжение и, если оно совпадает с планом, допишет только усечение.",
         cause: error,
         continuation: { uid, href: continuation.href },
         ...(error.current ? { current: error.current } : {}),

@@ -3,6 +3,7 @@ import {
   deleteObject,
   getObject,
   putObject,
+  putObjectWithStatus,
   queryEventByUid,
   queryEvents,
 } from "../../src/caldav/objects.js";
@@ -119,6 +120,36 @@ describe("putObject", () => {
 
     expect(request.mock.calls[0][0].headers["If-Match"]).toBe("1789383239000");
     expect(etag).toBe("1789383239000");
+  });
+});
+
+describe("putObjectWithStatus", () => {
+  it("отдаёт код ответа вместе с ETag: 204 — объект заменён", async () => {
+    const { client: caldav } = client({ status: 204, headers: { ETag: "1789383239000" } });
+
+    expect(await putObjectWithStatus(caldav, "/x.ics", "BEGIN:VCALENDAR", { ifMatch: "1789383238000" })).toEqual({
+      status: 204,
+      etag: "1789383239000",
+    });
+  });
+
+  it("201 на запись с If-Match: объекта по пути не было, сервер создал его (Ж16)", async () => {
+    const { client: caldav, request } = client({ status: 201, headers: { ETag: "1789383240000" } });
+
+    expect(await putObjectWithStatus(caldav, "/x.ics", "BEGIN:VCALENDAR", { ifMatch: "1789383239000" })).toEqual({
+      status: 201,
+      etag: "1789383240000",
+    });
+    expect(request.mock.calls[0][0].headers["If-Match"]).toBe("1789383239000");
+  });
+
+  it("код есть и тогда, когда сервер не прислал ETag", async () => {
+    const { client: caldav } = client({ status: 201 });
+
+    expect(await putObjectWithStatus(caldav, "/x.ics", "BEGIN:VCALENDAR", { ifNoneMatch: true })).toEqual({
+      status: 201,
+      etag: "",
+    });
   });
 });
 

@@ -5,10 +5,10 @@
 //
 // Всё — на изменяемом стенде tests/support через настоящий транспорт
 // createClient(config, fake.fetch): порт ioFor(ctx) идёт в боевые
-// queryEventByUid, putObject и deleteObject. Стенд по умолчанию ведёт себя
-// как Яндекс: If-None-Match и If-Match на DELETE не соблюдаются (Ж13, Ж15),
-// PUT с If-Match по пустому пути создаёт объект (Ж16); режим conditions
-// "rfc" — там, где нужен именно 412.
+// queryEventByUid, putObjectWithStatus и deleteObject. Стенд по умолчанию
+// ведёт себя как Яндекс: If-None-Match и If-Match на DELETE не соблюдаются
+// (Ж13, Ж15), PUT с If-Match по пустому пути создаёт объект и отвечает 201
+// (Ж16); режим conditions "rfc" — там, где нужен именно 412.
 //
 // semanticDigest обёрнут счётчиком: дайджест давней частой серии считается
 // около секунды, поэтому прежний дайджест вызывающий считает один раз и
@@ -18,7 +18,7 @@ import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import { CaldavError } from "../../src/caldav/request.js";
 import { hrefFor } from "../../src/domain/events.js";
-import { DeliveryError, deliver, ioFor, writeSplit, type KnownState, type SplitWrite } from "../../src/domain/writes.js";
+import { DeliveryError, deliver, ioFor, writeSplit, type DeliveryIO, type KnownState, type SplitWrite } from "../../src/domain/writes.js";
 import { semanticDigest } from "../../src/ical/object.js";
 import { vtimezoneFor } from "../../src/ical/timezones.js";
 import type { IcalEnv } from "../../src/ical/values.js";
@@ -93,7 +93,7 @@ const SPLIT: SplitWrite = { continuation: { uid: CONT_UID, ics: CONTINUATION }, 
 interface Setup {
   fake: FakeCaldav;
   ctx: Context;
-  io: ObjectIO;
+  io: DeliveryIO;
   calendar: Calendar;
   path: string;
   /** Прочитанное в этом вызове состояние серии, дайджест посчитан один раз. */
@@ -109,7 +109,7 @@ async function setup(options: FakeCaldavOptions = {}): Promise<Setup> {
 }
 
 /** Чтение серии, как его делает вызывающий код: путь и ETag с сервера, дайджест — один раз. */
-async function known(io: ObjectIO, calendar: Calendar): Promise<KnownState> {
+async function known(io: DeliveryIO, calendar: Calendar): Promise<KnownState> {
   const found = await io.find(calendar, UID);
   expect(found, "серия на сервере").toBeDefined();
   const state = { uid: UID, href: found!.href, etag: found!.etag, digest: semanticDigest(found!.ics, ENV) };
@@ -161,7 +161,9 @@ describe("ioFor: порт ввода-вывода на транспорте CalD
 
   it("put с If-Match — applied и ETag из ответа; без ETag в ответе — пустая строка", async () => {
     const { fake, io, path, before } = await setup();
+    // Замена существующего объекта — ответ 204, пометки «создан» нет.
     expect(await io.put(path, RENAMED, { ifMatch: before.etag })).toEqual({ status: "applied", etag: fake.etag(path) });
+    expect(fake.log.at(-1)?.status).toBe(204);
     expect(fake.log.at(-1)?.ifMatch).toBe(before.etag);
 
     const silent = await setup({ etagOnPut: false });
@@ -171,8 +173,16 @@ describe("ioFor: порт ввода-вывода на транспорте CalD
   it("put с If-None-Match шлёт заголовок «*» по заданному пути", async () => {
     const { fake, io } = await setup();
     const outcome = await io.put(CONT_HREF, CONTINUATION, { ifNoneMatch: "*" });
-    expect(outcome).toEqual({ status: "applied", etag: fake.etag(CONT_HREF) });
+    expect(outcome).toEqual({ status: "applied", etag: fake.etag(CONT_HREF), created: true });
     expect(fake.log.at(-1)?.ifNoneMatch).toBe("*");
+  });
+
+  it("ответ 201 помечается created — и при создании, и при записи по пустому пути (Ж16)", async () => {
+    const { fake, io, path, before } = await setup();
+    fake.externalDelete(path);
+    const outcome = await io.put(path, RENAMED, { ifMatch: before.etag });
+    expect(outcome, "сервер создал объект, а не заменил").toEqual({ status: "applied", etag: fake.etag(path), created: true });
+    expect(fake.log.at(-1)?.status).toBe(201);
   });
 
   it("сбои — значения, а не исключения; каждый запрос уходит ровно один раз", async () => {
@@ -369,6 +379,23 @@ describe("deliver: правка — PUT с If-Match прочитанного ETa
     expect(error.message).toMatch(/удал/);
     expect(s.fake.has(s.path)).toBe(false);
     expect(s.fake.writes()).toHaveLength(1);
+  });
+
+  it("другой клиент удалил событие до нашего PUT (Ж16): ответ 201 — не успех, а конфликт", async () => {
+    const s = await setup();
+    // Удаление успевает пройти между нашим чтением и записью: If-Match по
+    // пустому пути Яндекс не отклоняет, а создаёт объект нашим текстом.
+    s.fake.externalDelete(s.path);
+    const mark = s.fake.mark();
+    const error = await failure(() => deliver(s.io, s.calendar, { kind: "put", ics: RENAMED }, s.before, ENV));
+    expect(error.code).toBe("conflict");
+    expect(error.recreated, "правка создала удалённое событие заново").toBe(true);
+    expect(error.message).toMatch(/удалили/);
+    expect(error.message).toMatch(/создал событие заново/);
+    expect(error.message, "во внятном тексте нет внутренних обозначений").not.toMatch(/Ж1|201/);
+    expect(journal(s.fake, mark, s)).toEqual(["PUT исходный If-Match=прочитанный → 201"]);
+    expect(s.fake.ics(s.path), "воскрешённый объект остаётся с правкой: вслепую его не стираем").toBe(RENAMED);
+    expect(digestCalls.count, "исход дал ответ сервера — сверять смысл не нужно").toBe(0);
   });
 
   it("отказ сервера (4xx): rejected, без перечитывания и повтора", async () => {
@@ -777,6 +804,31 @@ describe("writeSplit: разрез серии — продолжение, зат
     expect(error.message, "исходную серию изменили — о «видны дважды» знать нельзя").not.toMatch(/видны дважды/);
     expect(s.fake.ics(s.path)).toBe(externalRename(SEED));
     expect(s.fake.writes().some((w) => w.method === "DELETE")).toBe(false);
+  });
+
+  it("исходную серию удалили до усечения (Ж16): оно создало её заново — split-incomplete говорит об этом", async () => {
+    const s = await setup();
+    s.fake.beforeRequest = (request) => {
+      if (request.method === "PUT" && request.path === s.path) {
+        s.fake.externalDelete(s.path);
+        s.fake.beforeRequest = undefined;
+      }
+    };
+    const mark = s.fake.mark();
+    const error = await failure(() => writeSplit(s.io, s.calendar, s.before, SPLIT, ENV));
+    expect(error.code).toBe("split-incomplete");
+    expect((error.cause as DeliveryError).recreated).toBe(true);
+    expect(error.message).toMatch(/создало исходную серию заново/);
+    expect(error.message).toMatch(/Ничего не удалено/);
+    expect(error.message, "дописывать нечего — совет о повторе вызова не годится").not.toMatch(/Повторите тот же вызов/);
+    expect(journal(s.fake, mark, s)).toEqual([
+      "REPORT календарь → 207",
+      "PUT продолжение If-None-Match=* → 201",
+      "PUT исходный If-Match=прочитанный → 201",
+    ]);
+    expect(s.fake.ics(s.path), "усечённая серия создана заново").toBe(TRUNCATED);
+    expect(s.fake.has(CONT_HREF)).toBe(true);
+    expect(s.fake.writesSince(mark).some((w) => w.method === "DELETE"), "компенсирующего DELETE нет").toBe(false);
   });
 
   it("сервер без ETag в ответе на PUT: разрез проходит, etag пустые", async () => {
