@@ -18,9 +18,8 @@
 // перезаписал бы продолжение и потерял правки. Режим conditions "rfc" здесь
 // не нужен ни одной цепочке.
 //
-// Все цепочки — it.fails: на прежней реализации каждая падает на утверждении
-// о данных (видимый список, состояние сервера, ответ пользователю). Задача З13
-// снимает .fails, когда цепочки станут зелёными.
+// Пометка it.fails снята: разрез идёт через планировщик, предохранитель и
+// доставку (writeSplit), и все цепочки этого файла зелёные.
 import { describe, expect, it } from "vitest";
 import { deleteEvent, readEvents, updateEvent } from "../../src/domain/events.js";
 import type { CalendarEvent, Context, EditScope } from "../../src/types.js";
@@ -334,7 +333,7 @@ function weeklyStand() {
 }
 
 describe("цепочки разреза серии «эта и следующие» (З05b)", () => {
-  it.fails("C11: перенос 04.11 на 05.11 → t&f 26.10 {location}: 6 встреч, перенос в продолжении с новым местом", async () => {
+  it("C11: перенос 04.11 на 05.11 → t&f 26.10 {location}: 6 встреч, перенос в продолжении с новым местом", async () => {
     // R13-N5, AE10, R8-N1(D): переопределение после границы оставалось в
     // исходном объекте сиротой и задваивалось с продолжением.
     const { fake, ctx, path } = weeklyStand();
@@ -389,7 +388,7 @@ describe("цепочки разреза серии «эта и следующи�
     });
   });
 
-  it.fails("C12: delete this 21.10 → all_series {location}: 21.10 не воскрес, EXDATE побайтово", async () => {
+  it("C12: delete this 21.10 → all_series {location}: 21.10 не воскрес, EXDATE побайтово", async () => {
     // R13-N3, AE1, AD7: all_series пересобирал основной компонент из модели и терял EXDATE.
     const { fake, ctx, path } = weeklyStand();
 
@@ -417,7 +416,7 @@ describe("цепочки разреза серии «эта и следующи�
     assertPropsPreserved(afterDelete, fake.ics(path), { except: ["LOCATION"] });
   });
 
-  it.fails("C13a: delete this 04.11 → t&f 26.10: 04.11 не воскрес в продолжении", async () => {
+  it("C13a: delete this 04.11 → t&f 26.10: 04.11 не воскрес в продолжении", async () => {
     // AE2, R13-N3 (S15): продолжение собиралось из модели без EXDATE.
     const { fake, ctx } = weeklyStand();
 
@@ -446,7 +445,7 @@ describe("цепочки разреза серии «эта и следующи�
     expectSuccess(split, "разрез 26.10");
   });
 
-  it.fails("C13b: delete 21.10 и 04.11 → t&f 28.10: всего 4, лишней встречи 09.11 нет (S10)", async () => {
+  it("C13b: delete 21.10 и 04.11 → t&f 28.10: всего 4, лишней встречи 09.11 нет (S10)", async () => {
     // AD8: COUNT продолжения считался по видимым экземплярам, удалённые до
     // границы удлиняли серию, а удалённый после границы воскресал.
     const { fake, ctx } = weeklyStand();
@@ -477,7 +476,7 @@ describe("цепочки разреза серии «эта и следующи�
     expectSuccess(split, "разрез 28.10");
   });
 
-  it.fails("C14a: delete 21.10 → t&f 02.11: 5 встреч, COUNT по позициям правила", async () => {
+  it("C14a: delete 21.10 → t&f 02.11: 5 встреч, COUNT по позициям правила", async () => {
     // AE3, R8-O3: остаток COUNT считался по видимым экземплярам — лишняя 09.11.
     const { fake, ctx } = weeklyStand();
 
@@ -508,7 +507,7 @@ describe("цепочки разреза серии «эта и следующи�
     expectSuccess(split, "разрез 02.11");
   });
 
-  it.fails("C14b: перенос 21.10 на 03.11 → t&f 02.11: 6 встреч, лишней 09.11 нет", async () => {
+  it("C14b: перенос 21.10 на 03.11 → t&f 02.11: 6 встреч, лишней 09.11 нет", async () => {
     // AE3: перенесённый через границу считался по фактическому времени — лишняя встреча.
     const { fake, ctx } = weeklyStand();
 
@@ -554,7 +553,7 @@ describe("цепочки разреза серии «эта и следующи�
     expectSuccess(split, "разрез 02.11");
   });
 
-  it.fails("C14c: перенос 28.10 на 25.10 → t&f 26.10: COUNT продолжения 4, 04.11 есть", async () => {
+  it("C14c: перенос 28.10 на 25.10 → t&f 26.10: COUNT продолжения 4, 04.11 есть", async () => {
     // R8-N2: COUNT продолжения по фактическим началам — 3 вместо 4, 04.11 терялась.
     const { fake, ctx, path } = weeklyStand();
 
@@ -600,7 +599,7 @@ describe("цепочки разреза серии «эта и следующи�
     expect(ruleParts(continuation(fake, path).ics).COUNT, "COUNT продолжения — 6 минус 2 позиции до 26.10").toBe("4");
   });
 
-  it.fails("C14d: DAILY COUNT=10 Europe/Berlin: this 26.10, delete 27.10, t&f 29.10 → 9 встреч", async () => {
+  it("C14d: DAILY COUNT=10 Europe/Berlin: this 26.10, delete 27.10, t&f 29.10 → 9 встреч", async () => {
     // AE3 (Berlin): через переход CEST→CET 25.10 COUNT продолжения завышался — лишняя 31.10.
     const zone = "Europe/Berlin";
     const { fake, ctx } = makeStand();
@@ -689,7 +688,7 @@ describe("цепочки разреза серии «эта и следующи�
     }
   });
 
-  it.fails("C16b: BYMONTHDAY=1,15 → t&f 01.11: 15-е числа на месте", async () => {
+  it("C16b: BYMONTHDAY=1,15 → t&f 01.11: 15-е числа на месте", async () => {
     // AE6: продолжение из модели теряло BYMONTHDAY — 01.12, 01.01, 01.02 вместо 15-х.
     const { fake, ctx } = makeStand();
     const path = plant(fake, firstAndFifteenth);
@@ -717,7 +716,7 @@ describe("цепочки разреза серии «эта и следующи�
     expect(withoutEnd(ruleParts(continuation(fake, path).ics)), "правило продолжения, кроме конца").toEqual(seedRule);
   });
 
-  it.fails("C16c: WEEKLY;INTERVAL=2;WKST=SU → t&f 03.11: хвост совпадает или чистый отказ", async () => {
+  it("C16c: WEEKLY;INTERVAL=2;WKST=SU → t&f 03.11: хвост совпадает или чистый отказ", async () => {
     // AE6: продолжение из модели теряло WKST — хвост 08.11, 22.11, 06.12 вместо
     // 15.11, 29.11, 13.12. Отступление по Ж6: Яндекс WKST выбрасывает, поправка
     // к Р4 велит такие правила при записи отклонять — допустим и чистый отказ.
@@ -752,7 +751,7 @@ describe("цепочки разреза серии «эта и следующи�
     }
   });
 
-  it.fails("C28: 507 на втором PUT разреза → продолжение названо, повтор завершает: 6 встреч без дублей", async () => {
+  it("C28: 507 на втором PUT разреза → продолжение названо, повтор завершает: 6 встреч без дублей", async () => {
     // AE18, R13-N8: прежний порядок (усечение, потом продолжение) терял хвост,
     // а совет «повторите update_event» был невыполним.
     const { fake, ctx, path } = weeklyStand();
@@ -816,7 +815,7 @@ describe("цепочки разреза серии «эта и следующи�
   });
 
   for (const variant of ["rename", "delete"] as const) {
-    it.fails(`C40 (${variant}): t&f 26.10, 507 на усечении → ${variant} 04.11 в исходной → повтор: split-stale-continuation`, async () => {
+    it(`C40 (${variant}): t&f 26.10, 507 на усечении → ${variant} 04.11 в исходной → повтор: split-stale-continuation`, async () => {
       // J-A2: повтор принимал существующее продолжение за своё и усекал
       // исходную серию — правка или удаление 04.11 в ней терялись.
       const { fake, ctx, path } = weeklyStand();
@@ -868,7 +867,7 @@ describe("цепочки разреза серии «эта и следующи�
     });
   }
 
-  it.fails("C41: t&f 26.10 → all_series until позже → t&f 26.10: отказ, ничего не записано", async () => {
+  it("C41: t&f 26.10 → all_series until позже → t&f 26.10: отказ, ничего не записано", async () => {
     // J-A2: после продления усечённой серии повтор разреза в той же границе
     // находил старое продолжение и снимал из исходной то, чего в нём нет.
     const { fake, ctx, path } = weeklyStand();
@@ -906,7 +905,7 @@ describe("цепочки разреза серии «эта и следующи�
     expect(refusalOf(again, "повторный разрез в той же границе").code).toBe("split-stale-continuation");
   });
 
-  it.fails("C49: delete 04.11 → t&f 26.10 со сменой времени: 04.11 не воскрес", async () => {
+  it("C49: delete 04.11 → t&f 26.10 со сменой времени: 04.11 не воскрес", async () => {
     // Изъян B: EXDATE ≥ B копировались без сдвига и переставали совпадать со
     // слотами продолжения; у прежнего кода продолжение из модели их не знало вовсе.
     const { fake, ctx } = weeklyStand();
@@ -938,7 +937,7 @@ describe("цепочки разреза серии «эта и следующи�
     expectSuccess(split, "разрез 26.10 с 12:00");
   });
 
-  it.fails("C51: разрез серии с чужим участником: needsConfirm без записей, с confirm — продолжение с участниками", async () => {
+  it("C51: разрез серии с чужим участником: needsConfirm без записей, с confirm — продолжение с участниками", async () => {
     // Р9, T16: новый UID продолжения с прежними ATTENDEE может разослать письма.
     const { fake, ctx } = makeStand();
     const path = plant(fake, withGuest);
@@ -970,7 +969,7 @@ describe("цепочки разреза серии «эта и следующи�
     assertPropsPreserved(before, continuation(fake, path).ics, { scope: "master", only: ["ORGANIZER", "ATTENDEE"] });
   });
 
-  it.fails("C60a: t&f 26.10 {summary} → тот же t&f {location}: split-already-done с id продолжения", async () => {
+  it("C60a: t&f 26.10 {summary} → тот же t&f {location}: split-already-done с id продолжения", async () => {
     // П (повтор разреза), M25: «уже выполнено» без сверки патча молча
     // теряло новую правку; прежний код отвечал «экземпляра нет» без кода.
     const { fake, ctx, path } = weeklyStand();
@@ -1001,7 +1000,7 @@ describe("цепочки разреза серии «эта и следующи�
     expect(refusal.message, "отказ называет продолжение").toContain(tail.uid);
   });
 
-  it.fails("C60b: t&f 26.10 {summary} → тот же t&f с тем же патчем: «уже выполнено», без записей", async () => {
+  it("C60b: t&f 26.10 {summary} → тот же t&f с тем же патчем: «уже выполнено», без записей", async () => {
     // Р9: повтор уже выполненного разреза с тем же патчем — успех без записей
     // (тот же патч на экземпляре B продолжения даёт пустой план).
     const { fake, ctx } = weeklyStand();

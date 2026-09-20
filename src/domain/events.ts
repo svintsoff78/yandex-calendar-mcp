@@ -1,20 +1,47 @@
-import ICAL from "ical.js";
-import { randomUUID } from "node:crypto";
-import { deleteObject, queryEventByUid, queryEvents, putObject } from "../caldav/objects.js";
-import { expandOccurrences } from "../ical/expand.js";
+import { hrefFor, queryEventByUid, queryEvents, type RawObject } from "../caldav/objects.js";
 import { buildEvent, type BuildOptions } from "../ical/build.js";
-import { parseEvent } from "../ical/parse.js";
-import { registerTimeZone } from "../ical/timezones.js";
+import { continuationUid, planDelete, planUpdate } from "../ical/edit.js";
+import { expandOccurrences } from "../ical/expand.js";
+import { verifyPlan } from "../ical/guard.js";
+import { AddressError, parseAddress } from "../ical/instances.js";
+import { isUnparsable, loadObject, semanticDigest, type CalendarObject, type Unparsable } from "../ical/object.js";
+import { eventOfObject } from "../ical/parse.js";
+import { EditRefusal, type EventPatch, type Loss, type WritePlan } from "../ical/plan.js";
+import type { IcalEnv } from "../ical/values.js";
 import { resolveCalendarIn } from "./calendars.js";
-import type {
-  Attendee,
-  Calendar,
-  CalendarEvent,
-  Context,
-  EditScope,
-  Recurrence,
-  Reminder,
-} from "../types.js";
+import { deliver, ioFor, writeSplit, type DeliveryIO, type KnownState } from "./writes.js";
+import type { Calendar, CalendarEvent, Context, EditScope, Attendee, Recurrence, Reminder } from "../types.js";
+
+/**
+ * Чтение, создание, правка и удаление событий — то, что видят средства MCP.
+ *
+ * Правка и удаление здесь ничего не решают сами. Они складывают один и тот
+ * же путь из готовых частей:
+ *
+ *   чтение объекта → планировщик (src/ical/edit.ts: planUpdate, planDelete)
+ *   → предохранитель (src/ical/guard.ts: verifyPlan)
+ *   → доставка (src/domain/writes.ts: deliver, writeSplit)
+ *
+ * Второго пути правки нет намеренно: прежний собирал объект заново из
+ * разобранной модели и терял всё, чего модель не выражает (переопределения
+ * встреч, исключения серии, чужие свойства), а условную запись и разбор
+ * ответа сервера делал по-своему. Теперь запись объекта существует ровно в
+ * одном месте, а «что записать» решает только планировщик.
+ *
+ * Договор с предохранителем: при каждой правке ему передаётся тот же патч,
+ * который получил планировщик (`verifyPlan(..., { now, patch })`). Без патча
+ * часть проверок молчит — так прямо сказано в шапке guard.ts, — и сторожить
+ * это некому, кроме вызывающего. Поэтому патч передаётся в одном-единственном
+ * месте (`runPlan`), а не в каждой ветке.
+ *
+ * Отказ планировщика (`EditRefusal`) наружу уходит понятным пользователю
+ * текстом: что случилось, что будет потеряно и каким etag это подтвердить.
+ * Отказ предохранителя (`GuardError`) и неудача доставки (`DeliveryError`)
+ * уже несут свой текст и код и проходят как есть.
+ *
+ * Пояс процесса не участвует: время читается в поясе календаря
+ * (`IcalEnv.floatingZone` из настроек), «сейчас» берётся из `Context.now`.
+ */
 
 export interface ReadParams {
   from: string;
@@ -32,18 +59,68 @@ export function matchesQuery(event: CalendarEvent, query?: string): boolean {
     .some((value) => value.toLowerCase().includes(needle));
 }
 
-// Годится только для событий, которые создаём мы сами (задача 12): наш UID
-// не содержит "@", поэтому encodeURIComponent даёт путь, совпадающий с тем,
-// что кладёт на диск сервер Яндекса. Для чтения ЧУЖОГО события (заведённого
-// в вебе или на телефоне) эта функция непригодна — см. предупреждение у
-// readEvent ниже и docs/yandex-caldav-capabilities.md.
-export function hrefFor(calendar: Calendar, eventId: string): string {
-  return `${calendar.href.replace(/\/?$/, "/")}${encodeURIComponent(eventId)}.ics`;
+// Путь нового объекта переехал в слой CalDAV (src/caldav/objects.ts): им
+// пользуются и правка, и доставка, а взаимный импорт двух модулей домена —
+// круг. Здесь он только перевыставлен, чтобы прежние вызывающие не менялись.
+export { hrefFor };
+
+// ---------------------------------------------------------------------------
+// Общее для чтения и записи
+// ---------------------------------------------------------------------------
+
+/**
+ * Окружение разбора: пояс календаря из настроек (в нём читаются даты и
+ * время без смещения) и полный адрес владельца.
+ */
+function envFor(context: Context): IcalEnv {
+  return { floatingZone: context.config.defaultTimeZone, ownerEmail: context.config.login };
 }
 
-type QueryFn = (calendar: Calendar, from: Date, to: Date) => Promise<
-  Array<{ href: string; etag: string; ics: string }>
->;
+/** «Сейчас» для DTSTAMP, LAST-MODIFIED и горизонтов проверок. */
+function nowOf(context: Context): Date {
+  return context.now ? context.now() : new Date();
+}
+
+/**
+ * Логин владельца обязан быть полным адресом с доменом (name@yandex.ru).
+ *
+ * По нему отличаются свои встречи от чужих: участник с этим адресом — сам
+ * пользователь (его не перечисляют как приглашённого), организатор с этим
+ * адресом — свой (иначе встречу считают чужой и правят осторожнее), и он же
+ * получатель напоминания письмом, без которого такое напоминание не собрать.
+ * Логин без домена не совпадёт ни с одним настоящим адресом, и все три
+ * сверки молча дадут неверный ответ. Молчать об этом нельзя, гадать домен —
+ * тем более.
+ */
+function assertOwnerEmail(context: Context): void {
+  const login = context.config.login.trim();
+  if (/^[^@\s]+@[^@\s.]+\.[^@\s]+$/.test(login)) return;
+  throw new Error(
+    `Логин владельца календаря указан как «${context.config.login}» — это не полный адрес. ` +
+      "По адресу владельца определяются свои участники, свой организатор и получатель напоминания письмом; " +
+      "без домена все три сверки дают неверный ответ. Укажите в YANDEX_LOGIN полный адрес вида name@yandex.ru.",
+  );
+}
+
+async function writableCalendar(context: Context, calendarId: string | undefined): Promise<Calendar> {
+  const calendar = await context.resolveCalendar(calendarId);
+  if (calendar.readOnly) {
+    throw new Error(`Календарь «${calendar.displayName}» открыт только для чтения.`);
+  }
+  return calendar;
+}
+
+/** Событие с таким UID в календаре не найдено. */
+export class EventNotFoundError extends Error {
+  readonly code = "not-found";
+
+  constructor(message: string) {
+    super(message);
+    this.name = "EventNotFoundError";
+  }
+}
+
+type QueryFn = (calendar: Calendar, from: Date, to: Date) => Promise<RawObject[]>;
 
 function queryFor(context: Context): QueryFn {
   const injected = (context as unknown as { query?: QueryFn }).query;
@@ -64,6 +141,7 @@ export async function readEvents(context: Context, params: ReadParams): Promise<
     ? params.calendarIds.map((id) => resolveCalendarIn(all, id))
     : all;
 
+  const env = envFor(context);
   const expand = params.expandRecurring !== false;
   const query = queryFor(context);
   const collected: CalendarEvent[] = [];
@@ -81,7 +159,7 @@ export async function readEvents(context: Context, params: ReadParams): Promise<
     // календаря (иначе наружу ушло бы сообщение уровня CalDAV, из которого
     // не видно, какой именно календарь виноват), сохраняя исходную ошибку
     // как cause.
-    let objects: Array<{ href: string; etag: string; ics: string }>;
+    let objects: RawObject[];
     try {
       objects = await query(calendar, from, to);
     } catch (error) {
@@ -92,9 +170,10 @@ export async function readEvents(context: Context, params: ReadParams): Promise<
       );
     }
     for (const object of objects) {
+      const meta = { calendarId: calendar.id, etag: object.etag, href: object.href };
       const events = expand
-        ? expandOccurrences(object.ics, calendar.id, from, to, object.etag)
-        : [parseEvent(object.ics, calendar.id, object.etag)];
+        ? expandOccurrences(object.ics, calendar.id, from, to, object.etag, env)
+        : [eventOfObject(loadObject(object.ics, env), meta, env)];
       for (const event of events) {
         if (matchesQuery(event, params.query)) collected.push({ ...event, href: object.href });
       }
@@ -113,25 +192,26 @@ export async function readEvent(
 ): Promise<CalendarEvent> {
   const calendar = await context.resolveCalendar(calendarId);
 
-  // ОБЯЗАТЕЛЬНОЕ ОТСТУПЛЕНИЕ ОТ БРИФА: путь к объекту нельзя построить из
-  // UID (hrefFor) — сервер Яндекса не выводит имя файла из UID
-  // (docs/yandex-caldav-capabilities.md, задача 1): UID вида
-  // "aaaabbbbccccdddd11@yandex.ru" хранится как объект
-  // "aaaabbbbccccdddd11yandex.ru.ics" — собака выброшена, а не
-  // закодирована. Это верно для ЛЮБОГО события, заведённого не нами
-  // (веб-интерфейс, телефон), то есть почти для всех событий в реальном
-  // аккаунте. Поэтому ищем объект REPORT'ом calendar-query по UID
-  // (queryEventByUid, задача 9) и берём href и etag из ответа сервера.
+  // Путь к объекту нельзя построить из UID: сервер Яндекса не выводит имя
+  // файла из UID (docs/yandex-caldav-capabilities.md) — собака выброшена, а
+  // не закодирована. Это верно для любого события, заведённого не нами (веб,
+  // телефон), то есть почти для всех событий в реальном аккаунте. Поэтому
+  // объект ищется REPORT'ом calendar-query по UID, а href и etag берутся из
+  // ответа сервера.
+  const env = envFor(context);
   const object = await queryEventByUid(context.client, calendar.href, eventId);
   if (!object) {
-    throw new Error(
+    throw new EventNotFoundError(
       `Событие с идентификатором «${eventId}» не найдено в календаре «${calendar.displayName}».`,
     );
   }
 
-  const event = parseEvent(object.ics, calendar.id, object.etag);
-  return { ...event, href: object.href };
+  return eventOfObject(loadObject(object.ics, env), { calendarId: calendar.id, etag: object.etag, href: object.href }, env);
 }
+
+// ---------------------------------------------------------------------------
+// Создание
+// ---------------------------------------------------------------------------
 
 // Поля события на границе создания: без id/etag/href (их присваивает
 // сервер и hrefFor — вызывающий код их не выбирает) и без timeZone как
@@ -168,33 +248,18 @@ export interface BulkResult {
 // укладывается в единицы-десятки секунд при обычной задержке CalDAV-запроса.
 const MAX_BATCH_SIZE = 50;
 
-type PutFn = (
-  href: string,
-  ics: string,
-  options: { ifMatch?: string; ifNoneMatch?: boolean },
-) => Promise<string>;
-
-// Тот же приём внедрения зависимости, что и у queryFor выше: тесты кладут
-// в context.put мок вместо настоящего PUT по сети.
-function putFor(context: Context): PutFn {
-  const injected = (context as unknown as { put?: PutFn }).put;
-  if (injected) return injected;
-  return (href, ics, options) => putObject(context.client, href, ics, options);
-}
-
 /**
- * Окружение сборки нового текста. Полный адрес владельца календаря
- * (`Config.login`, name@yandex.ru) — получатель напоминания письмом: без него
- * VALARM с ACTION:EMAIL собрать нельзя (RFC 5545 §3.6.6, src/ical/build.ts,
- * newAlarm), и сборка отказывает «получатель неизвестен».
+ * Окружение сборки нового текста. Полный адрес владельца календаря —
+ * получатель напоминания письмом: без него VALARM с ACTION:EMAIL собрать
+ * нельзя (RFC 5545 §3.6.6, src/ical/build.ts), и сборка отказывает
+ * «получатель неизвестен».
  */
 function buildOptionsFor(context: Context): BuildOptions {
   return { ownerEmail: context.config.login };
 }
 
 export async function createEvent(context: Context, input: EventInput): Promise<CalendarEvent> {
-  // Самопроверка задачи 12 (проверки, которых нет в брифе): дешёвые проверки
-  // формы входа — до resolveCalendar и уж тем более до сети.
+  // Дешёвые проверки формы входа — до resolveCalendar и уж тем более до сети.
   if (!input.summary.trim()) {
     throw new Error("Заголовок события не может быть пустым.");
   }
@@ -207,10 +272,8 @@ export async function createEvent(context: Context, input: EventInput): Promise<
     throw new Error("Конец события должен быть позже начала.");
   }
 
-  const calendar = await context.resolveCalendar(input.calendarId);
-  if (calendar.readOnly) {
-    throw new Error(`Календарь «${calendar.displayName}» открыт только для чтения.`);
-  }
+  assertOwnerEmail(context);
+  const calendar = await writableCalendar(context, input.calendarId);
 
   const event = {
     calendarId: calendar.id,
@@ -228,9 +291,12 @@ export async function createEvent(context: Context, input: EventInput): Promise<
 
   const { ics, uid } = buildEvent(event, buildOptionsFor(context));
   const href = hrefFor(calendar, uid);
-  const etag = await putFor(context)(href, ics, { ifNoneMatch: true });
+  // Создание идёт той же доставкой, что правка и удаление: один PUT без
+  // слепых повторов, а потерянный ответ выясняется перечитыванием по UID, а
+  // не вторым PUT'ом (который у Яндекса молча перезаписал бы уже созданное).
+  const written = await deliver(ioFor(context), calendar, { kind: "create", uid, href, ics }, undefined, envFor(context));
 
-  return { ...event, id: uid, href, etag };
+  return { ...event, id: uid, href: written.href, etag: written.etag };
 }
 
 // Пачка намеренно не откатывается при частичной неудаче: транзакций в
@@ -263,7 +329,7 @@ export async function createEvents(
 }
 
 // ---------------------------------------------------------------------------
-// Правка событий (задача 13)
+// Правка и удаление: один путь
 // ---------------------------------------------------------------------------
 
 export interface UpdateParams {
@@ -271,485 +337,447 @@ export interface UpdateParams {
   id: string;
   scope?: EditScope;
   instanceStart?: string;
-  patch: Partial<EventInput>;
+  patch: EventPatch;
+  /** Подтверждение потерь; принимается только вместе с `etag`. */
+  confirm?: boolean;
+  /** ETag состояния, которое пользователь видел последним. */
+  etag?: string;
 }
-
-type GetFn = (calendar: Calendar, uid: string) => Promise<{ href: string; etag: string; ics: string }>;
-
-// Тот же приём внедрения зависимости, что у queryFor/putFor выше: тесты
-// подставляют context.get вместо похода в сеть.
-//
-// ОБЯЗАТЕЛЬНОЕ ОТСТУПЛЕНИЕ ОТ БРИФА: там объект для правки находился по
-// `hrefFor(calendar, params.id)` + GET. Это неверно для чужих событий: задача 1
-// установила на живом сервере Яндекса, что имя файла объекта НЕ выводится из
-// UID (docs/yandex-caldav-capabilities.md) — собака выбрасывается, а не
-// кодируется, поэтому собранный путь не совпадёт с реальным почти для любого
-// события, заведённого не нами (веб, телефон). Задача 11 уже решила это для
-// чтения (readEvent выше, тот же аргумент подробно расписан там) — здесь тот
-// же приём: ищем объект REPORT'ом calendar-query по UID (queryEventByUid) и
-// берём href, etag и ics из ответа сервера. hrefFor остаётся пригоден только
-// там, где UID выдаём мы сами — ниже, для новой серии при this_and_following.
-function getFor(context: Context): GetFn {
-  const injected = (context as unknown as { get?: GetFn }).get;
-  if (injected) return injected;
-  return async (calendar, uid) => {
-    const object = await queryEventByUid(context.client, calendar.href, uid);
-    if (!object) {
-      throw new Error(
-        `Событие с идентификатором «${uid}» не найдено в календаре «${calendar.displayName}».`,
-      );
-    }
-    return object;
-  };
-}
-
-// Патч не трогает поля, которых в нём нет: там, где patch[поле] === undefined,
-// остаётся значение из переданного события.
-function merge(event: CalendarEvent, patch: Partial<EventInput>) {
-  return {
-    calendarId: event.calendarId,
-    summary: patch.summary ?? event.summary,
-    description: patch.description ?? event.description,
-    location: patch.location ?? event.location,
-    start: patch.start ?? event.start,
-    end: patch.end ?? event.end,
-    timeZone: patch.timeZone ?? event.timeZone,
-    allDay: patch.allDay ?? event.allDay,
-    recurrence: patch.recurrence ?? event.recurrence,
-    reminders: patch.reminders ?? event.reminders,
-    attendees: patch.attendees ?? event.attendees,
-  };
-}
-
-function veventOf(ics: string): { root: ICAL.Component; vevent: ICAL.Component } {
-  const root = new ICAL.Component(ICAL.parse(ics));
-  const vevent = root.getFirstSubcomponent("vevent");
-  if (!vevent) throw new Error("В календарной записи нет компонента VEVENT.");
-  return { root, vevent };
-}
-
-// Значение RECURRENCE-ID обязано быть в том же представлении, что и DTSTART
-// экземпляра, который оно опознаёт (RFC 5545 §3.8.4.4) — иначе сервер и
-// другие клиенты не смогут сопоставить переопределение с конкретным
-// вхождением серии.
-//
-// Отступление от брифа: там стояло `ICAL.Time.fromJSDate(date, false)` +
-// `ICAL.TimezoneService.get(tzid) ?? ICAL.Timezone.utcTimezone`. Это тот же
-// баг, что уже был найден и исправлен в toIcalTime (src/ical/build.ts,
-// см. комментарий там подробно): при useUTC=false ical.js берёт год/час/
-// минуту и т. д. из геттеров JS Date БЕЗ смещения — то есть в часовом поясе
-// ХОСТ-МАШИНЫ, а не из смещения, указанного в самой ISO-строке. На машине,
-// где локальный пояс случайно совпадает с TZID события, это не проявляется,
-// но ломается на сервере с другим TZ (например, UTC). Плюс `??
-// ICAL.Timezone.utcTimezone` тихо подменяет пояс на UTC, если он ещё не
-// зарегистрирован в TimezoneService, — RECURRENCE-ID тогда не совпадёт с
-// DTSTART опознаваемого экземпляра ни по времени, ни по TZID. Здесь —
-// fromJSDate(date, true) (момент уже учёл смещение при парсинге ISO-строки)
-// плюс registerTimeZone, которая при необходимости зарегистрирует пояс из
-// базы IANA, а не молча подставит UTC.
-function icalTimeOf(iso: string, tzid: string): ICAL.Time {
-  const zone = registerTimeZone(tzid);
-  return ICAL.Time.fromJSDate(new Date(iso), true).convertToZone(zone);
-}
-
-// Число экземпляров исходной серии СТРОГО раньше instanceStart. Используется
-// в двух местах ниже: чтобы проверить, что instanceStart вообще указывает на
-// реальный экземпляр (иначе RECURRENCE-ID/UNTIL ссылались бы в пустоту, и
-// правка молча создавала бы «сиротский» объект, который не покажет ни один
-// календарный клиент, — это хуже явного отказа), и чтобы пересчитать
-// оставшийся COUNT для новой серии при this_and_following (см. там).
-function occurrencesBefore(ics: string, calendarId: string, instanceStart: string): number {
-  return expandOccurrences(ics, calendarId, new Date(0), new Date(instanceStart)).length;
-}
-
-// Самопроверка задачи 13 (проверки, которых нет в брифе): без неё scope
-// "this"/"this_and_following" с опечаткой в instanceStart (например, времени,
-// которого в серии никогда не было) не давал бы никакой ошибки — сервер
-// молча принял бы RECURRENCE-ID или UNTIL, ссылающиеся на несуществующий
-// экземпляр, и правка выглядела бы успешной, ничего не изменив ни в одном
-// клиенте.
-function assertInstanceExists(ics: string, calendarId: string, instanceStart: string): void {
-  const target = new Date(instanceStart);
-  if (Number.isNaN(target.getTime())) {
-    throw new Error(`instanceStart «${instanceStart}» не является датой в формате ISO 8601.`);
-  }
-  // expandOccurrences берёт полуоткрытый интервал [from, to) — окно длиной в
-  // секунду, начинающееся ровно в target, ловит экземпляр с началом ровно в
-  // target и не задевает соседние.
-  const occurrences = expandOccurrences(ics, calendarId, target, new Date(target.getTime() + 1000));
-  const exists = occurrences.some(
-    (occurrence) => new Date(occurrence.start).getTime() === target.getTime(),
-  );
-  if (!exists) {
-    throw new Error(
-      `Момент instanceStart «${instanceStart}» не совпадает ни с одним экземпляром серии. ` +
-        "Проверьте время начала конкретного вхождения, например через list_events.",
-    );
-  }
-}
-
-// Находка ревью (Critical, круг 1): buildEvent всегда собирает СВЕЖИЙ
-// VCALENDAR с единственным VEVENT (плюс VTIMEZONE). Если подменить им весь
-// объект целиком (как было раньше в all_series), теряются любые прочие
-// подкомпоненты, уже лежавшие в объекте, — в первую очередь переопределения
-// экземпляров с RECURRENCE-ID, добавленные более ранней правкой со
-// scope "this". Вместо пересборки всего объекта заменяем в ИСХОДНОМ
-// разобранном компоненте только master VEVENT (и его VTIMEZONE) на
-// свежесобранные из buildEvent — остальные подкомпоненты остаются как есть.
-// Тот же принцип «править на месте, не пересобирать», что deleteEvent
-// (задача 14) применил для scope this_and_following (см. там).
-//
-// Предполагается, что master — первый субкомпонент VEVENT объекта (так
-// veventOf его и находит): это тот же порядок, в котором его кладёт сюда
-// этот же модуль (master создаётся первым, переопределения добавляются
-// после через addSubcomponent), поэтому не нарушается собственными
-// операциями. Тот же порядок предполагает и deleteEvent.
-function replaceMaster(originalIcs: string, patchedIcs: string): string {
-  const { root, vevent: master } = veventOf(originalIcs);
-  const built = veventOf(patchedIcs);
-
-  for (const vtimezone of root.getAllSubcomponents("vtimezone")) {
-    root.removeSubcomponent(vtimezone);
-  }
-  root.removeSubcomponent(master);
-  for (const vtimezone of built.root.getAllSubcomponents("vtimezone")) {
-    root.addSubcomponent(vtimezone);
-  }
-  root.addSubcomponent(built.vevent);
-  return root.toString();
-}
-
-// Находка ревью (Critical, круг 1): без поиска и удаления уже существующего
-// переопределения с той же парой UID+RECURRENCE-ID повторная правка одного
-// и того же экземпляра копит дубликаты — по RFC 5545 §3.8.4.4 два
-// компонента с одинаковой парой UID/RECURRENCE-ID делают объект невалидным,
-// а поведение серверов и клиентов на таких данных не определено.
-function removeExistingOverride(root: ICAL.Component, uid: string, instant: Date): void {
-  for (const candidate of root.getAllSubcomponents("vevent")) {
-    const recurrenceIdProperty = candidate.getFirstProperty("recurrence-id");
-    if (!recurrenceIdProperty) continue; // master — не переопределение
-    if (String(candidate.getFirstPropertyValue("uid") ?? "") !== uid) continue;
-    const value = recurrenceIdProperty.getFirstValue() as ICAL.Time;
-    if (value.toJSDate().getTime() === instant.getTime()) {
-      root.removeSubcomponent(candidate);
-    }
-  }
-}
-
-export async function updateEvent(
-  context: Context,
-  params: UpdateParams,
-): Promise<CalendarEvent> {
-  const calendar = await context.resolveCalendar(params.calendarId);
-  if (calendar.readOnly) {
-    throw new Error(`Календарь «${calendar.displayName}» открыт только для чтения.`);
-  }
-
-  const object = await getFor(context)(calendar, params.id);
-  const current = parseEvent(object.ics, calendar.id, object.etag);
-  const scope: EditScope = params.scope ?? "this";
-  const put = putFor(context);
-  const merged = merge(current, params.patch);
-
-  // Одиночное событие или правка сразу всей серии: правится сам исходный
-  // компонент, без RECURRENCE-ID и без второй серии.
-  if (!current.recurrence || scope === "all_series") {
-    const { ics } = buildEvent({ ...merged, id: params.id }, buildOptionsFor(context));
-    // replaceMaster (не голый ics из buildEvent) — иначе переопределения
-    // экземпляров, уже лежащие в объекте, пропадут молча (находка ревью,
-    // Critical, круг 1). Для одиночного события без переопределений это
-    // эквивалентно прежнему поведению.
-    const etag = await put(object.href, replaceMaster(object.ics, ics), { ifMatch: object.etag });
-    return { ...merged, id: params.id, href: object.href, etag };
-  }
-
-  // Дальше — правка повторяющегося события с прицелом на конкретный
-  // экземпляр ("this" или "this_and_following"): без instanceStart непонятно,
-  // какое вхождение серии имеется в виду.
-  if (!params.instanceStart) {
-    throw new Error(
-      "Для правки повторяющегося события укажите instanceStart — начало того экземпляра, который меняем. Либо передайте scope: \"all_series\", чтобы изменить всю серию.",
-    );
-  }
-
-  assertInstanceExists(object.ics, calendar.id, params.instanceStart);
-  // current.recurrence уже проверен выше (первый if вернул бы раньше, если
-  // бы его не было) — фиксируем это в локальной переменной, чтобы TypeScript
-  // не терял сужение типа после промежуточных вызовов функций.
-  const recurrence: Recurrence = current.recurrence;
-
-  if (scope === "this") {
-    // Экземпляр правим относительно ЕГО СОБСТВЕННОГО времени (instanceStart),
-    // а не относительно времени первого вхождения серии (current.start) —
-    // иначе правка одного только summary у второго и последующих экземпляров
-    // молча переносила бы их на время самого первого вхождения серии.
-    const duration = new Date(current.end).getTime() - new Date(current.start).getTime();
-    const instanceEnd = new Date(new Date(params.instanceStart).getTime() + duration).toISOString();
-    const instanceMerged = merge(
-      { ...current, start: params.instanceStart, end: instanceEnd },
-      params.patch,
-    );
-
-    const { root } = veventOf(object.ics);
-    // Находка ревью (Critical, круг 1): без этого повторная правка того же
-    // экземпляра копит дубликаты переопределений с одинаковой парой
-    // UID+RECURRENCE-ID — по RFC 5545 такой объект невалиден. Убираем
-    // прежнее переопределение ЭТОГО экземпляра (если оно уже было), прежде
-    // чем добавлять новое.
-    removeExistingOverride(root, params.id, new Date(params.instanceStart));
-    const override = veventOf(
-      buildEvent({ ...instanceMerged, id: params.id, recurrence: undefined }, buildOptionsFor(context)).ics,
-    ).vevent;
-    const recurrenceId = override.addPropertyWithValue(
-      "recurrence-id",
-      icalTimeOf(params.instanceStart, current.timeZone),
-    );
-    if (!current.allDay) recurrenceId.setParameter("tzid", current.timeZone);
-    root.addSubcomponent(override);
-
-    const etag = await put(object.href, root.toString(), { ifMatch: object.etag });
-    return {
-      ...instanceMerged,
-      id: params.id,
-      href: object.href,
-      etag,
-      instanceStart: params.instanceStart,
-    };
-  }
-
-  // scope === "this_and_following": у исходной серии выставляется UNTIL на
-  // момент перед правимым экземпляром, и создаётся новая серия с новым UID и
-  // изменёнными полями — здесь UID выдаём мы сами, поэтому hrefFor уместен.
-  const boundary = new Date(new Date(params.instanceStart).getTime() - 1000).toISOString();
-
-  // Находка ревью (Critical, круг 1): усечение раньше пересобирало весь
-  // объект через buildEvent(current...) — то же самое, что уже сломало
-  // all_series выше, теряло переопределения и прочие подкомпоненты (сама
-  // серия только что могла нести переопределение экземпляра, добавленное
-  // предыдущей правкой со scope "this"). Вместо пересборки мутируем RRULE
-  // ПРЯМО в исходном разобранном компоненте — тот же приём, что deleteEvent
-  // (задача 14) применяет для этого же scope: остальные подкомпоненты
-  // (переопределения, VALARM, ATTENDEE и т. д.) остаются как есть.
-  const { root: originalRoot, vevent: originalMaster } = veventOf(object.ics);
-  const rruleProperty = originalMaster.getFirstProperty("rrule");
-  if (!rruleProperty) throw new Error("В повторяющемся событии нет свойства RRULE.");
-  const recur = rruleProperty.getFirstValue() as ICAL.Recur;
-  // UNTIL обязан быть в UTC (RFC 5545 §3.3.10) — тот же приём, что и в
-  // toRrule (src/ical/build.ts): useUTC=true без convertToZone.
-  recur.until = ICAL.Time.fromJSDate(new Date(boundary), true);
-  recur.count = null;
-  rruleProperty.setValue(recur);
-  await put(object.href, originalRoot.toString(), { ifMatch: object.etag });
-
-  // COUNT — предел ОТНОСИТЕЛЬНЫЙ (число повторов от DTSTART серии), в
-  // отличие от UNTIL (абсолютная дата, которая остаётся верной точкой
-  // отсечения без изменений и переносится в новую серию как есть через
-  // merged.recurrence). Если перенести recurrence.count в новую серию не
-  // тронув, общее число повторов превысит то, что было в исходной серии:
-  // часть уже прожита в усечённом «хвосте», а новая серия добавит ещё
-  // столько же. Пересчитываем остаток — если только пользователь не задал
-  // recurrence патчем явно, тогда это его осознанный выбор, и трогать его
-  // не нужно.
-  let continuationRecurrence = merged.recurrence;
-  if (!params.patch.recurrence && recurrence.count) {
-    const kept = occurrencesBefore(object.ics, calendar.id, params.instanceStart);
-    const remaining = recurrence.count - kept;
-    if (remaining > 0) continuationRecurrence = { ...recurrence, count: remaining };
-  }
-
-  const continuation = buildEvent(
-    {
-      ...merged,
-      recurrence: continuationRecurrence,
-      id: randomUUID(),
-      start: params.patch.start ?? params.instanceStart,
-      end:
-        params.patch.end ??
-        new Date(
-          new Date(params.instanceStart).getTime() +
-            (new Date(current.end).getTime() - new Date(current.start).getTime()),
-        ).toISOString(),
-    },
-    buildOptionsFor(context),
-  );
-  const continuationHref = hrefFor(calendar, continuation.uid);
-
-  // Находка ревью (Important): две записи здесь неатомарны — CalDAV не даёт
-  // транзакций, а исходная серия к этому моменту уже усечена (put выше
-  // прошёл успешно). Если эта, вторая запись отвалится, будущие встречи
-  // молча пропадут: они не попадут ни в старую серию (она обрезана), ни в
-  // новую (она не создалась). Отката нет (решение контроллера — транзакций
-  // всё равно не даёт CalDAV), но отказ обязан явно назвать, что произошло
-  // и что проверить, а не уйти наружу голым сообщением уровня CalDAV.
-  let etag: string;
-  try {
-    etag = await put(continuationHref, continuation.ics, { ifNoneMatch: true });
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
-    throw new Error(
-      `Серия усечена по ${params.instanceStart}, но новая часть серии не создана: ${reason}. ` +
-        `Проверьте календарь «${calendar.displayName}»: начиная с ${params.instanceStart} события ` +
-        "могут отсутствовать — досоздайте их вручную (create_event/create_events) или повторите update_event.",
-      { cause: error },
-    );
-  }
-
-  return {
-    ...merged,
-    recurrence: continuationRecurrence,
-    id: continuation.uid,
-    href: continuationHref,
-    etag,
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Удаление событий (задача 14) — единственная необратимая операция сервера.
-// ---------------------------------------------------------------------------
 
 export interface DeleteParams {
   calendarId?: string;
   id: string;
   scope?: EditScope;
   instanceStart?: string;
+  confirm?: boolean;
+  /**
+   * ETag состояния, которое пользователь видел последним. Несовпадение —
+   * отказ без единой записи: удаляется то, что показали, а не то, что успел
+   * записать другой клиент между показом и вызовом.
+   *
+   * По смыслу удаления он обязателен, и необязательным оставлен только
+   * потому, что средство delete_event его пока не принимает: сделать его
+   * обязательным здесь значит сегодня же сломать удаление целиком. Как
+   * только схема средства получит поле, его следует затребовать.
+   */
+  etag?: string;
 }
 
-type RemoveFn = (href: string, etag?: string) => Promise<void>;
-
-// Тот же приём внедрения зависимости, что у get/putFor выше: тесты
-// подставляют context.remove вместо похода в сеть. По умолчанию — настоящий
-// DELETE с If-Match на etag, снятым с ответа сервера (см. getFor): для
-// необратимой операции недопустимо ни угадывать путь, ни отправлять запрос
-// без условного заголовка, если etag известен.
-function removeFor(context: Context): RemoveFn {
-  const injected = (context as unknown as { remove?: RemoveFn }).remove;
-  if (injected) return injected;
-  return (href, etag) => deleteObject(context.client, href, etag);
+/** Ответ правки. */
+export interface UpdateResult {
+  /** UID объекта, который несёт встречу после правки (у разреза — продолжения). */
+  id: string;
+  calendarId: string;
+  href: string;
+  /** ETag после записи; "" — сервер его не прислал (перечитыванием не добирается). */
+  etag: string;
+  scope: EditScope;
+  /** Адрес правимой встречи, как его передал вызывающий. */
+  instanceStart?: string;
+  /** false — менять было нечего, на сервер ничего не ушло. */
+  changed: boolean;
+  /** Встречи, которых правка лишила, — то же, что подтверждалось confirm. */
+  removed: Loss[];
+  /** Пояснения по-русски о том, что правка сделала не буквально. */
+  notices: string[];
+  /** Исходная серия после разреза «эта и следующие». */
+  series?: { id: string; href: string; etag: string };
+  /** Событие, каким оно записано. */
+  event?: CalendarEvent;
 }
 
-export async function deleteEvent(
-  context: Context,
-  params: DeleteParams,
-): Promise<{ deleted: string; scope: EditScope }> {
-  const calendar = await context.resolveCalendar(params.calendarId);
-  if (calendar.readOnly) {
-    throw new Error(`Календарь «${calendar.displayName}» открыт только для чтения.`);
+/** Ответ удаления. */
+export interface DeleteResult {
+  /** Что удалено: адрес встречи, «адрес и далее» или сам идентификатор события. */
+  deleted: string;
+  id: string;
+  calendarId: string;
+  scope: EditScope;
+  /** Объект удалён с сервера целиком (в нём не осталось ни одной встречи). */
+  objectRemoved: boolean;
+  /** Встречи, которых удаление лишило сверх названной. */
+  removed: Loss[];
+  notices: string[];
+  href: string;
+}
+
+/**
+ * Отказ правки или удаления, переведённый для пользователя: к тексту
+ * планировщика добавлены перечень потерь и etag, которым их подтверждают.
+ * Поля `code`, `needsConfirm`, `losses` и `hint` — те же, что у отказа
+ * планировщика: по ним вызывающий различает причины.
+ */
+export class EditRefused extends EditRefusal {
+  /** ETag прочитанного состояния: его передают вместе с confirm. */
+  readonly etag: string;
+
+  constructor(refusal: EditRefusal, etag: string) {
+    super(refusal.code, textOfRefusal(refusal, etag), {
+      needsConfirm: refusal.needsConfirm,
+      losses: refusal.losses,
+      hint: refusal.hint,
+    });
+    this.name = "EditRefusal";
+    this.etag = etag;
+    this.cause = refusal;
+  }
+}
+
+function textOfRefusal(refusal: EditRefusal, etag: string): string {
+  const parts = [refusal.message];
+  if (refusal.losses.length > 0) {
+    parts.push(`Будет потеряно: ${refusal.losses.map(describeLoss).join("; ")}.`);
+  }
+  if (refusal.hint) parts.push(refusal.hint);
+  if (refusal.needsConfirm && etag) {
+    parts.push(`Подтвердить эти потери можно повтором того же вызова с confirm: true и etag ${etag}.`);
+  }
+  return parts.join(" ");
+}
+
+function describeLoss(loss: Loss): string {
+  const title = loss.summary ? ` «${loss.summary}»` : "";
+  const when = loss.start && loss.start !== loss.instanceStart ? ` (фактически ${loss.start})` : "";
+  return `${loss.instanceStart}${title}${when} — ${loss.reason}`;
+}
+
+/**
+ * Прочитанное состояние объекта: путь, ETag и дайджест для доставки.
+ *
+ * Дайджест считается лениво (и один раз): у давней частой серии он стоит
+ * около секунды, а нужен он только там, где ответа сервера не было и исход
+ * выясняется перечитыванием. На обычном пути он не считается вовсе.
+ */
+function knownState(raw: RawObject, uid: string, env: IcalEnv): KnownState {
+  let digest: string | undefined;
+  return {
+    uid,
+    href: raw.href,
+    etag: raw.etag,
+    get digest(): string {
+      return (digest ??= semanticDigest(raw.ics, env));
+    },
+  };
+}
+
+interface Loaded {
+  raw: RawObject;
+  object: CalendarObject | Unparsable;
+  before: KnownState;
+}
+
+async function readForEdit(io: DeliveryIO, calendar: Calendar, uid: string, env: IcalEnv): Promise<Loaded> {
+  const raw = await io.find(calendar, uid);
+  if (!raw) {
+    throw new EventNotFoundError(
+      `Событие с идентификатором «${uid}» не найдено в календаре «${calendar.displayName}».`,
+    );
+  }
+  return { raw, object: loadObject(raw.ics, env), before: knownState(raw, uid, env) };
+}
+
+/**
+ * Отказ по устаревшему etag: пользователь назвал состояние, которого на
+ * сервере уже нет. Своя ошибка, а не отказ планировщика: о состоянии
+ * сервера планировщик не знает.
+ */
+export class StaleEtagError extends Error {
+  readonly code = "stale-etag";
+  readonly needsConfirm = false;
+  readonly losses: readonly Loss[] = [];
+  readonly hint = "Перечитайте событие (get_event или list_events) и повторите вызов с новым etag.";
+  /** ETag состояния, которое лежит на сервере сейчас. */
+  readonly etag: string;
+
+  constructor(what: string, given: string, current: string) {
+    super(
+      `${what} с etag ${given}, а событие на сервере уже изменилось (сейчас его etag ${current}): ` +
+        "возможно, его правил другой клиент, и на экране не то, что на сервере. Ничего не записано. " +
+        "Перечитайте событие (get_event или list_events) и повторите вызов с новым etag.",
+    );
+    this.name = "EditRefusal";
+    this.etag = current;
+  }
+}
+
+/**
+ * Построить план и сверить его с предохранителем. Запись отсюда не уходит:
+ * всё, что здесь отказало, не тронуло сервер.
+ *
+ * `patch` передаётся предохранителю ВСЕГДА, когда он есть у планировщика, —
+ * это договор guard.ts: без патча часть проверок молчит. У удаления патча
+ * нет вовсе, и он не передаётся.
+ */
+function runPlan(
+  beforeIcs: string,
+  plan: () => WritePlan,
+  env: IcalEnv,
+  now: Date,
+  patch: EventPatch | undefined,
+  etag: string,
+): WritePlan {
+  let built: WritePlan;
+  try {
+    built = plan();
+  } catch (error) {
+    if (error instanceof EditRefusal) throw new EditRefused(error, etag);
+    throw error;
+  }
+  verifyPlan(beforeIcs, built, env, patch === undefined ? { now } : { now, patch });
+  return built;
+}
+
+/** Что легло на сервер. */
+interface Written {
+  href: string;
+  etag: string;
+  objectRemoved: boolean;
+  /** UID объекта, который несёт встречу после записи. */
+  uid: string;
+  /** Текст этого объекта — из него строится событие ответа. */
+  ics?: string;
+  /** Исходная серия после разреза. */
+  series?: { id: string; href: string; etag: string };
+}
+
+async function applyPlan(
+  io: DeliveryIO,
+  calendar: Calendar,
+  plan: WritePlan,
+  before: KnownState,
+  env: IcalEnv,
+): Promise<Written> {
+  switch (plan.kind) {
+    case "noop":
+      return { href: before.href, etag: before.etag, objectRemoved: false, uid: before.uid };
+    case "put": {
+      const done = await deliver(io, calendar, { kind: "put", ics: plan.ics }, before, env);
+      return { href: done.href, etag: done.etag, objectRemoved: false, uid: before.uid, ics: plan.ics };
+    }
+    case "delete-object": {
+      const done = await deliver(io, calendar, { kind: "delete" }, before, env);
+      return { href: done.href, etag: "", objectRemoved: true, uid: before.uid };
+    }
+    case "split": {
+      const done = await writeSplit(io, calendar, before, { continuation: plan.continuation, truncated: plan.truncated }, env);
+      return {
+        href: done.continuation.href,
+        etag: done.continuation.etag,
+        objectRemoved: false,
+        uid: plan.continuation.uid,
+        ics: plan.continuation.ics,
+        series: { id: before.uid, href: done.truncated.href, etag: done.truncated.etag },
+      };
+    }
+  }
+}
+
+/** Событие, каким его записали, — из текста плана, без похода на сервер. */
+function writtenEvent(written: Written, calendar: Calendar, env: IcalEnv, fallback: string): CalendarEvent {
+  const ics = written.ics ?? fallback;
+  return eventOfObject(loadObject(ics, env), { calendarId: calendar.id, etag: written.etag, href: written.href }, env);
+}
+
+export async function updateEvent(context: Context, params: UpdateParams): Promise<UpdateResult> {
+  assertOwnerEmail(context);
+  const calendar = await writableCalendar(context, params.calendarId);
+  const env = envFor(context);
+  const now = nowOf(context);
+  const io = ioFor(context);
+
+  const { raw, object, before } = await readForEdit(io, calendar, params.id, env);
+  // У правки без confirm etag необязателен: патч ложится на свежее
+  // состояние, и это честно — правка называет поля, а не переписывает весь
+  // объект. Устаревший etag вместе с confirm ловит планировщик: подтверждать
+  // потери можно только по тому состоянию, в котором их перечислили.
+  const scope: EditScope = params.scope ?? "this";
+  const request = {
+    scope,
+    instanceStart: params.instanceStart,
+    patch: params.patch,
+    confirm: params.confirm,
+    etag: params.etag,
+    now,
+    defaultTimeZone: context.config.defaultTimeZone,
+  };
+
+  let plan: WritePlan;
+  try {
+    plan = runPlan(raw.ics, () => planUpdate(object, { ...request, currentEtag: raw.etag }), env, now, params.patch, raw.etag);
+  } catch (error) {
+    // Разрез этой серии по этой же границе мог быть выполнен раньше: тогда
+    // встреч с границы в исходной серии уже нет, и она честно отвечает «такой
+    // встречи нет». Ответ верный, но бесполезный: разрез не пропал, а уехал в
+    // отдельное событие. Найдём его и скажем об этом.
+    const already = await splitAlreadyDone(io, calendar, object, request, env, now, error);
+    if (already) return already;
+    throw error;
   }
 
-  // ОБЯЗАТЕЛЬНОЕ ОТСТУПЛЕНИЕ ОТ БРИФА: там объект для удаления находился по
-  // `hrefFor(calendar, params.id)`. По тем же причинам, что уже разобраны у
-  // getFor выше (используется updateEvent'ом, задача 13, тот же аргумент —
-  // задача 11): имя файла объекта на сервере Яндекса НЕ выводится из UID
-  // (docs/yandex-caldav-capabilities.md) — собака выбрасывается, а не
-  // кодируется, поэтому собранный путь не совпадёт с реальным почти для
-  // любого события, заведённого не нами (веб, телефон). Для удаления — самой
-  // необратимой операции сервиса — цена ошибки здесь хуже, чем для чтения
-  // или правки: операция либо молча ничего не найдёт, либо (что куда хуже)
-  // попадёт не в тот объект. getFor уже решает это через queryEventByUid и
-  // отдаёт href/etag/ics из ответа сервера — используем ту же функцию, а не
-  // переписываем поиск заново.
-  const object = await getFor(context)(calendar, params.id);
-  const current = parseEvent(object.ics, calendar.id, object.etag);
-  // Умолчание зависит от типа события: у одиночного удалять «экземпляр»
-  // нечего (у него нет отдельного понятия «экземпляр» помимо самого
-  // объекта), поэтому оно сразу трактуется как all_series; у серии по
-  // умолчанию исчезает только названный экземпляр — неточная формулировка
-  // не должна стирать всю серию.
-  const scope: EditScope = params.scope ?? (current.recurrence ? "this" : "all_series");
-  const remove = removeFor(context);
+  const written = await applyPlan(io, calendar, plan, before, env);
+  const result: UpdateResult = {
+    id: written.uid,
+    calendarId: calendar.id,
+    href: written.href,
+    etag: written.etag,
+    scope,
+    changed: plan.kind !== "noop",
+    removed: [...plan.removed],
+    notices: [...plan.notices],
+    event: writtenEvent(written, calendar, env, raw.ics),
+  };
+  if (params.instanceStart !== undefined) result.instanceStart = params.instanceStart;
+  if (written.series) result.series = written.series;
+  return result;
+}
 
-  // Одиночное событие или явная просьба удалить всю серию — удаляется сам
-  // объект, найденный getFor. Ветка одна и та же для обоих случаев: для
-  // одиночного события "экземпляр" и "серия" — один и тот же объект, поэтому
-  // сужать поведение по scope там не на чем.
-  if (!current.recurrence || scope === "all_series") {
-    await remove(object.href, object.etag);
-    return { deleted: params.id, scope: "all_series" };
+/** Запрос правки, как его получает планировщик, без `currentEtag`. */
+type UpdateRequestBody = {
+  scope: EditScope;
+  instanceStart?: string;
+  patch: EventPatch;
+  confirm?: boolean;
+  etag?: string;
+  now: Date;
+  defaultTimeZone?: string;
+};
+
+/**
+ * Повтор уже выполненного разреза «эта и следующие».
+ *
+ * После разреза встречи с границы и дальше живут отдельным объектом с
+ * детерминированным идентификатором: тот же разрез той же серии даёт тот же
+ * идентификатор. Поэтому повторный вызов по исходной серии узнаётся точно —
+ * чтением по этому идентификатору, а не догадками.
+ *
+ * Что отвечаем:
+ * - продолжение есть, и тот же патч на нём ничего не меняет — разрез уже
+ *   выполнен, вызов повторный: успех без единой записи;
+ * - продолжение есть, а патч другой — отказ с идентификатором продолжения:
+ *   резать исходную серию второй раз нечего, а новую правку надо адресовать
+ *   продолжению, иначе она молча пропала бы;
+ * - продолжения нет — это не повтор разреза, и отвечает исходная ошибка.
+ */
+async function splitAlreadyDone(
+  io: DeliveryIO,
+  calendar: Calendar,
+  object: CalendarObject | Unparsable,
+  request: UpdateRequestBody,
+  env: IcalEnv,
+  now: Date,
+  cause: unknown,
+): Promise<UpdateResult | undefined> {
+  if (request.scope !== "this_and_following" || request.instanceStart === undefined) return undefined;
+  if (!(cause instanceof AddressError) || cause.code !== "not-found") return undefined;
+  if (isUnparsable(object)) return undefined;
+
+  let uid: string;
+  try {
+    uid = continuationUid(object.uid, parseAddress(object, request.instanceStart));
+  } catch {
+    return undefined; // адрес не разобрать — отвечает исходная ошибка
+  }
+  const found = await io.find(calendar, uid);
+  if (!found) return undefined;
+
+  const continuation = loadObject(found.ics, env);
+  let plan: WritePlan | undefined;
+  try {
+    plan = runPlan(
+      found.ics,
+      () => planUpdate(continuation, { ...request, currentEtag: found.etag }),
+      env,
+      now,
+      request.patch,
+      found.etag,
+    );
+  } catch {
+    plan = undefined; // патч на продолжении не ложится — тем более это не повтор
   }
 
-  // Дальше — частичное удаление серии ("this" или "this_and_following"):
-  // без instanceStart непонятно, какой именно экземпляр (или начиная с
-  // какого момента) нужно убрать, а гадать в необратимой операции
-  // недопустимо — лучше понятная ошибка, чем удаление наугад.
-  if (!params.instanceStart) {
-    throw new Error(
-      "Для удаления части серии укажите instanceStart — начало удаляемого экземпляра. " +
-        'Либо передайте scope: "all_series", чтобы удалить всю серию целиком.',
+  if (!plan || plan.kind !== "noop") {
+    throw new EditRefused(
+      new EditRefusal(
+        "split-already-done",
+        `Серия уже разрезана по ${request.instanceStart}: встречи с этой границы и дальше живут отдельным событием ` +
+          `(id ${uid}), а в исходной серии их больше нет. Ничего не записано.`,
+        {
+          hint: `Правьте продолжение по его идентификатору: update_event с id ${uid}. Если менять нужно встречи ДО границы, передайте адрес одной из них.`,
+        },
+      ),
+      found.etag,
     );
   }
 
-  // Самопроверка (тот же приём, что и assertInstanceExists в updateEvent
-  // выше): без неё instanceStart, не совпадающий ни с одним настоящим
-  // экземпляром серии (опечатка во времени, чужой часовой пояс), тихо
-  // добавил бы бесполезный EXDATE или UNTIL «в пустоту» — операция выглядела
-  // бы успешной, ничего не удалив, а пользователь решил бы, что экземпляр
-  // убран, хотя он остался на месте в календаре.
-  assertInstanceExists(object.ics, calendar.id, params.instanceStart);
+  return {
+    id: uid,
+    calendarId: calendar.id,
+    href: found.href,
+    etag: found.etag,
+    scope: request.scope,
+    instanceStart: request.instanceStart,
+    changed: false,
+    removed: [],
+    notices: [`Разрез по ${request.instanceStart} уже был выполнен раньше: встречи с этой границы лежат в событии ${uid} и уже такие, как просили. Менять нечего.`],
+    event: eventOfObject(continuation, { calendarId: calendar.id, etag: found.etag, href: found.href }, env),
+  };
+}
 
-  const { root, vevent } = veventOf(object.ics);
+export async function deleteEvent(context: Context, params: DeleteParams): Promise<DeleteResult> {
+  assertOwnerEmail(context);
+  const calendar = await writableCalendar(context, params.calendarId);
+  const env = envFor(context);
+  const now = nowOf(context);
+  const io = ioFor(context);
 
-  if (scope === "this") {
-    // EXDATE, а не удаление объекта: серия остаётся, пропадает только
-    // названный экземпляр. Правим СЫРОЙ компонент (root/vevent из
-    // veventOf), а не пересобираем событие через buildEvent из
-    // распарсенного CalendarEvent, — потому что тип CalendarEvent/Recurrence
-    // не несёт уже существующие EXDATE (parseRecurrence их не читает):
-    // пересборка потеряла бы прежде поставленные исключения серии.
-    const exdate = vevent.addPropertyWithValue(
-      "exdate",
-      icalTimeOf(params.instanceStart, current.timeZone),
-    );
-    // RFC 5545 §3.8.5.1: параметр TZID у EXDATE обязан совпадать с DTSTART
-    // того же VEVENT. Проверено отдельно на живом ical.js: без явного
-    // setParameter("tzid", ...) addPropertyWithValue сериализует EXDATE как
-    // floating-время без зоны ("EXDATE:20261021T100000" вместо
-    // "EXDATE;TZID=...:20261021T100000") — клиенты не смогут надёжно
-    // сопоставить исключение с экземпляром в его настоящем часовом поясе.
-    // allDay-события используют VALUE=DATE без TZID, поэтому параметр
-    // ставится только при явном времени — тот же приём, что у
-    // RECURRENCE-ID в updateEvent выше.
-    if (!current.allDay) exdate.setParameter("tzid", current.timeZone);
-
-    await putFor(context)(object.href, root.toString(), { ifMatch: object.etag });
-    return { deleted: params.instanceStart, scope };
+  const { raw, object, before } = await readForEdit(io, calendar, params.id, env);
+  // Удаление необратимо, поэтому назвать состояние обязательно: удаляется то,
+  // что пользователю показали. Чужая правка, попавшая между показом и
+  // вызовом, — отказ, а не молчаливое стирание.
+  if (params.etag !== undefined && params.etag !== raw.etag) {
+    throw new StaleEtagError("Удаление запрошено", params.etag, raw.etag);
   }
 
-  // scope === "this_and_following": у серии выставляется UNTIL перед
-  // удаляемым экземпляром — сам объект остаётся, просто перестаёт порождать
-  // экземпляры начиная с этого момента. Новая серия (в отличие от
-  // updateEvent) не создаётся: удаление хвоста не переносит вперёд
-  // изменённые поля, продолжать нечему.
-  //
-  // Отступление от брифа: там UNTIL выставлялся через buildEvent(current...)
-  // — пересборку всего VEVENT из распарсенного CalendarEvent (тот же приём,
-  // что updateEvent использует для этого scope). Для удаления это опаснее,
-  // чем для правки: CalendarEvent не несёт уже существующие EXDATE серии
-  // (см. комментарий у scope "this" выше), поэтому пересборка потеряла бы
-  // экземпляры, удалённые РАНЕЕ через scope "this", если они попадают до
-  // новой границы UNTIL, — прежде удалённый экземпляр «воскрес» бы. Здесь
-  // вместо пересборки правится только сам RRULE внутри исходного сырого
-  // компонента (root/vevent из veventOf, тот же объект, что и у "this"
-  // выше) — EXDATE, ATTENDEE, VALARM и всё остальное остаются как есть.
-  // Проверено отдельно на живом ical.js: mutating recur.until/recur.count и
-  // rruleProperty.setValue(recur) корректно переписывают RRULE, не трогая
-  // соседние свойства VEVENT.
-  //
-  // current.recurrence уже проверен веткой выше (иначе мы бы не дошли
-  // сюда), а сам rrule получен именно из него — parseRecurrence в
-  // src/ical/parse.ts читает свойство "rrule" и ничего больше, поэтому оно
-  // гарантированно есть в сыром компоненте.
-  const rruleProperty = vevent.getFirstProperty("rrule");
-  if (!rruleProperty) throw new Error("В повторяющемся событии нет свойства RRULE.");
-  const recur = rruleProperty.getFirstValue() as ICAL.Recur;
-  const boundary = new Date(new Date(params.instanceStart).getTime() - 1000).toISOString();
-  // UNTIL обязан быть в UTC (RFC 5545 §3.3.10) — в отличие от RECURRENCE-ID
-  // и EXDATE, которые обязаны совпадать по представлению с DTSTART. Тот же
-  // приём, что и в toRrule (src/ical/build.ts): useUTC=true без
-  // convertToZone.
-  recur.until = ICAL.Time.fromJSDate(new Date(boundary), true);
-  recur.count = null;
-  rruleProperty.setValue(recur);
+  const scope: EditScope = params.scope ?? "this";
+  const plan = runPlan(
+    raw.ics,
+    () =>
+      planDelete(object, {
+        scope,
+        instanceStart: params.instanceStart,
+        confirm: params.confirm,
+        etag: params.etag,
+        currentEtag: raw.etag,
+        now,
+      }),
+    env,
+    now,
+    undefined,
+    raw.etag,
+  );
 
-  await putFor(context)(object.href, root.toString(), { ifMatch: object.etag });
-  return { deleted: `${params.instanceStart} и далее`, scope };
+  const written = await applyPlan(io, calendar, plan, before, env);
+  return {
+    deleted: deletedAddress(scope, params.instanceStart, params.id, written.objectRemoved),
+    id: params.id,
+    calendarId: calendar.id,
+    scope,
+    objectRemoved: written.objectRemoved,
+    removed: [...plan.removed],
+    notices: [...plan.notices],
+    href: written.href,
+  };
 }
+
+// Что именно удалено, по-русски: у всей серии и у объекта, от которого не
+// осталось встреч, — само событие; у хвоста — «адрес и далее»; у одной
+// встречи — её адрес.
+function deletedAddress(scope: EditScope, instanceStart: string | undefined, id: string, objectRemoved: boolean): string {
+  if (scope === "all_series" || instanceStart === undefined) return id;
+  if (objectRemoved) return id;
+  return scope === "this_and_following" ? `${instanceStart} и далее` : instanceStart;
+}
+
+// UID продолжения разреза считает планировщик; здесь он перевыставлен для
+// вызывающих, которым нужно найти продолжение по исходной серии и границе.
+export { continuationUid };

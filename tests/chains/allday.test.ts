@@ -12,8 +12,8 @@
 //
 // Устройство цепочек — как в foreign.test.ts: только публичные вызовы на
 // изменяемом стенде, instanceStart и etag — из выдачи, отказы — по `code`,
-// сначала проверки данных, потом исход вызова. На текущем коде все цепочки
-// красные — `it.fails`; снимает `.fails` задача З13.
+// сначала проверки данных, потом исход вызова. Пометка it.fails снята: все
+// цепочки этого файла зелёные.
 import { assert, describe, expect, it } from "vitest";
 import { createEvent, deleteEvent, readEvents, updateEvent } from "../../src/domain/events.js";
 import type { CalendarEvent, Context } from "../../src/types.js";
@@ -193,7 +193,7 @@ const DAYS = ["2026-10-19", "2026-10-21", "2026-10-26", "2026-10-28", "2026-11-0
 // ---------------------------------------------------------------------------
 
 describe("З05c: встречи на весь день и время без смещения", () => {
-  it.fails("C19: серия на весь день COUNT=6 — адреса-даты; this 21.10; delete this 26.10; t&f 02.11: VALUE=DATE, COUNT 4 + 2", async () => {
+  it("C19: серия на весь день COUNT=6 — адреса-даты; this 21.10; delete this 26.10; t&f 02.11: VALUE=DATE, COUNT 4 + 2", async () => {
     const { fake, ctx } = makeStand();
     const uid = seeds.allDayWeekly.uid;
     const path = plant(fake, seeds.allDayWeekly);
@@ -270,7 +270,7 @@ describe("З05c: встречи на весь день и время без см
     done(s3, fake);
   });
 
-  it.fails("C19: серия на весь день с UNTIL=DATE — all_series rename хранит UNTIL побайтово; delete t&f 02.11 пишет UNTIL датой", async () => {
+  it("C19: серия на весь день с UNTIL=DATE — all_series rename хранит UNTIL побайтово; delete t&f 02.11 пишет UNTIL датой", async () => {
     const { fake, ctx } = makeStand();
     const uid = seeds.allDayWeekly.uid;
     const path = plant(fake, {
@@ -312,7 +312,7 @@ describe("З05c: встречи на весь день и время без см
     done(s2, fake);
   });
 
-  it.fails("C36: create и update со start без смещения — стенное время пояса события, не пояса процесса", async () => {
+  it("C36: create и update со start без смещения — стенное время пояса события, не пояса процесса", async () => {
     // Пояс события — не пояс ни одного из трёх прогонов test:tz (UTC,
     // Europe/Moscow, America/New_York) и не пояс календаря по умолчанию.
     const zone = "Asia/Yekaterinburg";
@@ -384,7 +384,7 @@ describe("З05c: встречи на весь день и время без см
     done(s4, fake);
   });
 
-  it.fails("C47: весь день — instanceStart «…T21:00:00Z» отклоняется как invalid; «…T00:00:00+00:00» — буквальная дата", async () => {
+  it("C47: весь день — instanceStart «…T21:00:00Z» отклоняется как invalid; «…T00:00:00+00:00» — буквальная дата", async () => {
     const { fake, ctx } = makeStand();
     const uid = seeds.allDayWeekly.uid;
     const path = plant(fake, seeds.allDayWeekly);

@@ -1,492 +1,391 @@
-import { readFileSync } from "node:fs";
-import { describe, expect, it, vi } from "vitest";
-import { updateEvent } from "../../src/domain/events.js";
-import type { Calendar } from "../../src/types.js";
-import type { CaldavClient } from "../../src/caldav/request.js";
+// Правка событий: домен ведёт её единственным путём — чтение объекта →
+// планировщик (src/ical/edit.ts) → предохранитель (src/ical/guard.ts) →
+// доставка (src/domain/writes.ts). Второго пути правки нет: прежний,
+// собиравший объект заново из разобранной модели, убран целиком.
+//
+// Стенд — настоящий фейковый сервер tests/support (весь путь домен → CalDAV
+// → транспорт исполняется боевым кодом), кроме случаев, где нужен исход
+// записи, которого стенд не изображает: там подставляется `Context.io`.
+import { describe, expect, it } from "vitest";
+import { readEvents, updateEvent } from "../../src/domain/events.js";
+import type { Calendar, CalendarEvent, Context, EditScope, ObjectIO, RawObject } from "../../src/types.js";
+import { hrefFor } from "../../src/caldav/objects.js";
+import { calendarA, makeStand, plant } from "../support/context.js";
+import type { FakeCaldav } from "../support/fakeCaldav.js";
+import { DEFAULT_WINDOW, describeStand, visible, wallTime } from "../support/observe.js";
+import { singleMoscow, weeklyMoscow } from "../support/seeds.js";
 
-const weekly = readFileSync("tests/fixtures/weekly.ics", "utf8");
-const simple = readFileSync("tests/fixtures/simple.ics", "utf8");
+const ZONE = "Europe/Moscow";
 
-const calendar: Calendar = {
-  id: "work",
-  href: "/c/work/",
-  displayName: "Работа",
-  readOnly: false,
-};
+interface UpdateCall {
+  calendarId?: string;
+  id: string;
+  scope?: EditScope;
+  instanceStart?: string;
+  patch: Record<string, unknown>;
+  etag?: string;
+  confirm?: boolean;
+}
 
-/** Логин владельца (Config.login): полный адрес, как требует Яндекс. */
-const OWNER = "owner@yandex.ru";
+function update(ctx: Context, call: UpdateCall) {
+  return updateEvent(ctx, call as unknown as Parameters<typeof updateEvent>[1]);
+}
 
-function contextWith(ics: string) {
-  const put = vi.fn().mockResolvedValue('"etag-new"');
-  const get = vi.fn().mockResolvedValue({ href: "/c/work/x.ics", etag: '"etag-old"', ics });
+async function list(ctx: Context): Promise<CalendarEvent[]> {
+  return readEvents(ctx, DEFAULT_WINDOW);
+}
+
+/** Встреча серии по дате её слота в поясе показа; адрес — только из выдачи. */
+function at(events: CalendarEvent[], date: string): CalendarEvent {
+  const found = events.filter((event) => event.instanceStart !== undefined && wallTime(event.instanceStart, ZONE).startsWith(date));
+  expect(found.map((event) => event.instanceStart), `ровно одна встреча со слотом ${date}`).toHaveLength(1);
+  return found[0];
+}
+
+/** Записи стенда после отметки: метод и путь. */
+function writes(fake: FakeCaldav, mark: number): string[] {
+  return fake.writesSince(mark).map((entry) => `${entry.method} ${entry.path}`);
+}
+
+function weeklyStand() {
+  const stand = makeStand();
+  return { ...stand, path: plant(stand.fake, weeklyMoscow) };
+}
+
+function singleStand() {
+  const stand = makeStand();
+  return { ...stand, path: plant(stand.fake, singleMoscow) };
+}
+
+/** Поля отказа: они и различают причины. */
+function refusalOf(error: unknown): { code?: unknown; needsConfirm?: unknown; losses?: unknown[]; message: string } {
+  const fields = (typeof error === "object" && error !== null ? error : {}) as Record<string, unknown>;
   return {
-    context: {
-      client: {} as never,
-      config: { defaultTimeZone: "Europe/Moscow", login: OWNER } as never,
-      calendars: async () => [calendar],
-      resolveCalendar: async () => calendar,
-      get,
-      put,
-    },
-    put,
-    get,
+    code: fields.code,
+    needsConfirm: fields.needsConfirm,
+    losses: fields.losses as unknown[] | undefined,
+    message: error instanceof Error ? error.message : String(error),
   };
 }
 
-describe("updateEvent", () => {
-  it("правит всю серию и шлёт If-Match со свежим ETag", async () => {
-    const { context, put } = contextWith(weekly);
+async function refused(run: () => Promise<unknown>): Promise<ReturnType<typeof refusalOf>> {
+  try {
+    await run();
+  } catch (error) {
+    return refusalOf(error);
+  }
+  throw new Error("ожидался отказ, а вызов прошёл");
+}
 
-    await updateEvent(context as never, {
-      id: "test-weekly-1",
-      scope: "all_series",
-      patch: { summary: "Проект «Заря» — новое название" },
-    });
+describe("updateEvent: один путь записи", () => {
+  it("вся серия: один PUT с If-Match прочитанного ETag, правило цело", async () => {
+    const { fake, ctx, path } = weeklyStand();
+    const etag = fake.etag(path);
 
-    const [, ics, options] = put.mock.calls[0];
-    expect(options.ifMatch).toBe('"etag-old"');
-    expect(ics).toContain("новое название");
-    expect(ics).toContain("RRULE");
+    const mark = fake.mark();
+    const result = await update(ctx, { id: weeklyMoscow.uid, scope: "all_series", patch: { summary: "Планёрка отдела" } });
+
+    const log = fake.writesSince(mark);
+    expect(log.map((entry) => `${entry.method} ${entry.path}`)).toEqual([`PUT ${path}`]);
+    expect(log[0].ifMatch, "запись условна по прочитанному ETag").toBe(etag);
+    expect(fake.ics(path)).toContain("RRULE:FREQ=WEEKLY;BYDAY=MO,WE;COUNT=6");
+    expect(result.changed).toBe(true);
+    expect(result.scope).toBe("all_series");
+    expect(await visible(ctx)).toEqual([
+      "2026-10-19 10:00–11:00 Планёрка отдела",
+      "2026-10-21 10:00–11:00 Планёрка отдела",
+      "2026-10-26 10:00–11:00 Планёрка отдела",
+      "2026-10-28 10:00–11:00 Планёрка отдела",
+      "2026-11-02 10:00–11:00 Планёрка отдела",
+      "2026-11-04 10:00–11:00 Планёрка отдела",
+    ]);
   });
 
-  it("не трогает поля, которых нет в патче", async () => {
-    const { context, put } = contextWith(simple);
+  it("не трогает полей, которых нет в патче", async () => {
+    const { fake, ctx, path } = singleStand();
+    const before = fake.ics(path);
 
-    await updateEvent(context as never, {
-      id: "test-simple-1",
-      scope: "all_series",
-      patch: { location: "Офис" },
-    });
+    await update(ctx, { id: singleMoscow.uid, patch: { location: "Офис" } });
 
-    const ics = put.mock.calls[0][1];
-    expect(ics).toContain("LOCATION:Офис");
-    expect(ics).toContain("первая половина дня");
-  });
-
-  it("при scope this добавляет исключение с RECURRENCE-ID", async () => {
-    const { context, put } = contextWith(weekly);
-
-    await updateEvent(context as never, {
-      id: "test-weekly-1",
-      scope: "this",
-      instanceStart: "2026-10-21T10:00:00+03:00",
-      patch: { summary: "Перенесённая встреча" },
-    });
-
-    const ics = put.mock.calls[0][1];
-    expect(ics).toContain("RECURRENCE-ID");
-    expect(ics).toContain("Перенесённая встреча");
-    expect(ics).toContain("RRULE");
-  });
-
-  // Получатель напоминания письмом — владелец календаря (Config.login).
-  // Каждый разрез собирает свой текст (правка серии, переопределение
-  // экземпляра, продолжение), и адрес обязан дойти до каждого.
-  it.each(["all_series", "this", "this_and_following"] as const)(
-    "проводит адрес владельца в напоминание письмом (scope %s)",
-    async (scope) => {
-      const { context, put } = contextWith(weekly);
-
-      await updateEvent(context as never, {
-        id: "test-weekly-1",
-        scope,
-        instanceStart: "2026-10-21T10:00:00+03:00",
-        patch: { reminders: [{ minutesBefore: 30, method: "email" }] },
-      });
-
-      const byEmail = put.mock.calls
-        .map(([, ics]) => ics as string)
-        .filter((ics) => ics.includes("ACTION:EMAIL"));
-      expect(byEmail.length).toBeGreaterThan(0);
-      for (const ics of byEmail) expect(ics).toContain(`ATTENDEE:mailto:${OWNER}`);
-    },
-  );
-
-  it("требует instanceStart при scope this", async () => {
-    const { context } = contextWith(weekly);
-
-    await expect(
-      updateEvent(context as never, {
-        id: "test-weekly-1",
-        scope: "this",
-        patch: { summary: "Без экземпляра" },
-      }),
-    ).rejects.toThrow(/instanceStart/);
-  });
-
-  it("при scope this_and_following обрезает серию и создаёт новую", async () => {
-    const { context, put } = contextWith(weekly);
-
-    await updateEvent(context as never, {
-      id: "test-weekly-1",
-      scope: "this_and_following",
-      instanceStart: "2026-11-02T10:00:00+03:00",
-      patch: { summary: "Новая часть серии" },
-    });
-
-    expect(put).toHaveBeenCalledTimes(2);
-    expect(put.mock.calls[0][1]).toContain("UNTIL=");
-    expect(put.mock.calls[1][1]).toContain("Новая часть серии");
-    expect(put.mock.calls[1][2].ifNoneMatch).toBe(true);
-  });
-
-  it("по умолчанию использует scope this, а не всю серию", async () => {
-    const { context, put } = contextWith(weekly);
-
-    await updateEvent(context as never, {
-      id: "test-weekly-1",
-      instanceStart: "2026-10-21T10:00:00+03:00",
-      patch: { summary: "Только этот" },
-    });
-
-    expect(put.mock.calls[0][1]).toContain("RECURRENCE-ID");
-  });
-
-  // ---------------------------------------------------------------------
-  // Дополнительные тесты, требуемые диспетчером задачи 13 сверх брифа.
-  // ---------------------------------------------------------------------
-
-  describe("путь к объекту берётся от сервера, а не собирается из UID", () => {
-    // Задача 1 (docs/yandex-caldav-capabilities.md): имя файла объекта на
-    // сервере Яндекса не выводится из UID. UID "aaaabbbbccccdddd11@yandex.ru"
-    // хранится как объект "aaaabbbbccccdddd11yandex.ru.ics" — собака
-    // выброшена, а не закодирована. Этот тест НЕ подставляет context.get —
-    // он идёт через настоящий getFor→queryEventByUid поверх фиктивного
-    // CaldavClient, поэтому падает на реализации, которая находит объект по
-    // hrefFor(calendar, uid) (как было в брифе), а не по ответу сервера.
-    const uid = "aaaabbbbccccdddd11@yandex.ru";
-    const realHref = "/c/work/aaaabbbbccccdddd11yandex.ru.ics";
-    const hrefFromUid = `/c/work/${encodeURIComponent(uid)}.ics`;
-
-    function multistatusFor(href: string): string {
-      return `<?xml version="1.0"?>
-<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
-  <d:response>
-    <d:href>${href}</d:href>
-    <d:propstat><d:prop>
-      <d:getetag>1789383239000</d:getetag>
-      <c:calendar-data>BEGIN:VCALENDAR
-VERSION:2.0
-BEGIN:VEVENT
-UID:aaaabbbbccccdddd11@yandex.ru
-DTSTAMP:20261001T090000Z
-DTSTART;TZID=Europe/Moscow:20261019T100000
-DTEND;TZID=Europe/Moscow:20261019T140000
-SUMMARY:Событие с собакой в UID
-END:VEVENT
-END:VCALENDAR</c:calendar-data>
-    </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
-  </d:response>
-</d:multistatus>`;
+    const after = fake.ics(path);
+    expect(after).toContain("LOCATION:Офис");
+    // Заголовок и время прежние — их патч не называл.
+    for (const line of before.split("\r\n")) {
+      if (line.startsWith("SUMMARY:") || line.startsWith("DTSTART") || line.startsWith("DTEND")) {
+        expect(after, `строка «${line}» обязана была уцелеть`).toContain(line);
+      }
     }
-
-    // Один и тот же фиктивный ответ на любой request(): для REPORT (поиск по
-    // UID) отдаёт multistatus с событием, для последующего PUT — тот же
-    // текст не важен, важен только путь (request.mock.calls[...][0].path).
-    function fakeClient(text: string) {
-      const request = vi.fn().mockResolvedValue({
-        status: 207,
-        headers: new Headers(),
-        text,
-      });
-      return { client: { request } as unknown as CaldavClient, request };
-    }
-
-    function contextFor(client: CaldavClient) {
-      return {
-        client,
-        config: { defaultTimeZone: "Europe/Moscow", login: OWNER } as never,
-        calendars: async () => [calendar],
-        resolveCalendar: async () => calendar,
-      };
-    }
-
-    it("находит событие по ответу сервера и пишет по этому пути, а не по hrefFor(calendar, uid)", async () => {
-      const { client, request } = fakeClient(multistatusFor(realHref));
-
-      await updateEvent(contextFor(client) as never, {
-        id: uid,
-        patch: { summary: "Новое название" },
-      });
-
-      expect(request.mock.calls[0][0].method).toBe("REPORT");
-      expect(request.mock.calls[0][0].path).toBe("/c/work/");
-      expect(request.mock.calls[0][0].body).toContain('<c:prop-filter name="UID">');
-
-      const putCall = request.mock.calls.find((call) => call[0].method === "PUT");
-      expect(putCall).toBeDefined();
-      // Ключевая проверка: путь записи взят из ответа сервера, а не построен
-      // через hrefFor(calendar, uid) — эти два пути для UID с собакой
-      // различаются.
-      expect(putCall![0].path).toBe(realHref);
-      expect(putCall![0].path).not.toBe(hrefFromUid);
-    });
-
-    it("бросает понятную ошибку, если событие с таким UID не найдено", async () => {
-      const empty = `<?xml version="1.0"?><d:multistatus xmlns:d="DAV:"></d:multistatus>`;
-      const { client } = fakeClient(empty);
-
-      await expect(
-        updateEvent(contextFor(client) as never, {
-          id: uid,
-          patch: { summary: "Не найдётся" },
-        }),
-      ).rejects.toThrow(/не найдено/);
-    });
   });
 
-  it("распространяет отказ 412 (конфликт ETag) наружу, а не подавляет его", async () => {
-    const { context, put } = contextWith(simple);
-    put.mockRejectedValueOnce(
-      new Error(
-        "Событие изменили после того, как мы его прочитали. Перечитайте событие и повторите операцию.",
-      ),
+  it("scope this: добавляет переопределение с RECURRENCE-ID, правило серии цело", async () => {
+    const { fake, ctx, path } = weeklyStand();
+    const target = at(await list(ctx), "2026-10-21");
+
+    await update(ctx, { id: weeklyMoscow.uid, scope: "this", instanceStart: target.instanceStart, patch: { summary: "С заказчиком" } });
+
+    const text = fake.ics(path);
+    expect(text).toContain("RECURRENCE-ID;TZID=Europe/Moscow:20261021T100000");
+    expect(text).toContain("SUMMARY:С заказчиком");
+    expect(text).toContain("RRULE:FREQ=WEEKLY;BYDAY=MO,WE;COUNT=6");
+    expect(await visible(ctx)).toContain("2026-10-21 10:00–11:00 С заказчиком");
+  });
+
+  it("scope по умолчанию — this, а не вся серия", async () => {
+    const { ctx } = weeklyStand();
+    const target = at(await list(ctx), "2026-10-21");
+
+    await update(ctx, { id: weeklyMoscow.uid, instanceStart: target.instanceStart, patch: { summary: "Только 21-е" } });
+
+    const seen = await visible(ctx);
+    expect(seen.filter((row) => row.includes("Только 21-е"))).toHaveLength(1);
+  });
+
+  it("требует адрес встречи у серии при scope this: отказ с кодом, без записей", async () => {
+    const { fake, ctx } = weeklyStand();
+
+    const mark = fake.mark();
+    const refusal = await refused(() => update(ctx, { id: weeklyMoscow.uid, scope: "this", patch: { summary: "Без адреса" } }));
+
+    expect(writes(fake, mark), "отказ ничего не пишет").toEqual([]);
+    expect(refusal.code, `отказ обязан нести код: ${refusal.message}`).toEqual(expect.any(String));
+  });
+
+  it("адрес, которого в серии нет, — отказ с кодом, без записей", async () => {
+    const { fake, ctx } = weeklyStand();
+
+    const mark = fake.mark();
+    const refusal = await refused(() =>
+      update(ctx, { id: weeklyMoscow.uid, scope: "this", instanceStart: "2026-10-20T10:00:00+03:00", patch: { summary: "Мимо" } }),
     );
 
-    await expect(
-      updateEvent(context as never, {
-        id: "test-simple-1",
-        scope: "all_series",
-        patch: { summary: "Не долетит" },
-      }),
-    ).rejects.toThrow(/изменили/);
+    expect(writes(fake, mark)).toEqual([]);
+    expect(refusal.code).toEqual(expect.any(String));
   });
 
-  it("отказывает понятной ошибкой, если instanceStart не совпадает ни с одним экземпляром серии", async () => {
-    const { context } = contextWith(weekly);
+  // Разрез серии (writeSplit): продолжение создаётся раньше усечения
+  // исходной серии — иначе сорвавшаяся вторая запись оставила бы хвост
+  // нигде.
+  it("scope this_and_following: сначала создаётся продолжение, потом усекается исходная серия", async () => {
+    const { fake, ctx, path } = weeklyStand();
+    const target = at(await list(ctx), "2026-10-26");
 
-    // Вторник — в BYDAY=MO,WE вторников не бывает, значит такого экземпляра
-    // в серии нет ни на одной неделе.
-    await expect(
-      updateEvent(context as never, {
-        id: "test-weekly-1",
-        scope: "this",
-        instanceStart: "2026-10-20T10:00:00+03:00",
-        patch: { summary: "Мимо экземпляра" },
-      }),
-    ).rejects.toThrow(/экземпляр/i);
-  });
-
-  it("при scope this_and_following пересчитывает COUNT новой серии, не превышая исходный", async () => {
-    const { context, put } = contextWith(weekly);
-
-    // weekly.ics: WEEKLY;BYDAY=MO,WE;COUNT=6 от 2026-10-19 (Пн) даёт
-    // экземпляры 19,21,26,28 октября и 2,4 ноября. instanceStart=2 ноября —
-    // пятый из шести, до него остаётся 4 уже прожитых экземпляра.
-    await updateEvent(context as never, {
-      id: "test-weekly-1",
+    const mark = fake.mark();
+    const result = await update(ctx, {
+      id: weeklyMoscow.uid,
       scope: "this_and_following",
-      instanceStart: "2026-11-02T10:00:00+03:00",
-      patch: { summary: "Хвост серии" },
+      instanceStart: target.instanceStart,
+      patch: { location: "Переговорная 5" },
     });
 
-    // Если бы COUNT перенёсся в новую серию без изменений (было бы COUNT=6),
-    // общее число повторов (4 в усечённой исходной + 6 в новой) превысило бы
-    // исходные 6 — новая серия обязана унести только ОСТАВШИЕСЯ 6-4=2.
-    expect(put.mock.calls[1][1]).toContain("COUNT=2");
-    expect(put.mock.calls[1][1]).not.toContain("COUNT=6");
+    const log = fake.writesSince(mark);
+    expect(log).toHaveLength(2);
+    expect(log[0].path, "первой записью создаётся продолжение").not.toBe(path);
+    expect(log[0].ifNoneMatch, "продолжение создаётся условно").toBe("*");
+    expect(log[1].path, "второй записью усекается исходная серия").toBe(path);
+    expect(result.id, "ответ называет продолжение").not.toBe(weeklyMoscow.uid);
+    expect(result.series?.id, "ответ называет и исходную серию").toBe(weeklyMoscow.uid);
+    expect(await visible(ctx), describeStand(fake)).toEqual([
+      "2026-10-19 10:00–11:00 Планёрка",
+      "2026-10-21 10:00–11:00 Планёрка",
+      "2026-10-26 10:00–11:00 Планёрка @Переговорная 5",
+      "2026-10-28 10:00–11:00 Планёрка @Переговорная 5",
+      "2026-11-02 10:00–11:00 Планёрка @Переговорная 5",
+      "2026-11-04 10:00–11:00 Планёрка @Переговорная 5",
+    ]);
   });
 
-  it("при scope this_and_following переносит напоминания и участников в новую серию", async () => {
-    const withExtras = `BEGIN:VCALENDAR
-VERSION:2.0
-BEGIN:VEVENT
-UID:test-weekly-extras-1
-DTSTAMP:20261001T090000Z
-DTSTART;TZID=Europe/Moscow:20261019T100000
-DTEND;TZID=Europe/Moscow:20261019T140000
-RRULE:FREQ=WEEKLY;INTERVAL=1;BYDAY=MO,WE;COUNT=6
-SUMMARY:Проект «Заря»
-ATTENDEE;PARTSTAT=ACCEPTED:mailto:user@yandex.ru
-BEGIN:VALARM
-ACTION:DISPLAY
-TRIGGER:-PT15M
-DESCRIPTION:Напоминание
-END:VALARM
-END:VEVENT
-END:VCALENDAR`;
-    const { context, put } = contextWith(withExtras);
+  // Путь объекта на сервере Яндекса не выводится из UID (собака
+  // выбрасывается, а не кодируется): писать нужно по пути из ответа
+  // сервера, иначе правка ушла бы мимо — в новый объект.
+  it("пишет по пути из ответа сервера, а не по пути, собранному из UID", async () => {
+    const { fake, ctx, path } = weeklyStand();
+    expect(path, "путь на сервере не совпадает с собранным из UID").not.toBe(hrefFor(calendarA, weeklyMoscow.uid));
 
-    await updateEvent(context as never, {
-      id: "test-weekly-extras-1",
-      scope: "this_and_following",
-      instanceStart: "2026-11-02T10:00:00+03:00",
-      patch: { summary: "Хвост с допами" },
-    });
+    const mark = fake.mark();
+    await update(ctx, { id: weeklyMoscow.uid, scope: "all_series", patch: { summary: "Новое имя" } });
 
-    const continuationIcs = put.mock.calls[1][1];
-    expect(continuationIcs).toContain("BEGIN:VALARM");
-    expect(continuationIcs).toContain("ATTENDEE");
-    expect(continuationIcs).toContain("user@yandex.ru");
+    expect(writes(fake, mark)).toEqual([`PUT ${path}`]);
+    expect(fake.objects.size, "второго объекта не появилось").toBe(1);
   });
 
   it("отказывается писать в календарь только для чтения", async () => {
-    const readOnly = { ...calendar, readOnly: true };
-    const { context } = contextWith(weekly);
-    context.resolveCalendar = async () => readOnly;
+    const readOnly: Calendar = { ...calendarA, readOnly: true };
+    const { fake, ctx } = makeStand({ calendars: [readOnly] });
+    plant(fake, weeklyMoscow, readOnly);
 
-    await expect(
-      updateEvent(context as never, {
-        id: "test-weekly-1",
-        scope: "all_series",
-        patch: { summary: "Не пройдёт" },
-      }),
-    ).rejects.toThrow(/только для чтения/);
+    const mark = fake.mark();
+    await expect(update(ctx, { id: weeklyMoscow.uid, scope: "all_series", patch: { summary: "Нельзя" } })).rejects.toThrow(
+      /только для чтения/,
+    );
+    expect(writes(fake, mark)).toEqual([]);
   });
 
-  it("не теряет etag при повторной правке того же события подряд", async () => {
-    const { context, put, get } = contextWith(simple);
-    // Второй вызов get() имитирует то, что сервер вернул уже ОБНОВЛЁННЫЙ
-    // etag после первой правки — это то, что произошло бы в реальности,
-    // так как getFor всегда запрашивает объект заново, а не переиспользует
-    // старый снимок.
-    get.mockResolvedValueOnce({ href: "/c/work/x.ics", etag: '"etag-1"', ics: simple });
-    get.mockResolvedValueOnce({ href: "/c/work/x.ics", etag: '"etag-2"', ics: simple });
+  it("события с неизвестным идентификатором не выдумывает", async () => {
+    const { fake, ctx } = weeklyStand();
 
-    await updateEvent(context as never, {
-      id: "test-simple-1",
+    const mark = fake.mark();
+    const refusal = await refused(() => update(ctx, { id: "нет-такого@yandex.ru", patch: { summary: "x" } }));
+
+    expect(writes(fake, mark)).toEqual([]);
+    expect(refusal.message).toMatch(/не найдено/);
+  });
+});
+
+describe("updateEvent: отказ движка переведён для пользователя", () => {
+  /** Серия с перенесённой 21.10: новое правило «только понедельники» её теряет. */
+  async function standWithMoved() {
+    const stand = weeklyStand();
+    const target = at(await list(stand.ctx), "2026-10-21");
+    await update(stand.ctx, {
+      id: weeklyMoscow.uid,
+      scope: "this",
+      instanceStart: target.instanceStart,
+      patch: { start: "2026-10-21T11:30:00+03:00", end: "2026-10-21T12:30:00+03:00" },
+    });
+    return stand;
+  }
+
+  const mondaysOnly = { recurrence: { frequency: "weekly", interval: 1, byWeekday: ["MO"] } };
+
+  // Потеря сверх названной цели — отказ с перечнем потерь. В тексте обязаны
+  // быть и сами потери, и etag, которым их подтверждают: без него
+  // пользователю пришлось бы догадываться, что передать.
+  it("потери названы в тексте, и там же — etag для подтверждения", async () => {
+    const { fake, ctx, path } = await standWithMoved();
+    const etag = fake.etag(path);
+
+    const mark = fake.mark();
+    const refusal = await refused(() => update(ctx, { id: weeklyMoscow.uid, scope: "all_series", patch: mondaysOnly }));
+
+    expect(writes(fake, mark), "отказ ничего не пишет").toEqual([]);
+    expect(refusal.needsConfirm).toBe(true);
+    expect((refusal.losses ?? []).length, "перечень потерь не пуст").toBeGreaterThan(0);
+    expect(refusal.message, "в тексте перечислены потери").toContain("Будет потеряно");
+    expect(refusal.message, "в тексте названа потерянная встреча").toContain("2026-10-21");
+    expect(refusal.message, "в тексте назван etag для подтверждения").toContain(etag);
+    expect(refusal.message, "во внешнем тексте нет внутренних обозначений").not.toMatch(/\b[ОРЖЗ]\d+\b/);
+  });
+
+  it("с confirm и тем же etag правка проходит, а потери названы в ответе", async () => {
+    const { fake, ctx, path } = await standWithMoved();
+
+    const result = await update(ctx, {
+      id: weeklyMoscow.uid,
       scope: "all_series",
-      patch: { summary: "Первая правка" },
-    });
-    await updateEvent(context as never, {
-      id: "test-simple-1",
-      scope: "all_series",
-      patch: { summary: "Вторая правка" },
+      patch: mondaysOnly,
+      confirm: true,
+      etag: fake.etag(path),
     });
 
-    expect(put.mock.calls[0][2].ifMatch).toBe('"etag-1"');
-    expect(put.mock.calls[1][2].ifMatch).toBe('"etag-2"');
+    expect(result.changed).toBe(true);
+    expect(
+      result.removed.some((loss) => loss.instanceStart.startsWith("2026-10-21")),
+      `ответ перечисляет то же, что подтверждали: ${JSON.stringify(result.removed)}`,
+    ).toBe(true);
+    expect(fake.rejections, "строгий стенд не отверг запись").toEqual([]);
   });
 
-  // -----------------------------------------------------------------------
-  // Регрессионные тесты по ревью задачи 13 (круг 1): две находки Critical
-  // и одна Important.
-  // -----------------------------------------------------------------------
+  it("confirm с чужим etag не действует: отказ и ни одной записи", async () => {
+    const { fake, ctx } = await standWithMoved();
 
-  // Объект с master-компонентом (RRULE) и уже существующим переопределением
-  // экземпляра (RECURRENCE-ID) — например, ранее правленным через scope
-  // "this". Используется находками 1 и 2 ниже.
-  const weeklyWithOverride = `BEGIN:VCALENDAR
-VERSION:2.0
-BEGIN:VEVENT
-UID:test-weekly-override-1
-DTSTAMP:20261001T090000Z
-DTSTART;TZID=Europe/Moscow:20261019T100000
-DTEND;TZID=Europe/Moscow:20261019T140000
-RRULE:FREQ=WEEKLY;INTERVAL=1;BYDAY=MO,WE;COUNT=6
-SUMMARY:Проект «Заря»
-END:VEVENT
-BEGIN:VEVENT
-UID:test-weekly-override-1
-RECURRENCE-ID;TZID=Europe/Moscow:20261021T100000
-DTSTAMP:20261001T090000Z
-DTSTART;TZID=Europe/Moscow:20261021T113000
-DTEND;TZID=Europe/Moscow:20261021T150000
-SUMMARY:Перенесённая среда
-END:VEVENT
-END:VCALENDAR`;
+    const mark = fake.mark();
+    const refusal = await refused(() =>
+      update(ctx, { id: weeklyMoscow.uid, scope: "all_series", patch: mondaysOnly, confirm: true, etag: "устаревший" }),
+    );
 
-  it("НАХОДКА 1: all_series сохраняет уже существующее переопределение экземпляра", async () => {
-    const { context, put } = contextWith(weeklyWithOverride);
-
-    await updateEvent(context as never, {
-      id: "test-weekly-override-1",
-      scope: "all_series",
-      patch: { summary: "Новое общее название" },
-    });
-
-    const ics = put.mock.calls[0][1];
-    // Переопределение не пропало (было потеряно при пересборке через
-    // buildEvent, у которой в календаре всегда ровно один VEVENT).
-    expect(ics).toContain("RECURRENCE-ID");
-    expect(ics).toContain("Перенесённая среда");
-    // При этом master действительно поправлен.
-    expect(ics).toContain("Новое общее название");
-    expect(ics).toContain("RRULE");
+    expect(writes(fake, mark)).toEqual([]);
+    expect(refusal.code).toBe("confirm-required");
   });
+});
 
-  it("НАХОДКА 1: this_and_following сохраняет переопределение при усечении исходной серии", async () => {
-    // Переопределение стоит на 21 октября — раньше instanceStart (2 ноября),
-    // то есть попадает в «хвост», который остаётся у исходной серии после
-    // усечения. Усечение не должно его терять.
-    const { context, put } = contextWith(weeklyWithOverride);
-
-    await updateEvent(context as never, {
-      id: "test-weekly-override-1",
-      scope: "this_and_following",
-      instanceStart: "2026-11-02T10:00:00+03:00",
-      patch: { summary: "Хвост серии" },
-    });
-
-    const truncatedIcs = put.mock.calls[0][1];
-    expect(truncatedIcs).toContain("UNTIL=");
-    expect(truncatedIcs).toContain("RECURRENCE-ID");
-    expect(truncatedIcs).toContain("Перенесённая среда");
-  });
-
-  it("НАХОДКА 2: scope this идемпотентен — повторная правка того же экземпляра не копит дубликаты RECURRENCE-ID", async () => {
-    const put = vi.fn().mockResolvedValue('"etag-new"');
-    const get = vi.fn();
-    get.mockResolvedValueOnce({ href: "/c/work/x.ics", etag: '"etag-1"', ics: weekly });
-    const context = {
-      client: {} as never,
-      config: { defaultTimeZone: "Europe/Moscow", login: OWNER } as never,
-      calendars: async () => [calendar],
-      resolveCalendar: async () => calendar,
-      get,
-      put,
+describe("updateEvent: ответ сервера разбирается доставкой", () => {
+  // Ж16 на живом пути: событие удалили между нашим чтением и записью.
+  // Яндекс такой PUT не отклоняет, а создаёт объект нашим текстом и отвечает
+  // 201. Это конфликт, а не успех: прежний код, бравший из ответа только
+  // ETag, выдал бы его за удачную правку.
+  it("ответ 201 на правку прочитанного объекта — конфликт, а не успех", async () => {
+    const { fake, ctx, path } = weeklyStand();
+    fake.beforeRequest = (request) => {
+      if (request.method === "PUT" && fake.has(path)) fake.externalDelete(path);
     };
 
-    await updateEvent(context as never, {
-      id: "test-weekly-1",
-      scope: "this",
-      instanceStart: "2026-10-21T10:00:00+03:00",
-      patch: { summary: "Первая правка экземпляра" },
-    });
+    let caught: unknown;
+    try {
+      await update(ctx, { id: weeklyMoscow.uid, scope: "all_series", patch: { summary: "Гонка" } });
+    } catch (error) {
+      caught = error;
+    }
 
-    // Второй вызов get() отдаёт РЕЗУЛЬТАТ первой записи — именно то, что
-    // реально вернул бы сервер при повторном чтении после первой правки.
-    const firstResultIcs = put.mock.calls[0][1];
-    get.mockResolvedValueOnce({ href: "/c/work/x.ics", etag: '"etag-2"', ics: firstResultIcs });
-
-    await updateEvent(context as never, {
-      id: "test-weekly-1",
-      scope: "this",
-      instanceStart: "2026-10-21T10:00:00+03:00",
-      patch: { summary: "Вторая правка того же экземпляра" },
-    });
-
-    const secondResultIcs = put.mock.calls[1][1];
-    const overrideCount = (secondResultIcs.match(/RECURRENCE-ID/g) ?? []).length;
-    expect(overrideCount).toBe(1);
-    expect(secondResultIcs).toContain("Вторая правка того же экземпляра");
-    expect(secondResultIcs).not.toContain("Первая правка экземпляра");
+    expect(fake.log.filter((entry) => entry.method === "PUT").map((entry) => entry.status)).toEqual([201]);
+    const refusal = refusalOf(caught);
+    expect(refusal.code, `исход записи — конфликт: ${refusal.message}`).toBe("conflict");
+    expect(refusal.message).toMatch(/создал событие заново/);
+    expect((caught as { recreated?: unknown }).recreated, "правка воскресила удалённое событие").toBe(true);
   });
 
-  it("НАХОДКА 3: this_and_following называет усечение серии и не созданную новую часть при отказе второй записи", async () => {
-    const { context, put } = contextWith(weekly);
-    put.mockResolvedValueOnce('"etag-truncated"'); // первая запись (усечение) — успех
-    const serverError = new Error("Сервер календаря ответил кодом 500.");
-    put.mockRejectedValueOnce(serverError); // вторая (новая серия) — отказ
+  it("412 на правку — конфликт «событие изменили», чужая правка цела", async () => {
+    const { fake, ctx, path } = weeklyStand();
+    // Чужая запись успевает между нашим чтением и нашим PUT: If-Match
+    // прочитанного ETag Яндекс соблюдает, и наш PUT получает 412.
+    fake.beforeRequest = (request) => {
+      if (request.method === "PUT") {
+        fake.beforeRequest = undefined;
+        fake.externalEdit(path, (ics) => ics.replace("SUMMARY:Планёрка", "SUMMARY:Чужая правка"));
+      }
+    };
 
-    expect.assertions(5);
-    try {
-      await updateEvent(context as never, {
-        id: "test-weekly-1",
-        scope: "this_and_following",
-        instanceStart: "2026-11-02T10:00:00+03:00",
-        patch: { summary: "Хвост серии" },
-      });
-    } catch (error) {
-      expect(error).toBeInstanceOf(Error);
-      expect((error as Error).message).toMatch(/усечен/i);
-      expect((error as Error).message).toMatch(/не создан/i);
-      // Исходная ошибка сохранена как причина, а не потеряна.
-      expect((error as Error).cause).toBe(serverError);
-    }
-    // Обе записи реально были предприняты (первая прошла, вторая отказала) —
-    // отказ во второй не должен помешать первой попытке случиться.
-    expect(put).toHaveBeenCalledTimes(2);
+    const mark = fake.mark();
+    const refusal = await refused(() => update(ctx, { id: weeklyMoscow.uid, scope: "all_series", patch: { summary: "Моя правка" } }));
+
+    expect(fake.ics(path), "чужая правка цела").toContain("SUMMARY:Чужая правка");
+    expect(fake.writesSince(mark).map((entry) => entry.status), "повторной записи нет").toEqual([412]);
+    expect(refusal.code).toBe("conflict");
+    expect(refusal.message).toMatch(/изменили после того, как его прочитали/);
+  });
+
+  // Перечитывание вместо слепого повтора: ответа сервера не было, объект на
+  // месте и прежний — значит запись не дошла, и повтор допустим ровно один.
+  it("потерянный ответ: объект перечитывается, повтор ровно один", async () => {
+    const { fake, ctx, path } = weeklyStand();
+    const fault = fake.dropRequest({ method: "PUT" }, 504);
+
+    const mark = fake.mark();
+    const result = await update(ctx, { id: weeklyMoscow.uid, scope: "all_series", patch: { summary: "После обрыва" } });
+
+    expect(fault.fired).toBe(1);
+    const log = fake.since(mark);
+    expect(log.filter((entry) => entry.method === "PUT").map((entry) => entry.status)).toEqual([504, 204]);
+    const firstPut = log.findIndex((entry) => entry.method === "PUT");
+    const secondPut = log.findIndex((entry, index) => index > firstPut && entry.method === "PUT");
+    expect(
+      log.slice(firstPut + 1, secondPut).some((entry) => entry.method === "REPORT" || entry.method === "GET"),
+      "перед повтором объект перечитан",
+    ).toBe(true);
+    expect(result.changed).toBe(true);
+    expect(fake.ics(path)).toContain("SUMMARY:После обрыва");
+  });
+});
+
+describe("updateEvent: отказ ввода-вывода доходит до пользователя целым", () => {
+  // Исход, которого стенд не изображает: сервер отклонил запись насовсем.
+  it("отказ сервера назван причиной, и объект не тронут", async () => {
+    const { fake, ctx, path } = weeklyStand();
+    const raw: RawObject = { href: path, etag: fake.etag(path), ics: fake.ics(path) };
+    let puts = 0;
+    const io: ObjectIO = {
+      find: async () => raw,
+      put: async () => {
+        puts += 1;
+        return { status: "rejected", error: new Error("Сервер: календарь переполнен") };
+      },
+      remove: async () => ({ status: "applied" }),
+    };
+    ctx.io = io;
+
+    const refusal = await refused(() => update(ctx, { id: weeklyMoscow.uid, scope: "all_series", patch: { summary: "Нельзя" } }));
+
+    expect(puts, "отклонённая запись не повторяется").toBe(1);
+    expect(refusal.code).toBe("rejected");
+    expect(refusal.message).toContain("календарь переполнен");
   });
 });

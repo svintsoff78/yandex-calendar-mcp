@@ -17,9 +17,11 @@
 // хранимый текст), затем исход вызова. Поэтому на прежнем коде цепочка
 // падает на утверждении о данных, даже если вызов бросил исключение.
 //
-// На текущем коде все цепочки красные — `it.fails`; снимает `.fails`
-// задача З13. Первое упавшее утверждение каждой цепочки — в отчёте З05c
-// (.superpowers/sdd/2026-09-18-yandex-calendar-mcp/rework-З05c-report.md).
+// Пометка it.fails снята: домен ведёт правку и удаление через планировщик,
+// предохранитель и доставку. Осталась одна красная — C30: правку встречи со
+// STATUS:CANCELLED планировщик не отклоняет, а спокойно её пишет. Это дефект
+// движка (src/ical/edit.ts), а не оркестрации, и насильно зелёной цепочка не
+// делается.
 //
 // Цепочек C55 (эхо) и C56 (stale-shift) здесь нет: по поправке плана «без
 // ремонта следов прежнего кода» роли echo и stale-shift и ремонт
@@ -428,7 +430,7 @@ const twoMasters = seed(
 // ---------------------------------------------------------------------------
 
 describe("З05c: объекты других клиентов и следы прежнего кода", () => {
-  it.fails("C04: переопределение раньше основного — get_event; this 26.10; all_series; delete this 26.10; delete t&f 02.11", async () => {
+  it("C04: переопределение раньше основного — get_event; this 26.10; all_series; delete this 26.10; delete t&f 02.11", async () => {
     const { fake, ctx } = makeStand();
     const uid = overrideFirst.uid;
     const path = plant(fake, overrideFirst);
@@ -527,7 +529,7 @@ describe("З05c: объекты других клиентов и следы пр
     done(s4, fake);
   });
 
-  it.fails("C15: all_series rename сохраняет EXDATE, RDATE, ORGANIZER, ATTENDEE, CATEGORIES, X-, SEQUENCE, VALARM", async () => {
+  it("C15: all_series rename сохраняет EXDATE, RDATE, ORGANIZER, ATTENDEE, CATEGORIES, X-, SEQUENCE, VALARM", async () => {
     const { fake, ctx } = makeStand();
     const uid = seeds.richMoscow.uid;
     const path = plant(fake, seeds.richMoscow);
@@ -552,7 +554,7 @@ describe("З05c: объекты других клиентов и следы пр
     done(s, fake);
   });
 
-  it.fails("C17: HOURLY — delete this 12:00, update this 14:00; объект жив", async () => {
+  it("C17: HOURLY — delete this 12:00, update this 14:00; объект жив", async () => {
     const { fake, ctx } = makeStand();
     const uid = hourly.uid;
     const path = plant(fake, hourly);
@@ -601,7 +603,7 @@ describe("З05c: объекты других клиентов и следы пр
     done(s2, fake);
   });
 
-  it.fails("C17: серия только из RDATE — три встречи с DTSTART; delete this по одной до пустоты", async () => {
+  it("C17: серия только из RDATE — три встречи с DTSTART; delete this по одной до пустоты", async () => {
     const { fake, ctx } = makeStand();
     const uid = rdateOnly.uid;
     const path = plant(fake, rdateOnly);
@@ -643,7 +645,7 @@ describe("З05c: объекты других клиентов и следы пр
     expect(done(s3, fake)).toMatchObject({ objectRemoved: true });
   });
 
-  it.fails("C30: переопределение CANCELLED — status, свободное время, правка отклонена, delete this", async () => {
+  it("C30: переопределение CANCELLED — status, свободное время, правка отклонена, delete this", async () => {
     const { fake, ctx } = makeStand();
     const path = plant(
       fake,
@@ -732,7 +734,7 @@ describe("З05c: объекты других клиентов и следы пр
     expect(refusal(s)).toHaveProperty("code");
   });
 
-  it.fails("C31: объект из одного переопределения — виден; update this на месте; delete this удаляет объект", async () => {
+  it("C31: объект из одного переопределения — виден; update this на месте; delete this удаляет объект", async () => {
     const { fake, ctx } = makeStand();
     const uid = lonelyOverride.uid;
     const path = plant(fake, lonelyOverride);
@@ -768,7 +770,7 @@ describe("З05c: объекты других клиентов и следы пр
     expect(done(s2, fake)).toMatchObject({ objectRemoved: true });
   });
 
-  it.fails("C32: RANGE=THISANDFUTURE — чтение со сдвигом; update и delete this — отказ; delete all_series", async () => {
+  it("C32: RANGE=THISANDFUTURE — чтение со сдвигом; update и delete this — отказ; delete all_series", async () => {
     const { fake, ctx } = makeStand();
     const path = plant(
       fake,
@@ -823,7 +825,7 @@ describe("З05c: объекты других клиентов и следы пр
     done(s3, fake);
   });
 
-  it.fails("C33: RECURRENCE-ID в поясе Europe/Berlin у серии в Europe/Moscow — один экземпляр +03:00; delete this", async () => {
+  it("C33: RECURRENCE-ID в поясе Europe/Berlin у серии в Europe/Moscow — один экземпляр +03:00; delete this", async () => {
     const { fake, ctx } = makeStand();
     const berlin = withLinesAfter(seeds.weeklyMoscow.ics, "METHOD:", ...BERLIN_ZONE);
     const path = plant(
@@ -867,7 +869,7 @@ describe("З05c: объекты других клиентов и следы пр
     done(s, fake);
   });
 
-  it.fails("C34: наследие — дубль EXDATE и переопределение под ним скрыты; скрытое удаляется delete this по своему RID", async () => {
+  it("C34: наследие — дубль EXDATE и переопределение под ним скрыты; скрытое удаляется delete this по своему RID", async () => {
     const { fake, ctx } = makeStand();
     // Так оставлял прежний код: update this 21.10 {summary} → delete this 21.10 дважды (AD5).
     const path = plant(
@@ -915,7 +917,7 @@ describe("З05c: объекты других клиентов и следы пр
     done(s, fake);
   });
 
-  it.fails("C34: наследие — сирота после UNTIL скрыта и не воскресает после all_series", async () => {
+  it("C34: наследие — сирота после UNTIL скрыта и не воскресает после all_series", async () => {
     const { fake, ctx } = makeStand();
     // Так оставлял прежний код: update this 02.11 → delete t&f 26.10 (R8-N1 C, AD6).
     const path = plant(
@@ -950,7 +952,7 @@ describe("З05c: объекты других клиентов и следы пр
     done(s, fake);
   });
 
-  it.fails("C34: наследие — RECURRENCE-ID в DATE-TIME у серии на весь день: одна встреча; delete this", async () => {
+  it("C34: наследие — RECURRENCE-ID в DATE-TIME у серии на весь день: одна встреча; delete this", async () => {
     const { fake, ctx } = makeStand();
     const uid = seeds.allDayWeekly.uid;
     // Так писал прежний код (AE14): RECURRENCE-ID:20261021T000000Z при DTSTART;VALUE=DATE.
@@ -995,7 +997,7 @@ describe("З05c: объекты других клиентов и следы пр
     done(s, fake);
   });
 
-  it.fails("C34: наследие — два основных компонента: аномалия, правка отклонена, delete all_series удаляет", async () => {
+  it("C34: наследие — два основных компонента: аномалия, правка отклонена, delete all_series удаляет", async () => {
     const { fake, ctx } = makeStand();
     const uid = twoMasters.uid;
     const path = plant(fake, twoMasters);
@@ -1033,7 +1035,7 @@ describe("З05c: объекты других клиентов и следы пр
   // одной не трогает другую.
   // Прежний код: падает на шаге 2 — update this по адресу detached он
   // отвергает (встречи с таким началом нет), и видимый список не меняется.
-  it.fails("C64: detached в дату слота, но не во время слота — две встречи 21.10; delete this слота; update и delete this detached по его адресу", async () => {
+  it("C64: detached в дату слота, но не во время слота — две встречи 21.10; delete this слота; update и delete this detached по его адресу", async () => {
     const { fake, ctx } = makeStand();
     const uid = seeds.detachedOnSlotDate.uid;
     const path = plant(fake, seeds.detachedOnSlotDate);
@@ -1187,7 +1189,7 @@ describe("З05c: объекты других клиентов и следы пр
     done(s, fake);
   });
 
-  it.fails("C37: all_series reminders частично — чужой AUDIO и совпадающий DISPLAY побайтово; attendees без status — PARTSTAT цел", async () => {
+  it("C37: all_series reminders частично — чужой AUDIO и совпадающий DISPLAY побайтово; attendees без status — PARTSTAT цел", async () => {
     const { fake, ctx } = makeStand();
     const uid = seeds.richMoscow.uid;
     const path = plant(fake, seeds.richMoscow);
@@ -1251,7 +1253,7 @@ describe("З05c: объекты других клиентов и следы пр
     done(s2, fake);
   });
 
-  it.fails("C38: HOURLY — recurrence.count 6 меняет только COUNT", async () => {
+  it("C38: HOURLY — recurrence.count 6 меняет только COUNT", async () => {
     const { fake, ctx } = makeStand();
     const uid = hourly.uid;
     const path = plant(fake, hourly);
@@ -1275,7 +1277,7 @@ describe("З05c: объекты других клиентов и следы пр
     done(s, fake);
   });
 
-  it.fails("C38: BYSETPOS — recurrence.replace без confirm отклонён, с confirm и etag правило заменено", async () => {
+  it("C38: BYSETPOS — recurrence.replace без confirm отклонён, с confirm и etag правило заменено", async () => {
     const { fake, ctx } = makeStand();
     const uid = lastWorkday.uid;
     const path = plant(fake, lastWorkday);
@@ -1312,7 +1314,7 @@ describe("З05c: объекты других клиентов и следы пр
     done(s2, fake);
   });
 
-  it.fails("C48: HOURLY — delete this 12:00, затем all_series +1 ч: EXDATE переехал по позиции", async () => {
+  it("C48: HOURLY — delete this 12:00, затем all_series +1 ч: EXDATE переехал по позиции", async () => {
     const { fake, ctx } = makeStand();
     const uid = hourly.uid;
     const path = plant(fake, hourly);
@@ -1348,7 +1350,7 @@ describe("З05c: объекты других клиентов и следы пр
     done(s2, fake);
   });
 
-  it.fails("C62: основной компонент с DURATION — update this и t&f без DTEND рядом с DURATION", async () => {
+  it("C62: основной компонент с DURATION — update this и t&f без DTEND рядом с DURATION", async () => {
     const { fake, ctx } = makeStand();
     const uid = seeds.c62DurationMaster.uid;
     const path = plant(fake, seeds.c62DurationMaster);
@@ -1402,7 +1404,7 @@ describe("З05c: объекты других клиентов и следы пр
     done(s2, fake);
   });
 
-  it.fails("C63: неразбираемые FREQ=FOO и BYDAY=0MO — list_events жив; update — отказ unparsable; delete all_series удаляет", async () => {
+  it("C63: неразбираемые FREQ=FOO и BYDAY=0MO — list_events жив; update — отказ unparsable; delete all_series удаляет", async () => {
     const { fake, ctx } = makeStand();
     plant(fake, seeds.weeklyMoscow);
     const bad = [seeds.c63BadFreq, seeds.c63BadByday];

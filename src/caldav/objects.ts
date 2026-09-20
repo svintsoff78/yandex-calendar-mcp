@@ -1,10 +1,30 @@
 import type { CaldavClient } from "./request.js";
+import type { Calendar } from "../types.js";
 import { buildCalendarQuery, buildUidQuery, parseMultistatus, type MultistatusEntry } from "./xml.js";
 
 export interface RawObject {
   href: string;
   etag: string;
   ics: string;
+}
+
+/**
+ * Путь нового объекта в коллекции календаря.
+ *
+ * Годится только там, где UID выдаём мы сами (создание события, продолжение
+ * разреза серии): наш UID не содержит "@", поэтому encodeURIComponent даёт
+ * путь, совпадающий с тем, что кладёт на диск сервер Яндекса. Путь ЧУЖОГО
+ * объекта из UID не выводится (docs/yandex-caldav-capabilities.md): UID вида
+ * "aaaabbbbccccdddd11@yandex.ru" лежит как "aaaabbbbccccdddd11yandex.ru.ics" —
+ * собака выброшена, а не закодирована. Путь такого объекта берётся только из
+ * ответа сервера (`queryEventByUid`).
+ *
+ * Живёт здесь, а не в слое домена: путь объекта в коллекции — дело CalDAV, и
+ * так его одинаково видят и правка (src/domain/events.ts), и доставка
+ * (src/domain/writes.ts), не занимая друг у друга.
+ */
+export function hrefFor(calendar: Calendar, eventId: string): string {
+  return `${calendar.href.replace(/\/?$/, "/")}${encodeURIComponent(eventId)}.ics`;
 }
 
 // ETag у Яндекса приходит голым числом без кавычек (например,
@@ -151,7 +171,17 @@ export async function putObjectWithStatus(
   return { status: response.status, etag: response.headers.get("etag") ?? "" };
 }
 
-/** Тот же PUT для вызывающих, которым от ответа нужен только ETag. */
+/**
+ * Тот же PUT для вызывающих, которым от ответа нужен только ETag.
+ *
+ * Для замены прочитанного объекта НЕ годится: код ответа здесь теряется, а
+ * вместе с ним и единственный признак того, что объекта по пути уже не было
+ * и запись создала событие заново (201, см. `PutResponse`). Такая потеря
+ * выдаёт конфликт за успешную правку. Запись домена идёт через
+ * `putObjectWithStatus` (src/domain/writes.ts, ioFor); эта обёртка осталась
+ * для вызывающих, у которых объекта по пути и не должно было быть, и для
+ * проверок транспорта.
+ */
 export async function putObject(
   client: CaldavClient,
   href: string,

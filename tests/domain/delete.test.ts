@@ -1,470 +1,299 @@
-import { readFileSync } from "node:fs";
-import { describe, expect, it, vi } from "vitest";
-import { deleteEvent } from "../../src/domain/events.js";
-import type { Calendar } from "../../src/types.js";
-import type { CaldavClient } from "../../src/caldav/request.js";
+// Удаление событий — единственная необратимая операция сервиса. Домен ведёт
+// её тем же путём, что правку: чтение объекта → планировщик
+// (src/ical/edit.ts, planDelete) → предохранитель (src/ical/guard.ts) →
+// доставка (src/domain/writes.ts). Отдельного пути удаления больше нет.
+import { describe, expect, it } from "vitest";
+import { deleteEvent, readEvents } from "../../src/domain/events.js";
+import { hrefFor } from "../../src/caldav/objects.js";
+import type { Calendar, CalendarEvent, Context, EditScope, ObjectIO, RawObject } from "../../src/types.js";
+import { calendarA, makeStand, plant } from "../support/context.js";
+import type { FakeCaldav } from "../support/fakeCaldav.js";
+import { DEFAULT_WINDOW, describeStand, visible, wallTime } from "../support/observe.js";
+import { singleMoscow, weeklyMoscow } from "../support/seeds.js";
 
-const weekly = readFileSync("tests/fixtures/weekly.ics", "utf8");
-const simple = readFileSync("tests/fixtures/simple.ics", "utf8");
+const ZONE = "Europe/Moscow";
 
-const calendar: Calendar = {
-  id: "work",
-  href: "/c/work/",
-  displayName: "Работа",
-  readOnly: false,
-};
-
-function contextWith(ics: string) {
-  const put = vi.fn().mockResolvedValue('"etag-new"');
-  const remove = vi.fn().mockResolvedValue(undefined);
-  const get = vi.fn().mockResolvedValue({ href: "/c/work/x.ics", etag: '"etag-old"', ics });
-  return {
-    context: {
-      client: {} as never,
-      config: { defaultTimeZone: "Europe/Moscow" } as never,
-      calendars: async () => [calendar],
-      resolveCalendar: async () => calendar,
-      get,
-      put,
-      remove,
-    },
-    put,
-    remove,
-    get,
-  };
+interface DeleteCall {
+  calendarId?: string;
+  id: string;
+  scope?: EditScope;
+  instanceStart?: string;
+  etag?: string;
+  confirm?: boolean;
 }
 
-describe("deleteEvent", () => {
-  it("удаляет одиночное событие целиком", async () => {
-    const { context, remove } = contextWith(simple);
+function remove(ctx: Context, call: DeleteCall) {
+  return deleteEvent(ctx, call as unknown as Parameters<typeof deleteEvent>[1]);
+}
 
-    const result = await deleteEvent(context as never, { id: "test-simple-1" });
+async function list(ctx: Context): Promise<CalendarEvent[]> {
+  return readEvents(ctx, DEFAULT_WINDOW);
+}
 
-    expect(remove).toHaveBeenCalledTimes(1);
-    expect(remove.mock.calls[0][1]).toBe('"etag-old"');
-    expect(result).toEqual({ deleted: "test-simple-1", scope: "all_series" });
+function at(events: CalendarEvent[], date: string): CalendarEvent {
+  const found = events.filter((event) => event.instanceStart !== undefined && wallTime(event.instanceStart, ZONE).startsWith(date));
+  expect(found.map((event) => event.instanceStart), `ровно одна встреча со слотом ${date}`).toHaveLength(1);
+  return found[0];
+}
+
+function writes(fake: FakeCaldav, mark: number): string[] {
+  return fake.writesSince(mark).map((entry) => `${entry.method} ${entry.path}`);
+}
+
+function weeklyStand() {
+  const stand = makeStand();
+  return { ...stand, path: plant(stand.fake, weeklyMoscow) };
+}
+
+function singleStand() {
+  const stand = makeStand();
+  return { ...stand, path: plant(stand.fake, singleMoscow) };
+}
+
+function refusalOf(error: unknown): { code?: unknown; message: string } {
+  const fields = (typeof error === "object" && error !== null ? error : {}) as Record<string, unknown>;
+  return { code: fields.code, message: error instanceof Error ? error.message : String(error) };
+}
+
+async function refused(run: () => Promise<unknown>): Promise<{ code?: unknown; message: string }> {
+  try {
+    await run();
+  } catch (error) {
+    return refusalOf(error);
+  }
+  throw new Error("ожидался отказ, а вызов прошёл");
+}
+
+describe("deleteEvent: одиночное событие", () => {
+  it("удаляет объект целиком и говорит об этом в ответе", async () => {
+    const { fake, ctx, path } = singleStand();
+    const seen = (await list(ctx))[0];
+
+    const mark = fake.mark();
+    const result = await remove(ctx, { id: singleMoscow.uid, etag: seen.etag });
+
+    expect(writes(fake, mark)).toEqual([`DELETE ${path}`]);
+    expect(fake.has(path)).toBe(false);
+    expect(result.objectRemoved).toBe(true);
+    expect(result.scope).toBe("this");
+    expect(await visible(ctx)).toEqual([]);
   });
 
-  it("при явном scope all_series на одиночном событии удаляет ровно его, а не что-то ещё", async () => {
-    // Самопроверка диспетчера: у одиночного события явный all_series не
-    // должен вести себя иначе, чем умолчание, — удаляется тот же (и
-    // единственный) объект, что нашёл getFor, без побочного PUT.
-    const { context, remove, put } = contextWith(simple);
+  // Путь объекта на сервере Яндекса не выводится из UID: удалять нужно по
+  // пути из ответа сервера. Цена ошибки здесь выше, чем у чтения: DELETE
+  // либо не найдёт ничего, либо попадёт не в тот объект.
+  it("удаляет по пути из ответа сервера, а не по пути, собранному из UID", async () => {
+    const { fake, ctx, path } = singleStand();
+    expect(path).not.toBe(hrefFor(calendarA, singleMoscow.uid));
+    const seen = (await list(ctx))[0];
 
-    await deleteEvent(context as never, { id: "test-simple-1", scope: "all_series" });
+    const mark = fake.mark();
+    await remove(ctx, { id: singleMoscow.uid, etag: seen.etag });
 
-    expect(remove).toHaveBeenCalledTimes(1);
-    expect(remove.mock.calls[0][0]).toBe("/c/work/x.ics");
-    expect(put).not.toHaveBeenCalled();
+    expect(writes(fake, mark)).toEqual([`DELETE ${path}`]);
+  });
+});
+
+describe("deleteEvent: серия", () => {
+  it("scope this закрывает один слот EXDATE, объект и правило целы", async () => {
+    const { fake, ctx, path } = weeklyStand();
+    const target = at(await list(ctx), "2026-10-21");
+
+    const mark = fake.mark();
+    const result = await remove(ctx, { id: weeklyMoscow.uid, scope: "this", instanceStart: target.instanceStart, etag: target.etag });
+
+    expect(writes(fake, mark)).toEqual([`PUT ${path}`]);
+    expect(fake.has(path)).toBe(true);
+    expect(result.objectRemoved).toBe(false);
+    expect(fake.ics(path)).toContain("EXDATE;TZID=Europe/Moscow:20261021T100000");
+    expect(fake.ics(path)).toContain("RRULE:FREQ=WEEKLY;BYDAY=MO,WE;COUNT=6");
+    expect(await visible(ctx), describeStand(fake)).toEqual([
+      "2026-10-19 10:00–11:00 Планёрка",
+      "2026-10-26 10:00–11:00 Планёрка",
+      "2026-10-28 10:00–11:00 Планёрка",
+      "2026-11-02 10:00–11:00 Планёрка",
+      "2026-11-04 10:00–11:00 Планёрка",
+    ]);
   });
 
-  it("при scope this добавляет EXDATE вместо удаления объекта", async () => {
-    const { context, put, remove } = contextWith(weekly);
+  it("scope this_and_following укорачивает правило, объект остаётся", async () => {
+    const { fake, ctx, path } = weeklyStand();
+    const target = at(await list(ctx), "2026-11-02");
 
-    await deleteEvent(context as never, {
-      id: "test-weekly-1",
-      scope: "this",
-      instanceStart: "2026-10-21T10:00:00+03:00",
-    });
-
-    expect(remove).not.toHaveBeenCalled();
-    expect(put.mock.calls[0][1]).toContain("EXDATE");
-    expect(put.mock.calls[0][1]).toContain("RRULE");
-    expect(put.mock.calls[0][2].ifMatch).toBe('"etag-old"');
-  });
-
-  it("EXDATE несёт тот же TZID, что и DTSTART серии", async () => {
-    // Без явного параметра TZID ical.js молча пишет EXDATE floating-временем
-    // без зоны (проверено отдельно на живом ical.js: addPropertyWithValue
-    // сериализует "EXDATE:20261021T100000" без TZID, если TZID не выставлен
-    // явно через setParameter) — сервер и другие клиенты не смогут надёжно
-    // сопоставить исключение с экземпляром в его настоящем часовом поясе.
-    // RFC 5545 §3.8.5.1 требует совпадения представления EXDATE и DTSTART —
-    // тот же приём, что уже применён к RECURRENCE-ID в updateEvent.
-    const { context, put } = contextWith(weekly);
-
-    await deleteEvent(context as never, {
-      id: "test-weekly-1",
-      scope: "this",
-      instanceStart: "2026-10-21T10:00:00+03:00",
-    });
-
-    expect(put.mock.calls[0][1]).toContain("EXDATE;TZID=Europe/Moscow:");
-  });
-
-  it("при scope all_series удаляет объект", async () => {
-    const { context, remove } = contextWith(weekly);
-
-    const result = await deleteEvent(context as never, { id: "test-weekly-1", scope: "all_series" });
-
-    expect(remove).toHaveBeenCalledTimes(1);
-    expect(result.scope).toBe("all_series");
-  });
-
-  it("по умолчанию у серии удаляет только названный экземпляр, а не всю серию", async () => {
-    const { context, put, remove } = contextWith(weekly);
-
-    await deleteEvent(context as never, {
-      id: "test-weekly-1",
-      instanceStart: "2026-10-21T10:00:00+03:00",
-    });
-
-    expect(remove).not.toHaveBeenCalled();
-    expect(put.mock.calls[0][1]).toContain("EXDATE");
-  });
-
-  it("при scope this_and_following обрезает серию через UNTIL, не создавая новый объект", async () => {
-    const { context, put, remove } = contextWith(weekly);
-
-    await deleteEvent(context as never, {
-      id: "test-weekly-1",
+    const mark = fake.mark();
+    const result = await remove(ctx, {
+      id: weeklyMoscow.uid,
       scope: "this_and_following",
-      instanceStart: "2026-11-02T10:00:00+03:00",
+      instanceStart: target.instanceStart,
+      etag: target.etag,
     });
 
-    expect(remove).not.toHaveBeenCalled();
-    // В отличие от updateEvent, удаление "хвоста" серии не создаёт новую
-    // серию — только один PUT, обрезающий исходный объект.
-    expect(put).toHaveBeenCalledTimes(1);
-    expect(put.mock.calls[0][1]).toContain("UNTIL=");
-    expect(put.mock.calls[0][1]).not.toContain("COUNT=");
-    expect(put.mock.calls[0][2].ifMatch).toBe('"etag-old"');
+    expect(writes(fake, mark)).toEqual([`PUT ${path}`]);
+    expect(fake.has(path)).toBe(true);
+    expect(result.objectRemoved).toBe(false);
+    expect(result.deleted).toContain("и далее");
+    expect(await visible(ctx), describeStand(fake)).toEqual([
+      "2026-10-19 10:00–11:00 Планёрка",
+      "2026-10-21 10:00–11:00 Планёрка",
+      "2026-10-26 10:00–11:00 Планёрка",
+      "2026-10-28 10:00–11:00 Планёрка",
+    ]);
   });
 
-  it("при scope this_and_following сохраняет уже существующие EXDATE серии", async () => {
-    // Серия уже несёт EXDATE на 21 октября (например, добавленный раньше
-    // отдельным удалением scope: this). Обрезка хвоста через
-    // this_and_following не должна «воскрешать» этот экземпляр, потеряв
-    // EXDATE при пересборке события с нуля.
-    const withExdate = `BEGIN:VCALENDAR
-VERSION:2.0
-BEGIN:VEVENT
-UID:test-weekly-1
-DTSTAMP:20261001T090000Z
-DTSTART;TZID=Europe/Moscow:20261019T100000
-DTEND;TZID=Europe/Moscow:20261019T140000
-RRULE:FREQ=WEEKLY;INTERVAL=1;BYDAY=MO,WE;COUNT=6
-EXDATE;TZID=Europe/Moscow:20261021T100000
-SUMMARY:Проект «Заря»
-END:VEVENT
-END:VCALENDAR`;
-    const { context, put } = contextWith(withExdate);
+  it("scope all_series удаляет объект целиком", async () => {
+    const { fake, ctx, path } = weeklyStand();
+    const seen = at(await list(ctx), "2026-10-19");
 
-    await deleteEvent(context as never, {
-      id: "test-weekly-1",
-      scope: "this_and_following",
-      instanceStart: "2026-11-02T10:00:00+03:00",
-    });
+    const mark = fake.mark();
+    const result = await remove(ctx, { id: weeklyMoscow.uid, scope: "all_series", etag: seen.etag });
 
-    expect(put.mock.calls[0][1]).toContain("EXDATE;TZID=Europe/Moscow:20261021T100000");
+    expect(writes(fake, mark)).toEqual([`DELETE ${path}`]);
+    expect(result.objectRemoved).toBe(true);
+    expect(await visible(ctx)).toEqual([]);
   });
 
-  it("требует instanceStart для частичного удаления серии (scope this)", async () => {
-    const { context } = contextWith(weekly);
+  // Умолчание зависит от вида события: у серии неточная просьба не должна
+  // стирать всю серию.
+  it("без scope у серии удаляется только названная встреча", async () => {
+    const { fake, ctx, path } = weeklyStand();
+    const target = at(await list(ctx), "2026-10-26");
 
-    await expect(
-      deleteEvent(context as never, { id: "test-weekly-1", scope: "this" }),
-    ).rejects.toThrow(/instanceStart/);
+    await remove(ctx, { id: weeklyMoscow.uid, instanceStart: target.instanceStart, etag: target.etag });
+
+    expect(fake.has(path), "серия обязана остаться").toBe(true);
+    expect((await list(ctx)).length).toBe(5);
   });
 
-  it("требует instanceStart для частичного удаления серии (scope this_and_following)", async () => {
-    const { context } = contextWith(weekly);
+  it("без адреса встречи у серии — отказ с кодом, без записей", async () => {
+    const { fake, ctx } = weeklyStand();
 
-    await expect(
-      deleteEvent(context as never, { id: "test-weekly-1", scope: "this_and_following" }),
-    ).rejects.toThrow(/instanceStart/);
+    const mark = fake.mark();
+    const refusal = await refused(() => remove(ctx, { id: weeklyMoscow.uid, scope: "this", etag: fake.etag(fake.findByUid(weeklyMoscow.uid)[0].path) }));
+
+    expect(writes(fake, mark), "отказ ничего не пишет").toEqual([]);
+    expect(refusal.code, `отказ обязан нести код: ${refusal.message}`).toEqual(expect.any(String));
   });
 
-  it("отказывает понятной ошибкой, если instanceStart не совпадает ни с одним экземпляром серии", async () => {
-    const { context } = contextWith(weekly);
+  it("адрес, которого в серии нет, — отказ с кодом, без записей", async () => {
+    const { fake, ctx } = weeklyStand();
+    const etag = fake.etag(fake.findByUid(weeklyMoscow.uid)[0].path);
 
-    // Вторник — в BYDAY=MO,WE вторников не бывает, значит такого экземпляра
-    // в серии нет ни на одной неделе. Без проверки это тихо добавило бы
-    // бесполезный EXDATE «в пустоту»: операция выглядела бы успешной, ничего
-    // не удалив.
-    await expect(
-      deleteEvent(context as never, {
-        id: "test-weekly-1",
-        scope: "this",
-        instanceStart: "2026-10-20T10:00:00+03:00",
-      }),
-    ).rejects.toThrow(/экземпляр/i);
-  });
-
-  it("удаление последнего оставшегося экземпляра серии через this не удаляет объект", async () => {
-    // COUNT=1 — единственный экземпляр серии. scope "this" всё равно только
-    // добавляет EXDATE: серия остаётся объектом в календаре (пустой,
-    // больше ничего не порождающей), а не пропадает целиком, — потому что
-    // пользователь просил удалить экземпляр, а не серию.
-    const single = `BEGIN:VCALENDAR
-VERSION:2.0
-BEGIN:VEVENT
-UID:test-weekly-single-1
-DTSTAMP:20261001T090000Z
-DTSTART;TZID=Europe/Moscow:20261019T100000
-DTEND;TZID=Europe/Moscow:20261019T140000
-RRULE:FREQ=WEEKLY;INTERVAL=1;BYDAY=MO;COUNT=1
-SUMMARY:Единственный раз
-END:VEVENT
-END:VCALENDAR`;
-    const { context, put, remove } = contextWith(single);
-
-    await deleteEvent(context as never, {
-      id: "test-weekly-single-1",
-      scope: "this",
-      instanceStart: "2026-10-19T10:00:00+03:00",
-    });
-
-    expect(remove).not.toHaveBeenCalled();
-    expect(put).toHaveBeenCalledTimes(1);
-    expect(put.mock.calls[0][1]).toContain("EXDATE");
-    expect(put.mock.calls[0][1]).toContain("RRULE");
-  });
-
-  it("распространяет отказ 412 (конфликт ETag) наружу при удалении объекта целиком", async () => {
-    const { context, remove } = contextWith(simple);
-    remove.mockRejectedValueOnce(
-      new Error(
-        "Событие изменили после того, как мы его прочитали. Перечитайте событие и повторите операцию.",
-      ),
+    const mark = fake.mark();
+    const refusal = await refused(() =>
+      remove(ctx, { id: weeklyMoscow.uid, scope: "this", instanceStart: "2026-10-20T10:00:00+03:00", etag }),
     );
 
-    await expect(deleteEvent(context as never, { id: "test-simple-1" })).rejects.toThrow(
-      /изменили/,
-    );
+    expect(writes(fake, mark)).toEqual([]);
+    expect(refusal.code).toEqual(expect.any(String));
   });
 
-  it("распространяет отказ 412 наружу при частичном удалении серии", async () => {
-    const { context, put } = contextWith(weekly);
-    put.mockRejectedValueOnce(
-      new Error("Событие изменили после того, как мы его прочитали."),
-    );
+  // Удаление последней живой встречи оставило бы объект без встреч — «зомби»,
+  // которого не показывает ни один клиент. Такой объект удаляется целиком.
+  it("удаление последней встречи убирает объект с сервера", async () => {
+    const { fake, ctx, path } = singleStand();
+    const seen = (await list(ctx))[0];
 
-    await expect(
-      deleteEvent(context as never, {
-        id: "test-weekly-1",
-        scope: "this",
-        instanceStart: "2026-10-21T10:00:00+03:00",
-      }),
-    ).rejects.toThrow(/изменили/);
+    const result = await remove(ctx, { id: singleMoscow.uid, scope: "this", instanceStart: seen.instanceStart ?? seen.start, etag: seen.etag });
+
+    expect(fake.has(path)).toBe(false);
+    expect(result.objectRemoved).toBe(true);
+  });
+});
+
+describe("deleteEvent: чужая правка между показом и удалением", () => {
+  // If-Match на DELETE Яндекс не соблюдает, поэтому сверять состояние обязан
+  // сам код: удаляется то, что пользователю показали, а не то, что успел
+  // записать другой клиент.
+  it("устаревший etag — отказ, объект и чужая правка целы", async () => {
+    const { fake, ctx, path } = weeklyStand();
+    const seen = at(await list(ctx), "2026-10-19");
+    fake.externalEdit(path, (ics) => ics.replace("SUMMARY:Планёрка", "SUMMARY:Чужая правка"));
+    const external = fake.ics(path);
+
+    const mark = fake.mark();
+    const refusal = await refused(() => remove(ctx, { id: weeklyMoscow.uid, scope: "all_series", etag: seen.etag }));
+
+    expect(writes(fake, mark), "отказ ничего не пишет").toEqual([]);
+    expect(fake.ics(path), "чужая правка цела").toBe(external);
+    expect(refusal.code).toBe("stale-etag");
+    expect(refusal.message).toMatch(/уже изменилось/);
   });
 
-  it("отказывается удалять из календаря только для чтения, не трогая сеть", async () => {
-    const readOnly = { ...calendar, readOnly: true };
-    const { context, remove, put, get } = contextWith(simple);
-    context.resolveCalendar = async () => readOnly;
+  it("перед DELETE объект перечитывается: чужая правка, попавшая в это окно, спасает объект", async () => {
+    const { fake, ctx, path } = weeklyStand();
+    const seen = at(await list(ctx), "2026-10-19");
+    // Правка приходит после нашего чтения, но до сверки перед DELETE.
+    let armed = true;
+    fake.beforeRequest = (request) => {
+      if (armed && request.method === "REPORT" && fake.has(path)) {
+        armed = false;
+        fake.externalEdit(path, (ics) => ics.replace("SUMMARY:Планёрка", "SUMMARY:Свежая чужая"));
+      }
+    };
 
-    await expect(deleteEvent(context as never, { id: "test-simple-1" })).rejects.toThrow(
-      /только для чтения/,
-    );
-    expect(get).not.toHaveBeenCalled();
-    expect(remove).not.toHaveBeenCalled();
-    expect(put).not.toHaveBeenCalled();
+    const mark = fake.mark();
+    const refusal = await refused(() => remove(ctx, { id: weeklyMoscow.uid, scope: "all_series", etag: seen.etag }));
+
+    expect(writes(fake, mark), "DELETE не ушёл").toEqual([]);
+    expect(fake.has(path)).toBe(true);
+    expect(refusal.code).toEqual(expect.any(String));
   });
 
-  describe("путь к объекту берётся от сервера, а не собирается из UID", () => {
-    // Тот же приём, что и в tests/domain/update.test.ts (задача 13): не
-    // подставляем context.get/context.remove — идём через настоящие
-    // getFor→queryEventByUid и removeFor→deleteObject поверх фиктивного
-    // CaldavClient. Падает, если реализация находит/удаляет объект по
-    // hrefFor(calendar, uid), а не по href из ответа сервера.
-    const uid = "aaaabbbbccccdddd11@yandex.ru";
-    const realHref = "/c/work/aaaabbbbccccdddd11yandex.ru.ics";
-    const hrefFromUid = `/c/work/${encodeURIComponent(uid)}.ics`;
+  it("потерянный ответ на DELETE — «удалено», а не ошибка, и DELETE ровно один", async () => {
+    const { fake, ctx, path } = weeklyStand();
+    const seen = at(await list(ctx), "2026-10-19");
+    const fault = fake.loseResponse({ method: "DELETE" }, 503);
 
-    function multistatusFor(href: string): string {
-      return `<?xml version="1.0"?>
-<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
-  <d:response>
-    <d:href>${href}</d:href>
-    <d:propstat><d:prop>
-      <d:getetag>1789383239000</d:getetag>
-      <c:calendar-data>BEGIN:VCALENDAR
-VERSION:2.0
-BEGIN:VEVENT
-UID:aaaabbbbccccdddd11@yandex.ru
-DTSTAMP:20261001T090000Z
-DTSTART;TZID=Europe/Moscow:20261019T100000
-DTEND;TZID=Europe/Moscow:20261019T140000
-SUMMARY:Событие с собакой в UID
-END:VEVENT
-END:VCALENDAR</c:calendar-data>
-    </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
-  </d:response>
-</d:multistatus>`;
-    }
+    const mark = fake.mark();
+    const result = await remove(ctx, { id: weeklyMoscow.uid, scope: "all_series", etag: seen.etag });
 
-    function fakeClient(text: string) {
-      const request = vi.fn().mockResolvedValue({
-        status: 207,
-        headers: new Headers(),
-        text,
-      });
-      return { client: { request } as unknown as CaldavClient, request };
-    }
+    expect(fault.fired).toBe(1);
+    expect(writes(fake, mark).filter((entry) => entry.startsWith("DELETE"))).toHaveLength(1);
+    expect(fake.has(path)).toBe(false);
+    expect(result.objectRemoved).toBe(true);
+  });
+});
 
-    function contextFor(client: CaldavClient) {
-      return {
-        client,
-        config: { defaultTimeZone: "Europe/Moscow" } as never,
-        calendars: async () => [calendar],
-        resolveCalendar: async () => calendar,
-      };
-    }
+describe("deleteEvent: границы", () => {
+  it("отказывается удалять из календаря только для чтения", async () => {
+    const readOnly: Calendar = { ...calendarA, readOnly: true };
+    const { fake, ctx } = makeStand({ calendars: [readOnly] });
+    plant(fake, weeklyMoscow, readOnly);
 
-    it("находит событие по ответу сервера и шлёт DELETE по этому пути, а не по hrefFor(calendar, uid)", async () => {
-      const { client, request } = fakeClient(multistatusFor(realHref));
-
-      await deleteEvent(contextFor(client) as never, { id: uid });
-
-      expect(request.mock.calls[0][0].method).toBe("REPORT");
-      expect(request.mock.calls[0][0].path).toBe("/c/work/");
-      expect(request.mock.calls[0][0].body).toContain('<c:prop-filter name="UID">');
-
-      const deleteCall = request.mock.calls.find((call) => call[0].method === "DELETE");
-      expect(deleteCall).toBeDefined();
-      // Ключевая проверка: путь удаления взят из ответа сервера, а не
-      // построен через hrefFor(calendar, uid) — эти два пути для UID с
-      // собакой различаются, и удаление по неверному пути либо ничего не
-      // найдёт, либо (что хуже) попадёт не в тот объект.
-      expect(deleteCall![0].path).toBe(realHref);
-      expect(deleteCall![0].path).not.toBe(hrefFromUid);
-      // If-Match несёт ETag, пришедший от сервера, как есть (без кавычек).
-      expect(deleteCall![0].headers["If-Match"]).toBe("1789383239000");
-    });
-
-    it("бросает понятную ошибку, если событие с таким UID не найдено, и не шлёт DELETE", async () => {
-      const empty = `<?xml version="1.0"?><d:multistatus xmlns:d="DAV:"></d:multistatus>`;
-      const { client, request } = fakeClient(empty);
-
-      await expect(deleteEvent(contextFor(client) as never, { id: uid })).rejects.toThrow(
-        /не найдено/,
-      );
-      expect(request.mock.calls.some((call) => call[0].method === "DELETE")).toBe(false);
-    });
+    const mark = fake.mark();
+    await expect(remove(ctx, { id: weeklyMoscow.uid, scope: "all_series" })).rejects.toThrow(/только для чтения/);
+    expect(writes(fake, mark)).toEqual([]);
   });
 
-  describe("настоящие последовательности вызовов (мутируемый контекст)", () => {
-    // Находка ревью: contextWith выше подставляет ОДИН И ТОТ ЖЕ снимок ics на
-    // каждый вызов get() — второй deleteEvent в тесте видел бы состояние ДО
-    // первого, а не то, что первый реально записал. Это годится для проверки
-    // одного вызова, но не для проверки последовательности: тест на
-    // "this_and_following сохраняет уже существующие EXDATE" (выше) кладёт
-    // готовый EXDATE фикстурой, а не получает его настоящим предыдущим
-    // вызовом deleteEvent — это статическая имитация состояния, а не
-    // последовательность.
-    //
-    // Здесь put()/remove() ДЕЙСТВИТЕЛЬНО меняют то, что вернёт следующий
-    // get() — так же, как в реальности следующий REPORT/GET увидел бы то,
-    // что записал предыдущий PUT/DELETE на сервере. Это единственный способ
-    // честно проверить, что делает ВТОРОЙ вызов deleteEvent, а не то, что мы
-    // заранее решили, будто он должен увидеть.
-    function mutableContextWith(initialIcs: string) {
-      let store: { href: string; etag: string; ics: string } | undefined = {
-        href: "/c/work/x.ics",
-        etag: '"etag-0"',
-        ics: initialIcs,
-      };
-      let etagSeq = 0;
+  it("события с неизвестным идентификатором не выдумывает", async () => {
+    const { fake, ctx } = weeklyStand();
 
-      const get = vi.fn(async () => {
-        if (!store) {
-          throw new Error("Объект уже удалён — сервер больше не находит его по UID.");
-        }
-        return store;
-      });
+    const mark = fake.mark();
+    const refusal = await refused(() => remove(ctx, { id: "нет-такого@yandex.ru", scope: "all_series" }));
 
-      const put = vi.fn(async (href: string, ics: string) => {
-        etagSeq += 1;
-        const etag = `"etag-${etagSeq}"`;
-        store = { href, etag, ics };
-        return etag;
-      });
+    expect(writes(fake, mark)).toEqual([]);
+    expect(refusal.message).toMatch(/не найдено/);
+  });
 
-      const remove = vi.fn(async () => {
-        store = undefined;
-      });
+  // Исход, которого стенд не изображает: сервер отклонил DELETE насовсем.
+  it("отказ сервера назван причиной, объект не тронут", async () => {
+    const { fake, ctx, path } = weeklyStand();
+    const raw: RawObject = { href: path, etag: fake.etag(path), ics: fake.ics(path) };
+    let removes = 0;
+    const io: ObjectIO = {
+      find: async () => raw,
+      put: async () => ({ status: "applied", etag: "x" }),
+      remove: async () => {
+        removes += 1;
+        return { status: "rejected", error: new Error("Сервер: удаление запрещено") };
+      },
+    };
+    ctx.io = io;
 
-      return {
-        context: {
-          client: {} as never,
-          config: { defaultTimeZone: "Europe/Moscow" } as never,
-          calendars: async () => [calendar],
-          resolveCalendar: async () => calendar,
-          get,
-          put,
-          remove,
-        },
-        get,
-        put,
-        remove,
-      };
-    }
+    const refusal = await refused(() => remove(ctx, { id: weeklyMoscow.uid, scope: "all_series", etag: raw.etag }));
 
-    it("удаление одного и того же экземпляра дважды подряд: второй раз — понятная ошибка, а не дубликат исключения и не удаление объекта", async () => {
-      const { context, put, remove } = mutableContextWith(weekly);
-
-      await deleteEvent(context as never, {
-        id: "test-weekly-1",
-        scope: "this",
-        instanceStart: "2026-10-21T10:00:00+03:00",
-      });
-
-      // Первый вызов честно дошёл до PUT с EXDATE — читаем НЕ фикстуру, а то,
-      // что реально записал deleteEvent.
-      expect(put).toHaveBeenCalledTimes(1);
-      const afterFirstDelete = put.mock.calls[0][1];
-      expect(afterFirstDelete).toContain("EXDATE");
-      expect(put.mock.calls[0][2].ifMatch).toBe('"etag-0"');
-
-      // Второй вызов передаёт ТОТ ЖЕ instanceStart. Следующий get() отдаёт
-      // ics с уже стоящим EXDATE (записанный первым вызовом, а не исходную
-      // фикстуру weekly.ics) — assertInstanceExists честно раскрывает повтор
-      // с учётом EXDATE (ICAL.RecurExpansion сам его учитывает) и не находит
-      // экземпляр в 21 октября: он исключён.
-      await expect(
-        deleteEvent(context as never, {
-          id: "test-weekly-1",
-          scope: "this",
-          instanceStart: "2026-10-21T10:00:00+03:00",
-        }),
-      ).rejects.toThrow(/экземпляр/i);
-
-      // Ключевая проверка: второй вызов не должен был дойти ни до PUT
-      // (дубликат EXDATE), ни тем более до DELETE (удаление всего объекта
-      // вместо понятной ошибки) — он обязан остановиться на проверке.
-      expect(put).toHaveBeenCalledTimes(1);
-      expect(remove).not.toHaveBeenCalled();
-    });
-
-    it("удалить экземпляр, затем усечь серию: итоговый объект несёт и поставленное исключение, и границу окончания", async () => {
-      const { context, put, remove } = mutableContextWith(weekly);
-
-      await deleteEvent(context as never, {
-        id: "test-weekly-1",
-        scope: "this",
-        instanceStart: "2026-10-21T10:00:00+03:00",
-      });
-
-      await deleteEvent(context as never, {
-        id: "test-weekly-1",
-        scope: "this_and_following",
-        instanceStart: "2026-11-02T10:00:00+03:00",
-      });
-
-      expect(remove).not.toHaveBeenCalled();
-      expect(put).toHaveBeenCalledTimes(2);
-      // Второй вызов принял ifMatch со свежим ETag, оставленным первым —
-      // ещё одно подтверждение, что состояние действительно перетекает
-      // между вызовами, а не берётся из готового снимка.
-      expect(put.mock.calls[1][2].ifMatch).toBe('"etag-1"');
-
-      // Итоговый ics — тот, что читает ВТОРОЙ вызов put (после усечения),
-      // построенный поверх результата ПЕРВОГО вызова, а не поверх исходной
-      // фикстуры weekly.ics.
-      const finalIcs = put.mock.calls[1][1];
-      expect(finalIcs).toContain("EXDATE;TZID=Europe/Moscow:20261021T100000");
-      expect(finalIcs).toContain("UNTIL=");
-    });
+    expect(removes, "отклонённое удаление не повторяется").toBe(1);
+    expect(refusal.code).toBe("rejected");
+    expect(refusal.message).toContain("удаление запрещено");
   });
 });
