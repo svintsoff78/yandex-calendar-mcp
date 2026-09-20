@@ -9,6 +9,7 @@
   "scripts": {
     "test": "vitest --project unit",
     "test:chains": "vitest run --project chains --passWithNoTests",
+    "test:oracle": "vitest run --project unit tests/oracle/sweep.test.ts",
     "test:tz": "for tz in UTC Europe/Moscow America/New_York; do echo \"== TZ=$tz\" && TZ=$tz EXPECTED_TZ=$tz vitest run --passWithNoTests || exit 1; done",
     "build": "tsc -p ."
   },

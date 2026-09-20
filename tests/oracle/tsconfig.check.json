@@ -1,0 +1,7 @@
+{
+  // Проверка типов файлов оракула: `npx tsc -p tests/oracle/tsconfig.check.json`.
+  // Корневой tsconfig.json берёт только src/**, поэтому у tests/oracle свой.
+  "extends": "../../tsconfig.json",
+  "compilerOptions": { "noEmit": true, "rootDir": "../.." },
+  "include": ["./**/*.ts", "../support/**/*.ts"]
+}
