@@ -326,9 +326,9 @@ describe("серия: update this", () => {
     expect(update(weekly(), { instanceStart: "2026-10-26T10:00:00+03:00", patch: { summary: "Планёрка" } }).kind).toBe("noop");
   });
 
-  it("recurrence у одной встречи — отказ", () => {
+  it("recurrence у одной встречи — отказ по области правки", () => {
     const error = refusal(() => update(weekly(), { instanceStart: "2026-10-26T10:00:00+03:00", patch: { recurrence: { count: 2 } } }));
-    expect(error.code).toBe("invalid-field");
+    expect(error.code).toBe("invalid-scope");
   });
 
   it("смена «весь день» у одной встречи — отказ invalid-time", () => {
@@ -676,24 +676,27 @@ describe("серия: update all_series", () => {
     const DAILY_MSK = ["DTSTART;TZID=Europe/Moscow:20261019T100000", "DTEND;TZID=Europe/Moscow:20261019T110000",
       "RRULE:FREQ=DAILY;COUNT=12", "SUMMARY:Планёрка"];
 
-    it("оторванная встреча идёт за сдвигом и остаётся оторванной; скрытая — под своим EXDATE", () => {
+    it("оторванная встреча за сдвигом не идёт (слота у неё нет); скрытая на слоте — под своим EXDATE", () => {
       const detached = override("20261022T103000", "20261022T103000", "20261022T113000", "SUMMARY:Чужое");
       const hidden = override("20261024T100000", "20261024T100000", "20261024T110000", "SUMMARY:След");
       const o = load(calendar(MOSCOW, vevent([...DAILY_MSK, "EXDATE;TZID=Europe/Moscow:20261024T100000"]), detached, hidden));
       const plan = update(o, { scope: "all_series", patch: { start: "2026-10-19T12:00:00+03:00" } });
       const ics = icsOf(plan);
-      expect(overrideLines(ics, "20261022T123000")).toEqual(expect.arrayContaining([
-        "DTSTART;TZID=Europe/Moscow:20261022T123000", "DTEND;TZID=Europe/Moscow:20261022T133000",
+      // 22.10 10:30 — мимо слотов: ни адрес, ни время не меняются.
+      expect(overrideLines(ics, "20261022T103000")).toEqual(expect.arrayContaining([
+        "DTSTART;TZID=Europe/Moscow:20261022T103000", "DTEND;TZID=Europe/Moscow:20261022T113000",
       ]));
+      // 24.10 10:00 — слот, закрытый EXDATE: адрес переезжает вместе со слотом.
       expect(linesNamed(masterLines(ics), "EXDATE")).toEqual(["EXDATE;TZID=Europe/Moscow:20261024T120000"]);
       expect(overrideLines(ics, "20261024T120000")).toEqual(expect.arrayContaining([
         "SUMMARY:След", "DTSTART;TZID=Europe/Moscow:20261024T120000", "DTEND;TZID=Europe/Moscow:20261024T130000",
       ]));
       const next = after(plan);
       expect(visible(next).filter((line) => line.includes("Чужое"))).toEqual([
-        "2026-10-22T12:30:00+03:00 → 2026-10-22T12:30:00+03:00–13:30 Чужое",
+        "2026-10-22T10:30:00+03:00 → 2026-10-22T10:30:00+03:00–11:30 Чужое",
       ]);
       expect(visible(next).some((line) => line.includes("След"))).toBe(false);
+      expect(plan.notices.join(" ")).toContain("2026-10-22T10:30:00+03:00");
     });
 
     it("RDATE сдвигается на ту же стенную разницу", () => {
@@ -910,12 +913,15 @@ describe("серия: update this_and_following (разрез, Р9)", () => {
     expect(linesNamed(tail, "RRULE")).toEqual(["RRULE:FREQ=DAILY;UNTIL=20261030"]);
   });
 
-  it("скрытое переопределение ≥ B переходит в продолжение и остаётся скрытым", () => {
+  it("скрытое переопределение ≥ B остаётся в исходном объекте: продолжение рождается без следов", () => {
     const hidden = override("20261028T100000", "20261028T100000", "20261028T110000", "SUMMARY:След");
     const o = load(calendar(MOSCOW, vevent([...WEEKLY, "EXDATE;TZID=Europe/Moscow:20261028T100000"]), hidden));
     const plan = split(update(o, { scope: "this_and_following", instanceStart: B, patch: { start: "2026-10-26T12:00:00+03:00" } }));
-    expect(overrideLines(plan.continuation.ics, "20261028T120000")).toContain("SUMMARY:След");
-    expect(visible(load(plan.continuation.ics)).some((line) => line.includes("След"))).toBe(false);
+    expect(events(plan.continuation.ics)).toHaveLength(1);
+    expect(linesNamed(masterLines(plan.continuation.ics), "EXDATE")).toEqual(["EXDATE;TZID=Europe/Moscow:20261028T120000"]);
+    expect(overrideLines(plan.truncated.ics, "20261028T100000")).toContain("SUMMARY:След");
+    expect(visible(load(plan.truncated.ics)).some((line) => line.includes("След"))).toBe(false);
+    expect(plan.removed).toEqual([]);
   });
 
   it("с recurrence: правило продолжения меняется, переопределение без пары — needsConfirm", () => {
@@ -1653,8 +1659,9 @@ describe("правка по ревью: ни одна ветка не теряе
       ]);
     });
 
-    it("смена пояса: оторванная встреча продолжения совпала бы со встречей серии — split-mismatch с адресом в поясе серии", () => {
+    it("смена пояса: оторванная встреча прежней серии совпала бы со встречей продолжения — split-mismatch с адресом в поясе серии", () => {
       // 28.10 11:00 МСК = 08:00Z; после смены пояса встреча серии 28.10 — 09:00 CET = 08:00Z.
+      // Оторванная остаётся в прежнем объекте, но её адрес назвал бы и встречу продолжения.
       const o = load(calendar(MOSCOW, vevent(DAILY_MSK), override("20261028T110000", "20261028T110000", "20261028T120000", "SUMMARY:Чужое")));
       const error = refusal(() => update(o, {
         scope: "this_and_following", instanceStart: "2026-10-21T10:00:00+03:00", patch: { timeZone: "Europe/Berlin" },
@@ -1956,6 +1963,132 @@ describe("правка по перепроверке: свой пояс пере
     expect(error.message).toContain("2026-11-09T10:00:00+03:00");
     expect(error.message).toContain("2026-10-20T16:00:00+03:00");
     expect(error.hint ?? "").toContain("all_series");
+  });
+});
+
+// ─────────────────── переопределение без слота не принадлежит серии ───────────────────
+
+// Переопределение, чей RECURRENCE-ID не совпадает ни с одним слотом серии
+// (скрытый след за её концом, оторванная встреча), к правилу повтора не
+// привязано: время серии его не двигает, при разрезе оно остаётся в прежнем
+// объекте, и о нём сказано в ответе.
+describe("переопределение без слота серии", () => {
+  /** Ср 12:00–13:00 МСК с 21.10.2026, COUNT=3 (по 04.11); след с RECURRENCE-ID 18.11 — за концом серии. */
+  function pastEnd(): CalendarObject {
+    return load(calendar(MOSCOW,
+      vevent(["DTSTART;TZID=Europe/Moscow:20261021T120000", "DTEND;TZID=Europe/Moscow:20261021T130000",
+        "RRULE:FREQ=WEEKLY;BYDAY=WE;COUNT=3", "SUMMARY:Короткая серия"]),
+      override("20261118T120000", "20261118T120000", "20261118T130000", "SUMMARY:За концом")));
+  }
+
+  /** Пн и Ср 10:00 МСК, COUNT=6, и оторванная встреча с RECURRENCE-ID 21.10 15:00 — мимо слотов. */
+  function detached(): CalendarObject {
+    return load(calendar(MOSCOW, vevent(WEEKLY),
+      override("20261021T150000", "20261021T150000", "20261021T160000", "SUMMARY:Отдельная")));
+  }
+
+  describe("время серии их не двигает", () => {
+    it("скрытый след за концом серии: RECURRENCE-ID, начало и конец прежние", () => {
+      const plan = update(pastEnd(), { scope: "all_series", patch: { start: "2026-10-21T14:30:00+03:00" } });
+      const ics = icsOf(plan);
+      expect(linesNamed(masterLines(ics), "DTSTART")).toEqual(["DTSTART;TZID=Europe/Moscow:20261021T143000"]);
+      const trace = overrideLines(ics, "20261118T120000");
+      expect(linesNamed(trace, "RECURRENCE-ID")).toEqual(["RECURRENCE-ID;TZID=Europe/Moscow:20261118T120000"]);
+      expect(linesNamed(trace, "DTSTART")).toEqual(["DTSTART;TZID=Europe/Moscow:20261118T120000"]);
+      expect(linesNamed(trace, "DTEND")).toEqual(["DTEND;TZID=Europe/Moscow:20261118T130000"]);
+      // Роль прежняя: встречи по этому адресу как не было, так и нет.
+      expect(visible(after(plan)).some((line) => line.includes("За концом"))).toBe(false);
+    });
+
+    it("оторванная встреча: её адрес и время прежние, встречи серии сдвинуты", () => {
+      const plan = update(detached(), { scope: "all_series", patch: { start: "2026-10-19T14:30:00+03:00" } });
+      const own = overrideLines(icsOf(plan), "20261021T150000");
+      expect(linesNamed(own, "DTSTART")).toEqual(["DTSTART;TZID=Europe/Moscow:20261021T150000"]);
+      expect(linesNamed(own, "DTEND")).toEqual(["DTEND;TZID=Europe/Moscow:20261021T160000"]);
+      expect(visible(after(plan)).filter((line) => line.includes("Отдельная"))).toEqual([
+        "2026-10-21T15:00:00+03:00 → 2026-10-21T15:00:00+03:00–16:00 Отдельная",
+      ]);
+      expect(visible(after(plan))[0]).toBe("2026-10-19T14:30:00+03:00 → 2026-10-19T14:30:00+03:00–15:30 Планёрка");
+    });
+
+    it("смена пояса серии: у следа тот же момент, записанный в поясе серии (О4)", () => {
+      // 18.11 12:00 МСК = 09:00Z, в Берлине (CET) это 10:00; своё начало следа не трогается вовсе.
+      const plan = update(pastEnd(), { scope: "all_series", patch: { timeZone: "Europe/Berlin" } });
+      const ics = icsOf(plan);
+      expect(linesNamed(masterLines(ics), "DTSTART")).toEqual(["DTSTART;TZID=Europe/Berlin:20261021T110000"]);
+      const trace = overrideLines(ics, "20261118T100000");
+      expect(linesNamed(trace, "RECURRENCE-ID")).toEqual(["RECURRENCE-ID;TZID=Europe/Berlin:20261118T100000"]);
+      expect(linesNamed(trace, "DTSTART")).toEqual(["DTSTART;TZID=Europe/Moscow:20261118T120000"]);
+    });
+
+    it("t&f по первой встрече (разреза нет): след за концом серии на своём адресе", () => {
+      const plan = update(pastEnd(), {
+        scope: "this_and_following", instanceStart: "2026-10-21T12:00:00+03:00", patch: { start: "2026-10-21T14:30:00+03:00" },
+      });
+      expect(linesNamed(overrideLines(icsOf(plan), "20261118T120000"), "RECURRENCE-ID"))
+        .toEqual(["RECURRENCE-ID;TZID=Europe/Moscow:20261118T120000"]);
+    });
+
+    it("в ответе сказано, почему встреча не сдвинулась вместе с серией", () => {
+      const notices = update(detached(), { scope: "all_series", patch: { start: "2026-10-19T14:30:00+03:00" } }).notices.join(" ");
+      expect(notices).toContain("2026-10-21T15:00:00+03:00");
+      expect(notices).toContain("Отдельная");
+      expect(notices).toContain("вне правила повтора");
+
+      const traced = update(pastEnd(), { scope: "all_series", patch: { start: "2026-10-21T14:30:00+03:00" } }).notices.join(" ");
+      expect(traced).toContain("2026-11-18T12:00:00+03:00");
+      expect(traced).toContain("вне правила повтора");
+    });
+  });
+
+  describe("разрез их не уносит в продолжение", () => {
+    it("скрытый след за концом серии остаётся в исходном объекте, продолжение — без него", () => {
+      const plan = split(update(pastEnd(), {
+        scope: "this_and_following", instanceStart: "2026-10-28T12:00:00+03:00", patch: { summary: "Хвост" },
+      }));
+      expect(events(plan.continuation.ics)).toHaveLength(1);
+      expect(linesNamed(overrideLines(plan.truncated.ics, "20261118T120000"), "SUMMARY")).toEqual(["SUMMARY:За концом"]);
+      expect(plan.notices.join(" ")).toContain("2026-11-18T12:00:00+03:00");
+      expect(plan.removed).toEqual([]);
+    });
+
+    it("оторванная встреча хвоста остаётся в исходном объекте; потеря видимости — с confirm", () => {
+      const o = load(calendar(MOSCOW, vevent(WEEKLY),
+        override("20261028T153000", "20261028T153000", "20261028T163000", "SUMMARY:Отдельная")));
+      const where = { scope: "this_and_following" as const, instanceStart: "2026-10-26T10:00:00+03:00", patch: { summary: "Хвост" } };
+      const error = refusal(() => update(o, where));
+      expect(error.needsConfirm).toBe(true);
+      expect(error.losses.map((loss) => loss.instanceStart)).toEqual(["2026-10-28T15:30:00+03:00"]);
+
+      const plan = split(update(o, { ...where, confirm: true, etag: ETAG, currentEtag: ETAG }));
+      expect(events(plan.continuation.ics)).toHaveLength(1);
+      // Компонент цел: теряется только видимость, данные остаются скрытыми.
+      expect(linesNamed(overrideLines(plan.truncated.ics, "20261028T153000"), "SUMMARY")).toEqual(["SUMMARY:Отдельная"]);
+      expect(visible(load(plan.truncated.ics)).some((line) => line.includes("Отдельная"))).toBe(false);
+      expect(plan.removed.map((loss) => loss.instanceStart)).toEqual(["2026-10-28T15:30:00+03:00"]);
+      expect(plan.notices.join(" ")).toContain("2026-10-28T15:30:00+03:00");
+    });
+
+    it("переопределение слота уходит в продолжение по-прежнему", () => {
+      const own = override("20261028T100000", "20261028T113000", "20261028T123000", "SUMMARY:Своё");
+      const o = load(calendar(MOSCOW, vevent(WEEKLY), own));
+      const plan = split(update(o, {
+        scope: "this_and_following", instanceStart: "2026-10-26T10:00:00+03:00", patch: { summary: "Хвост" },
+      }));
+      expect(events(plan.continuation.ics)).toHaveLength(2);
+      expect(linesNamed(overrideLines(plan.continuation.ics, "20261028T100000"), "DTSTART"))
+        .toEqual(["DTSTART;TZID=Europe/Moscow:20261028T113000"]);
+      expect(events(plan.truncated.ics)).toHaveLength(1);
+    });
+  });
+
+  it("повтор со scope this: отказ по области правки, подсказка про all_series и this_and_following", () => {
+    const error = refusal(() => update(weekly(), {
+      scope: "this", instanceStart: "2026-10-21T10:00:00+03:00", patch: { recurrence: { count: 3 } },
+    }));
+    expect(error.code).toBe("invalid-scope");
+    expect(error.hint ?? "").toContain("all_series");
+    expect(error.hint ?? "").toContain("this_and_following");
   });
 });
 

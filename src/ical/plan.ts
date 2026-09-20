@@ -113,6 +113,8 @@ export interface Loss {
  * Код отказа правки. Коды этой задачи (patch.ts):
  * - `invalid-field` — пустой summary, неверный участник или напоминание,
  *   неизвестное поле патча;
+ * - `invalid-scope` — поле патча известно, но в названной области правки не
+ *   меняется (повтор у одной встречи): дело не в поле, а в scope;
  * - `invalid-time` — время не разобрано, не той формы (дата вместо времени и
  *   наоборот), из разрыва перевода часов, конец не позже начала, смена
  *   «весь день» без нужных start и end;
@@ -127,6 +129,7 @@ export interface Loss {
  */
 export type RefusalCode =
   | "invalid-field"
+  | "invalid-scope"
   | "invalid-time"
   | "unknown-timezone"
   | "invalid-rule"

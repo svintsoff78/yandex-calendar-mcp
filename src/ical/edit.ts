@@ -23,6 +23,7 @@ import {
   type AnomalyCode,
   type CalendarObject,
   type EditOp,
+  type OverrideRef,
   type OverrideRole,
   type Unparsable,
 } from "./object.js";
@@ -733,14 +734,21 @@ function deleteDetachedFollowing(run: Run, boundary: SlotKey, early: Loss[], ear
   return { kind: "put", ics: serializeObject(work), expect, removed, notices: run.notices };
 }
 
+/** Пустой набор ключей: усечение без оставляемых в объекте переопределений. */
+const NO_KEYS: ReadonlySet<SlotKey> = new Set<SlotKey>();
+
 /**
  * Усечение серии перед границей (таблица §3, t&f): COUNT — число позиций
  * правила до границы (форма ограничения сохраняется), иначе UNTIL по О4 на
  * секунду (у дат — на день) раньше границы, но не позже прежнего UNTIL;
  * EXDATE, RDATE и переопределения не раньше границы снимаются. Всё до
  * границы и свойства вне модели не трогаются.
+ *
+ * `keep` — ключи переопределений, которые остаются в объекте, хотя их адрес
+ * не раньше границы: у разреза это переопределения без слота серии, которые
+ * в продолжение не переходят (`updateSplit`).
  */
-function truncate(run: Run, work: CalendarObject, boundary: SlotKey, boundaryTime: ICAL.Time, touched: Touched): void {
+function truncate(run: Run, work: CalendarObject, boundary: SlotKey, boundaryTime: ICAL.Time, touched: Touched, keep: ReadonlySet<SlotKey> = NO_KEYS): void {
   const { o } = run;
   const master = work.master!;
   const rule = master.getFirstProperty("rrule");
@@ -755,7 +763,7 @@ function truncate(run: Run, work: CalendarObject, boundary: SlotKey, boundaryTim
   dropListValues(master, "exdate", work, atOrAfter, touched);
   dropListValues(master, "rdate", work, atOrAfter, touched);
   for (const [key, refs] of work.overrides) {
-    if (!atOrAfter(key)) continue;
+    if (!atOrAfter(key) || keep.has(key)) continue;
     for (const ref of refs) removeComponent(work.root, ref.component, touched);
   }
   stampTouched(run, [master], touched);
@@ -845,10 +853,12 @@ function ownMeetingsFrom(o: CalendarObject, from: SlotKey): Instance[] {
  * их компоненты не снимаются — остаются скрытыми (их можно удалить delete
  * this по адресу): так теряется только видимость, а не данные.
  */
-function becameHidden(o: CalendarObject, next: CalendarObject, boundary: SlotKey): Array<{ key: SlotKey; loss: Loss }> {
+function becameHidden(o: CalendarObject, next: CalendarObject, boundary: SlotKey, kept: ReadonlySet<SlotKey>): Array<{ key: SlotKey; loss: Loss }> {
   const lost: Array<{ key: SlotKey; loss: Loss }> = [];
   for (const [key, refs] of o.overrides) {
-    if (compareSlotKeys(key, boundary) >= 0) continue;
+    // Переопределения хвоста ушли в продолжение — кроме оставленных в объекте
+    // (`keep` усечения): эти усечение прячет так же, как встречи до границы.
+    if (compareSlotKeys(key, boundary) >= 0 && !kept.has(key)) continue;
     const role = o.roles.get(refs[0].component)?.role;
     if (role === "hidden") continue;
     const now = roleOfKey(next, key);
@@ -859,10 +869,10 @@ function becameHidden(o: CalendarObject, next: CalendarObject, boundary: SlotKey
   return lost;
 }
 
-const HIDDEN_MESSAGE = "Встречи до границы остались бы за концом усечённой серии и стали бы невидимы (их компоненты сохранятся скрытыми).";
+const HIDDEN_MESSAGE = "Встречи, остающиеся в прежней серии, оказались бы за концом усечённой серии и стали бы невидимы (их компоненты сохранятся скрытыми).";
 
 /**
- * Оторванные встречи до границы, которые усечение сделало бы невидимыми
+ * Оторванные встречи, которые усечение сделало бы невидимыми
  * (`becameHidden`): с confirm — потеря видимости, данные остаются. Но если
  * после усечения в объекте не осталось бы ни одной видимой встречи, отказ:
  * пустой объект не записывается (Р3), а удалить его целиком — значит
@@ -871,8 +881,14 @@ const HIDDEN_MESSAGE = "Встречи до границы остались бы
  * перенесённая раньше неё, — она уходит в продолжение (у правки; у удаления
  * этот путь не встречается, там до границы есть встреча по адресу).
  */
-function hiddenAfterCut(o: CalendarObject, next: CalendarObject, boundary: SlotKey, op: EditOp): Array<{ key: SlotKey; loss: Loss }> {
-  const hidden = becameHidden(o, next, boundary);
+function hiddenAfterCut(
+  o: CalendarObject,
+  next: CalendarObject,
+  boundary: SlotKey,
+  op: EditOp,
+  kept: ReadonlySet<SlotKey> = NO_KEYS,
+): Array<{ key: SlotKey; loss: Loss }> {
+  const hidden = becameHidden(o, next, boundary, kept);
   if (!isEmpty(next)) return hidden;
   if (hidden.length > 0) {
     throw cutRefusal(
@@ -1243,7 +1259,8 @@ function requireSynced(next: CalendarObject, what: string): void {
 function updateThis(run: Run, target: Target, patch: EventPatch): WritePlan {
   const { o } = run;
   if (patch.recurrence !== undefined) {
-    throw new EditRefusal("invalid-field", "Повтор (recurrence) меняется у всей серии или у её хвоста, а не у одной встречи.", {
+    // Поле известное, не годится область правки: код про scope, а не про поле.
+    throw new EditRefusal("invalid-scope", "Повтор (recurrence) меняется у всей серии или у её хвоста, а не у одной встречи.", {
       hint: 'Передайте scope: "all_series" или "this_and_following".',
     });
   }
@@ -1316,6 +1333,73 @@ function overridesOf(o: CalendarObject): OverrideInfo[] {
 function isMoved(c: ICAL.Component, key: SlotKey, o: CalendarObject): boolean {
   const start = c.getFirstPropertyValue("dtstart") as ICAL.Time;
   return slotKeyOf(start, o.form, o.env) !== key || start.isDate !== (o.form === "date");
+}
+
+/**
+ * Переопределение привязано к серии: его RECURRENCE-ID стоит на слоте —
+ * незакрытом (роль slot) или закрытом EXDATE (роль hidden под исключением).
+ * Только такое переопределение идёт за временем серии: слот переезжает, и
+ * адрес переезжает вместе с ним.
+ *
+ * У остальных (след за концом серии или раньше её начала, оторванная
+ * встреча) слота нет, и сдвиг их адреса ничего не сохраняет: сама встреча
+ * остаётся на своём времени, а её адрес — тот, по которому её правят и
+ * удаляют, — менялся бы без причины. На сервере такой сдвиг ещё и создаёт
+ * новую сироту: RECURRENCE-ID мимо слотов на ключе, которого в прежней
+ * версии объекта не было.
+ *
+ * Перебор оборвался (серия длиннее предела) — привязки не видно: считаем,
+ * что её нет, и ничего не двигаем. Так ветка не заводит нового отказа там,
+ * где прежняя сдвигала вслепую.
+ */
+function boundToSlot(o: CalendarObject, key: SlotKey, role: OverrideRole): boolean {
+  if (role === "slot") return true;
+  if (role === "detached") return false;
+  try {
+    return findSlot(o, key) !== undefined;
+  } catch (error) {
+    if (error instanceof SlotScanError) return false;
+    throw error;
+  }
+}
+
+/** «2026-11-18T12:00:00+03:00 «Короткая серия»» — адрес встречи и её заголовок для notice. */
+function meetingLabel(o: CalendarObject, key: SlotKey): string {
+  const refs = o.overrides.get(key) ?? [];
+  const summary = refs.length > 0 ? summaryOf(refs[0].component) : "";
+  return `${keyLabel(o, key, "instance")}${summary ? ` «${summary}»` : ""}`;
+}
+
+/**
+ * Правка сдвинула время серии, а переопределения без слота остались на своём
+ * месте: без объяснения непонятно, почему одна встреча не изменилась.
+ */
+function unmovedNotices(o: CalendarObject, infos: readonly OverrideInfo[]): string[] {
+  const notices: string[] = [];
+  for (const info of infos) {
+    if (boundToSlot(o, info.oldKey, info.role)) continue;
+    const label = meetingLabel(o, info.oldKey);
+    notices.push(
+      info.role === "hidden"
+        ? `Скрытый след встречи ${label} стоит вне правила повтора: время серии изменилось, его время и адрес прежние.`
+        : `Встреча ${label} стоит вне правила повтора: время серии изменилось, её время и адрес прежние.`,
+    );
+  }
+  return notices;
+}
+
+/**
+ * Разрез: переопределения без слота серии остались в прежнем объекте (в
+ * продолжение переходят только встречи правила), и правку хвоста они не
+ * получили.
+ */
+function stayedBehindNotices(o: CalendarObject, refs: readonly OverrideRef[]): string[] {
+  return refs.map((ref) => {
+    const label = meetingLabel(o, ref.key);
+    return o.roles.get(ref.component)?.role === "hidden"
+      ? `Скрытый след встречи ${label} остался в прежней серии: в продолжение переходят только встречи по правилу повтора.`
+      : `Встреча ${label} стоит отдельно от правила повтора: она осталась в прежней серии, в продолжение не перешла и правку не получила.`;
+  });
 }
 
 /**
@@ -1405,7 +1489,10 @@ function updateAll(run: Run, patch: EventPatch, scope: EditScope, boundary?: Slo
     if (boundary && info.oldKey === boundary.key) applyRebased(run, info.component, fields, touched, { place, literalLater: true, quiet: true });
     else if (inheritable.length > 0) inheritFields(info.component, oldMaster, master, inheritable, touched);
   }
-  if (retimed) checkPositional(o, copyOf(work), infos, retimed);
+  if (retimed) {
+    checkPositional(o, copyOf(work), infos, retimed);
+    run.notices.push(...unmovedNotices(o, infos));
+  }
 
   // 2. Повтор (Р1, Р4): сопоставление по ключу.
   let ruleChanged = startMoved || (retimed?.untilChanged ?? false);
@@ -1655,16 +1742,25 @@ type SlotTarget = Extract<Target, { kind: "single" | "slot" }>;
  * Р9): продолжение — клон основного без SEQUENCE и CREATED с UID
  * `continuationUid`, DTSTART = дата B и время патча (дата — только с
  * recurrence, и не раньше даты B), COUNT минус позиции до B, UNTIL пересчитан
- * по последней встрече; EXDATE, RDATE и переопределения с адресом ≥ B
+ * по последней встрече; EXDATE, RDATE и переопределения слотов с адресом ≥ B
  * переходят в продолжение со сдвигом по позиции, поля — по О7, встреча B
  * получает патч безусловно; расписание сверяется с хвостом исходной серии
  * (`sameTail`). Исходный объект усекается перед B.
  *
+ * Переопределения без слота (скрытый след, оторванная встреча) в продолжение
+ * не переходят: своего места в правиле у них нет, в новом объекте их адрес
+ * был бы новой сиротой (О12а) и сервер отверг бы запись, а двигать адрес не
+ * за чем. Они остаются в прежнем объекте — аномалий там от этого не
+ * прибавляется, они там и были, — и о них сказано в ответе. Оторванная
+ * встреча при этом оказывается за концом усечённой серии и перестаёт быть
+ * видимой: это потеря сверх цели, она названа в перечне и требует confirm,
+ * компонент остаётся на месте скрытым.
+ *
  * Пустой патч (О13) ничего не пишет и серию не делит. Все потери разреза —
  * письма чужим участникам (новое событие может разослать приглашения),
- * встречи без пары в новом правиле, скрытые следы, встречи до B, которые
- * усечение сделало бы невидимыми, — подтверждаются одним отказом с полным
- * перечнем (О11).
+ * встречи без пары в новом правиле, скрытые следы, встречи, которые усечение
+ * сделало бы невидимыми, — подтверждаются одним отказом с полным перечнем
+ * (О11).
  */
 function updateSplit(run: Run, target: SlotTarget, patch: EventPatch): WritePlan {
   const { o, env } = run;
@@ -1675,7 +1771,12 @@ function updateSplit(run: Run, target: SlotTarget, patch: EventPatch): WritePlan
   const recurrence = patch.recurrence;
   const requested = requestedFields(patch);
   const toggle = fields.allDay !== undefined && fields.allDay !== (o.form === "date");
-  const moving = [...o.overrides].filter(([key]) => compareSlotKeys(key, boundary) >= 0).flatMap(([, refs]) => refs);
+  // В продолжение переходят только переопределения со слотом серии; остальные
+  // (`staying`) остаются в прежнем объекте.
+  const tailRefs = [...o.overrides].filter(([key]) => compareSlotKeys(key, boundary) >= 0).flatMap(([, refs]) => refs);
+  const moving = tailRefs.filter((ref) => o.roles.get(ref.component)?.role === "slot");
+  const staying = tailRefs.filter((ref) => o.roles.get(ref.component)?.role !== "slot");
+  const stayingKeys = new Set(staying.map((ref) => ref.key));
   if (toggle) refuseToggle(o, moving.length > 0);
 
   // Продолжение: VCALENDAR с копиями нужных VTIMEZONE, клон основного и переносимых переопределений.
@@ -1784,6 +1885,7 @@ function updateSplit(run: Run, target: SlotTarget, patch: EventPatch): WritePlan
   const continuationText = textOf(root);
   const continuation = reparse(continuationText, env);
   if (target.slot.sources.includes("rrule")) requireSynced(continuation, "первая встреча продолжения");
+  refuseSharedAddress(o, continuation, staying);
   if (recurrence === undefined) {
     const tail = sameTail(o, boundary, continuation, retimed.mapper.mapKey);
     if (!tail.same) {
@@ -1802,8 +1904,8 @@ function updateSplit(run: Run, target: SlotTarget, patch: EventPatch): WritePlan
   // Исходный объект: усечение перед границей.
   const work = copyOf(o);
   const touched = newTouched();
-  truncate(run, work, boundary, boundaryTime, touched);
-  const hidden = hiddenAfterCut(o, copyOf(work), boundary, "update");
+  truncate(run, work, boundary, boundaryTime, touched, stayingKeys);
+  const hidden = hiddenAfterCut(o, copyOf(work), boundary, "update", stayingKeys);
 
   // Подтверждение (О11): все потери разреза — одним отказом с полным перечнем.
   const guests = foreignAttendees([o.master!, ...moving.map((ref) => ref.component)], env);
@@ -1815,6 +1917,7 @@ function updateSplit(run: Run, target: SlotTarget, patch: EventPatch): WritePlan
     throw needConfirm(losses, [guestMessage, step ? ruleConfirmMessage(step) : "", hidden.length > 0 ? HIDDEN_MESSAGE : ""].filter(Boolean).join(" "));
   }
   if (guestMessage) run.notices.push(guestMessage);
+  run.notices.push(...stayedBehindNotices(o, staying));
   run.notices.push(...hiddenNotice(hidden));
   run.notices.push(...movedPastBoundary(o, boundary, instantOf(boundaryTime, env), "остаются в прежней серии: их адрес раньше границы, изменения к ним не применены"));
   for (const info of infos) {
@@ -1843,6 +1946,35 @@ function updateSplit(run: Run, target: SlotTarget, patch: EventPatch): WritePlan
     removed: losses,
     notices: run.notices,
   };
+}
+
+/**
+ * Переопределение, оставшееся в прежней серии (`staying` разреза), не должно
+ * оказаться по одному адресу со встречей продолжения: один адрес называл бы
+ * две разные встречи в двух объектах, и правка или удаление по нему шли бы
+ * наугад. Так бывает при смене пояса: оторванная встреча стоит на моменте,
+ * который в новом поясе приходится на встречу серии.
+ *
+ * Перебор продолжения оборвался (серия длиннее предела) — совпадения не
+ * видно: отказывать не по чему, и разрез идёт как обычно.
+ */
+function refuseSharedAddress(o: CalendarObject, continuation: CalendarObject, staying: readonly OverrideRef[]): void {
+  for (const ref of staying) {
+    const key = slotKeyOf(ref.recurrenceId, continuation.form, continuation.env);
+    let taken: boolean;
+    try {
+      const slot = findSlot(continuation, key);
+      taken = (slot !== undefined && !slot.excluded) || continuation.overrides.has(key);
+    } catch (error) {
+      if (!(error instanceof SlotScanError)) throw error;
+      taken = false;
+    }
+    if (!taken) continue;
+    throw splitMismatch(
+      `Встреча ${keyLabel(o, ref.key, "instance")} стоит вне правила повтора и остаётся в прежней серии, ` +
+        "а в продолжении по её адресу оказалась бы встреча серии: один адрес называл бы две разные встречи",
+    );
+  }
 }
 
 /**
@@ -1985,11 +2117,14 @@ interface Retimed {
  *   тем же сдвигом, что RDATE;
  * - UNTIL — время новой встречи на месте последней встречи под прежним UNTIL
  *   (`lastSlotUpTo`, без горизонта; дальше предела — until-too-far);
- * - RECURRENCE-ID: slot — новая встреча той же позиции; hidden — так же или
- *   сдвигом; detached — сдвигом. Неперенесённые (начало = RID, в том числе
- *   скрытые) идут за новым временем, их длительность — за длительностью
- *   основного, если совпадала с прежней; перенесённые остаются на своём
- *   времени (О7).
+ * - RECURRENCE-ID переопределения со слотом (`boundToSlot`: роль slot или
+ *   скрытое под EXDATE) — новая встреча той же позиции, а если пары нет —
+ *   сдвигом. Неперенесённые (начало = RID, в том числе скрытые) идут за новым
+ *   временем, их длительность — за длительностью основного, если совпадала с
+ *   прежней; перенесённые остаются на своём времени (О7);
+ * - переопределение без слота (след за концом серии или раньше её начала,
+ *   оторванная встреча) за серией не идёт вовсе: его адрес и его время
+ *   прежние, значение адреса только переписывается в форме серии (О4).
  */
 function retime(input: RetimeInput): Retimed {
   const { run, source, root, master, touched } = input;
@@ -2064,9 +2199,20 @@ function retime(input: RetimeInput): Retimed {
   }
 
   // RECURRENCE-ID и время переопределений (О7).
+  // Значения переопределения без слота: тот же момент, только в форме серии
+  // (О4). Стенная разница якоря к ним не применяется — за серией они не идут.
+  const keepMoment: Shift = { ...shift, mode: "moment" };
   for (const info of input.overrides) {
     const c = info.component;
     const ridProperty = c.getFirstProperty("recurrence-id")!;
+    // Переопределение без слота серии к правилу не привязано: его адрес и
+    // его собственное время остаются прежними, значение только переписывается
+    // в форме серии (О4) — тем же моментом.
+    if (!boundToSlot(source, info.oldKey, info.role)) {
+      const kept = shiftTime(ridProperty.getFirstValue() as ICAL.Time, keepMoment);
+      if (!sameTimeValue(ridProperty, kept)) markProperty(touched, c, setTimeProperty(c, "recurrence-id", kept));
+      continue;
+    }
     // Кадры читаются до правки адреса и начала: они сверяются с прежним
     // RECURRENCE-ID (в прежней форме и поясе серии), а после записи нового
     // адреса такой сверки уже не сделать.
@@ -2077,7 +2223,7 @@ function retime(input: RetimeInput): Retimed {
     if (info.role === "slot") {
       if (!mapped) throw new MappingError(`У встречи ${formatForModel(ridProperty.getFirstValue() as ICAL.Time, env, "instance")} нет пары в сдвинутой серии.`);
       rid = mapped.clone();
-    } else if (info.role === "hidden" && mapped) {
+    } else if (mapped) {
       rid = mapped.clone();
     } else {
       rid = shiftTime(ridProperty.getFirstValue() as ICAL.Time, shift);

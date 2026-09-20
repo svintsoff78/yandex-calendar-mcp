@@ -65,13 +65,18 @@ describe("пояс процесса", () => {
     }
   });
 
-  it("test:tz гоняет весь набор под UTC, Europe/Moscow и America/New_York и падает на первом сбое", () => {
+  it("test:tz гоняет весь набор под UTC, Europe/Moscow и America/New_York и падает в конце, если упал хоть один", () => {
     const script = packageScripts()["test:tz"];
     expect(script).toBeDefined();
     for (const zone of ZONES) expect(script).toContain(zone);
     // Пояс задаётся до старта процесса и тем же значением уходит стражу.
     expect(script).toMatch(/TZ=\$\w+ EXPECTED_TZ=\$\w+ /);
-    expect(script).toContain("|| exit 1");
+    // Сбой одного пояса не обрывает прогон: прогоняются все три, сбой
+    // запоминается, и падение — в конце. Иначе о поясах после первого
+    // упавшего не было бы известно ничего.
+    expect(script).not.toContain("|| exit 1");
+    expect(script).toMatch(/\|\|\s*failed=/);
+    expect(script).toContain("exit 1");
   });
 
   it("цепочки — отдельный проект chains, который npm test не запускает", () => {
