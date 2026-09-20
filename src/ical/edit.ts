@@ -20,6 +20,7 @@ import {
   serializeObject,
   shownOverride,
   type Anomaly,
+  type AnomalyCode,
   type CalendarObject,
   type EditOp,
   type OverrideRole,
@@ -117,10 +118,15 @@ import {
  *   Существует ли продолжение на сервере, выясняет доставка чтением (Ж13,
  *   src/domain/writes.ts), а не планировщик.
  *
- * Порядок решения: блокирующие аномалии объекта → адрес (`resolveTarget`:
- * неоднозначный адрес без подтверждения — отказ ambiguous) → ветка по виду
- * объекта и scope → ожидание для предохранителя (`Expectation`: `touched` —
- * из patch.ts, `tail` — из `seriesExtent`).
+ * - Объект, уже испорченный другим клиентом (дубль RECURRENCE-ID, несколько
+ *   RRULE у основного компонента), не правится вовсе: `refuseCorrupted` (О14
+ *   с поправкой З10). Писать в него — угадывать, какое из двух противоречащих
+ *   описаний встречи или серии настоящее; целиком удалить его можно.
+ *
+ * Порядок решения: порча другим клиентом → блокирующие аномалии объекта →
+ * адрес (`resolveTarget`: неоднозначный адрес без подтверждения — отказ
+ * ambiguous) → ветка по виду объекта и scope → ожидание для предохранителя
+ * (`Expectation`: `touched` — из patch.ts, `tail` — из `seriesExtent`).
  *
  * Время (Р1): у всей серии и у хвоста из start и end берутся только время
  * суток, длительность и пояс — дата начала серии (или границы) прежняя, если
@@ -301,6 +307,48 @@ function refuseBlocking(anomalies: readonly Anomaly[]): void {
   });
 }
 
+/**
+ * Объект, испорченный другим клиентом (О14 с поправкой задачи З10): в нём
+ * два противоречащих друг другу описания одной и той же встречи или серии, и
+ * любая наша запись — угадывание, какое из них «настоящее». Отказ честен и
+ * ничего не теряет, поэтому такие аномалии блокируют правку любого scope и
+ * удаление встречи или хвоста; целиком объект удалить по-прежнему можно
+ * (delete all_series ничем не блокируется).
+ * - `duplicate-override` — у одной встречи несколько компонентов с одним
+ *   RECURRENCE-ID. Показывается один из них (`shownOverride` — по SEQUENCE,
+ *   DTSTAMP, порядку в файле), а правка всей серии трогает метаданные другого
+ *   и молча меняет выбор: перенесённая встреча пользователя пропадала бы из
+ *   виду, а на её месте оказывалась бы старая копия с другим временем.
+ * - `multiple-rrules` — у основного компонента несколько RRULE. Правка ложится
+ *   только на первое правило (`prepareRule`, `setRuleEnd`), остальные
+ *   продолжают давать встречи: серия, которую просили закончить, шла бы
+ *   дальше, и ни `removed`, ни notices об этом не сказали бы.
+ * Более узкие блокировки О14 (duplicate-override в целевом слоте, несколько
+ * RRULE при разрезе) остаются в `blockingAnomalies` — здесь отказ наступает
+ * раньше и одинаково для всех scope.
+ */
+const CORRUPTED: ReadonlyMap<AnomalyCode, string> = new Map([
+  ["duplicate-override", "какая из копий встречи настоящая, по объекту не определить"],
+  ["multiple-rrules", "правка легла бы только на первое правило, остальные остались бы прежними"],
+]);
+
+const CORRUPTED_HINT =
+  "Поправьте эту встречу в веб-интерфейсе Яндекс Календаря: он перезапишет объект целиком, и править его снова станет можно. " +
+  "Удалить событие целиком можно и сейчас: delete_event со scope all_series.";
+
+function refuseCorrupted(o: CalendarObject, op: EditOp, scope: EditScope): void {
+  if (op === "delete" && scope === "all_series") return;
+  const found = o.anomalies.filter((anomaly) => CORRUPTED.has(anomaly.code));
+  if (found.length === 0) return;
+  const list = found.map((anomaly) => `${formatAnomaly(anomaly)} — ${CORRUPTED.get(anomaly.code)!}`).join("; ");
+  throw new EditRefusal(
+    found[0].code,
+    `Объект испорчен другим клиентом: ${list}. Писать в него — угадывать, какая из записей верна, поэтому ` +
+      `${op === "update" ? "правка отклонена" : "удаление отклонено"}.`,
+    { hint: CORRUPTED_HINT },
+  );
+}
+
 function needConfirm(losses: readonly Loss[], message: string): EditRefusal {
   const list = losses.length > 0
     ? ` Будут потеряны: ${losses.map((loss) => `${loss.instanceStart} «${loss.summary}» (начало ${loss.start}) — ${loss.reason}`).join("; ")}.`
@@ -479,6 +527,7 @@ function unparsableDelete(input: Unparsable, scope: EditScope, request: DeleteRe
 
 function deletePlan(run: Run, scope: EditScope, instanceStart: string | undefined): WritePlan {
   const { o } = run;
+  refuseCorrupted(o, "delete", scope);
   if (scope === "all_series") {
     if (instanceStart !== undefined) resolveTarget(o, instanceStart, "delete", { confirm: true });
     const notices = o.kind === "detached"
@@ -956,6 +1005,7 @@ function tailOf(o: CalendarObject): Expectation["tail"] {
 
 function updatePlan(run: Run, scope: EditScope, request: UpdateRequest): WritePlan {
   const { o } = run;
+  refuseCorrupted(o, "update", scope);
   const patch = request.patch;
   const timed = hasTimeFields(fieldsOf(patch)) || patch.recurrence !== undefined;
 
@@ -1223,11 +1273,8 @@ function updateAll(run: Run, patch: EventPatch, scope: EditScope, boundary?: Slo
   const requested = requestedFields(patch);
   const toggle = fields.allDay !== undefined && fields.allDay !== (o.form === "date");
   if (toggle) refuseToggle(o, [...o.overrides.values()].flat().length > 0);
-  if (hasTimeFields(fields) && source.getAllProperties("rrule").length > 1) {
-    throw new EditRefusal("multiple-rrules", "У серии несколько правил RRULE: сдвинуть её время, не потеряв сопоставление встреч, нельзя.", {
-      hint: "Измените время отдельных встреч (scope this) или задайте серию заново в веб-интерфейсе.",
-    });
-  }
+  // Серия с несколькими RRULE сюда не доходит: она — испорченный объект (`refuseCorrupted`),
+  // и правка любого scope в ней отвергается до разбора патча.
   const boundaryDate = boundary ? refuseForeignTimeOfDay(run, boundary, fields) : undefined;
   const place = boundary ? `у встреч с ${boundary.instance.instanceStart}` : "у всей серии";
 

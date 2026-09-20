@@ -1055,10 +1055,11 @@ describe("серия: delete this", () => {
     expect(plan.expect.removed).toEqual([at("2026-10-21T10:00:00+03:00")]);
   });
 
-  it("перенесённая встреча: сняты её компоненты (с дублями) и EXDATE на слот", () => {
-    const a = override("20261026T100000", "20261027T100000", "20261027T110000", "SUMMARY:А", "SEQUENCE:1");
-    const b = override("20261026T100000", "20261027T120000", "20261027T130000", "SUMMARY:Б", "SEQUENCE:2");
-    const plan = remove(load(calendar(MOSCOW, vevent(WEEKLY), a, b)), { scope: "this", instanceStart: "2026-10-26T10:00:00+03:00" });
+  // Дубль RECURRENCE-ID сюда не доходит: объект с ним испорчен другим клиентом, и
+  // удаление встречи в нём отвергается (describe «объект испорчен другим клиентом»).
+  it("перенесённая встреча: снят её компонент и EXDATE на слот", () => {
+    const moved = override("20261026T100000", "20261027T120000", "20261027T130000", "SUMMARY:Б", "SEQUENCE:2");
+    const plan = remove(load(calendar(MOSCOW, vevent(WEEKLY), moved)), { scope: "this", instanceStart: "2026-10-26T10:00:00+03:00" });
     const ics = icsOf(plan);
     expect(events(ics)).toHaveLength(1);
     expect(linesNamed(masterLines(ics), "EXDATE")).toEqual(["EXDATE;TZID=Europe/Moscow:20261026T100000"]);
@@ -1344,11 +1345,76 @@ describe("delete all_series и аномалии", () => {
     expect(remove(o, { scope: "all_series" }).kind).toBe("delete-object");
   });
 
-  it("дубли одного RID: правка слота — отказ duplicate-override, delete this — снимает все", () => {
-    const o = load(calendar(MOSCOW, vevent(WEEKLY),
-      override("20261026T100000", "20261026T100000", "20261026T110000"), override("20261026T100000", "20261026T120000", "20261026T130000")));
-    expect(refusal(() => update(o, { instanceStart: "2026-10-26T10:00:00+03:00", patch: { summary: "Х" } })).code).toBe("duplicate-override");
-    expect(events(icsOf(remove(o, { scope: "this", instanceStart: "2026-10-26T10:00:00+03:00" })))).toHaveLength(1);
+});
+
+// ─────────────────────── объект испорчен другим клиентом (З10, поправка О14) ───────────────────────
+
+// Дубль RECURRENCE-ID и несколько RRULE — следы чужого клиента: объект уже
+// противоречив, и любая наша запись в него — угадывание, какая из копий
+// «настоящая» и какое из правил главное. Поэтому отвергается правка любого
+// scope и удаление встречи или хвоста; доступно только delete all_series.
+describe("объект испорчен другим клиентом: отказ вместо угадывания", () => {
+  /** 26.10 два компонента с одним RECURRENCE-ID: показывается последний — перенос на 12:00. */
+  const DUPLICATE = calendar(MOSCOW, vevent(WEEKLY),
+    override("20261026T100000", "20261026T100000", "20261026T110000", "SUMMARY:Старая копия"),
+    override("20261026T100000", "20261026T120000", "20261026T130000", "SUMMARY:Перенос на 12:00", "LOCATION:Каб. 7"));
+
+  /** Два RRULE у основного компонента: Пн ×4 и Пт ×3 — правка легла бы только на первое. */
+  const TWO_RULES = calendar(MOSCOW, vevent(["DTSTART;TZID=Europe/Moscow:20261019T100000", "DTEND;TZID=Europe/Moscow:20261019T110000",
+    "RRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=4", "RRULE:FREQ=WEEKLY;BYDAY=FR;COUNT=3", "SUMMARY:Планёрка"]));
+
+  /** Отказ назвал аномалию, объяснил порчу и отправил в веб-интерфейс Яндекса. */
+  function corrupted(run: () => unknown, code: "duplicate-override" | "multiple-rrules"): void {
+    const error = refusal(run);
+    expect(error.code).toBe(code);
+    expect(error.message).toContain("испорчен другим клиентом");
+    expect(error.message).toContain(code);
+    expect(error.needsConfirm).toBe(false);
+    expect(error.hint ?? "").toContain("веб-интерфейсе Яндекс Календаря");
+  }
+
+  it("дубль RECURRENCE-ID: правка любого scope — отказ duplicate-override", () => {
+    const o = load(DUPLICATE);
+    // До правки 26.10 показывается перенос со своими полями: прежний код молча подменял его старой копией.
+    expect(visible(o).filter((rowText) => rowText.startsWith("2026-10-26")))
+      .toEqual(["2026-10-26T10:00:00+03:00 → 2026-10-26T12:00:00+03:00–13:00 Перенос на 12:00"]);
+    corrupted(() => update(o, { scope: "all_series", patch: { summary: "Х" } }), "duplicate-override");
+    corrupted(() => update(o, { scope: "all_series", patch: { end: "2026-10-19T13:45:00+03:00" } }), "duplicate-override");
+    corrupted(() => update(o, { instanceStart: "2026-10-19T10:00:00+03:00", patch: { summary: "Х" } }), "duplicate-override");
+    corrupted(() => update(o, { instanceStart: "2026-10-26T10:00:00+03:00", patch: { summary: "Х" } }), "duplicate-override");
+    corrupted(() => update(o, { scope: "this_and_following", instanceStart: "2026-10-26T10:00:00+03:00", patch: { summary: "Х" } }),
+      "duplicate-override");
+  });
+
+  it("дубль RECURRENCE-ID: delete this и t&f — отказ, delete all_series — удаление объекта", () => {
+    const o = load(DUPLICATE);
+    corrupted(() => remove(o, { scope: "this", instanceStart: "2026-10-26T10:00:00+03:00" }), "duplicate-override");
+    corrupted(() => remove(o, { scope: "this", instanceStart: "2026-10-19T10:00:00+03:00" }), "duplicate-override");
+    corrupted(() => remove(o, { scope: "this_and_following", instanceStart: "2026-10-26T10:00:00+03:00" }), "duplicate-override");
+    expect(remove(o, { scope: "all_series" }).kind).toBe("delete-object");
+  });
+
+  it("два RRULE: правка любого scope, включая смену повтора, — отказ multiple-rrules", () => {
+    const o = load(TWO_RULES);
+    // Семь встреч по двум правилам: правка конца серии оставила бы пятничные жить дальше.
+    expect(visible(o).map((rowText) => rowText.slice(0, 10)))
+      .toEqual(["2026-10-19", "2026-10-23", "2026-10-26", "2026-10-30", "2026-11-02", "2026-11-06", "2026-11-09"]);
+    corrupted(() => update(o, { scope: "all_series", patch: { recurrence: { until: "2026-10-25" } } }), "multiple-rrules");
+    corrupted(() => update(o, { scope: "all_series", patch: { recurrence: { count: 1 } } }), "multiple-rrules");
+    corrupted(() => update(o, { scope: "all_series", patch: { summary: "Х" } }), "multiple-rrules");
+    corrupted(() => update(o, { scope: "all_series", patch: { start: "2026-10-19T11:00:00+03:00" } }), "multiple-rrules");
+    corrupted(() => update(o, { instanceStart: "2026-10-23T10:00:00+03:00", patch: { summary: "Х" } }), "multiple-rrules");
+    corrupted(() => update(o, { scope: "this_and_following", instanceStart: "2026-10-23T10:00:00+03:00", patch: { summary: "Х" } }),
+      "multiple-rrules");
+  });
+
+  it("два RRULE: delete this и t&f — отказ, delete all_series — удаление объекта", () => {
+    const o = load(TWO_RULES);
+    corrupted(() => remove(o, { scope: "this", instanceStart: "2026-10-23T10:00:00+03:00" }), "multiple-rrules");
+    corrupted(() => remove(o, { scope: "this_and_following", instanceStart: "2026-10-23T10:00:00+03:00" }), "multiple-rrules");
+    // t&f по первой встрече (до неё встреч нет) — тоже отказ: scope не all_series.
+    corrupted(() => remove(o, { scope: "this_and_following", instanceStart: "2026-10-19T10:00:00+03:00" }), "multiple-rrules");
+    expect(remove(o, { scope: "all_series" }).kind).toBe("delete-object");
   });
 });
 
