@@ -8,16 +8,18 @@ import {
   cloneComponent,
   distortedParts,
   inheritFields,
+  MAX_YEAR,
   newTouched,
   overrideFromMaster,
   patchRule,
   resolveTimes,
+  ruleReachYear,
   setRuleEnd,
   touchMetadata,
 } from "../../src/ical/patch.js";
 import { findSlot } from "../../src/ical/slots.js";
 import { vtimezoneFor } from "../../src/ical/timezones.js";
-import { formatForModel, type IcalEnv, type SlotKey } from "../../src/ical/values.js";
+import { formatForModel, ruleDict, type IcalEnv, type SlotKey } from "../../src/ical/values.js";
 
 // Точечная правка полей и правила (О5–О10, Р4 плана переделки,
 // docs/superpowers/plans/2026-09-19-recurring-events-rework.md, задача З08).
@@ -1030,17 +1032,51 @@ describe("patchRule (Р4): меняются только переданные ч
     expect(patch("RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,WE;COUNT=4", { count: 5 }).rule).toBe("RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,WE;COUNT=5");
   });
 
-  it("шаг повтора ограничен: INTERVAL=1000000 — отказ invalid-rule, а не разворот за пределы календаря", () => {
+  it("предел по стоимости разворота: огромный шаг у бесконечной серии — отказ, а не разворот за пределы календаря", () => {
     // Без предела план строился, а разворот (и у планировщика, и у
     // предохранителя) уходил в район миллионного года: ical.js разворачивал
     // YEARLY-правила самого VTIMEZONE от 1970-го до него, и процесс кончался
     // нехваткой памяти, не оставив ни отказа, ни сообщения.
     const error = refusal(() => patch("RRULE:FREQ=DAILY", { interval: 1_000_000 }));
     expect(error.code).toBe("invalid-rule");
-    expect(error.message).toContain("не больше 1000");
-    expect(refusal(() => patch("RRULE:FREQ=WEEKLY;COUNT=4", { interval: 1001 })).code).toBe("invalid-rule");
-    // Предел не мешает разумному шагу.
+    expect(error.message).toContain(`за ${MAX_YEAR} год`);
+    // Конец серии за краем календаря — тот же отказ и у конечной серии.
+    expect(refusal(() => patch("RRULE:FREQ=WEEKLY;COUNT=4", { interval: 1_000_000 })).code).toBe("invalid-rule");
+    // UNTIL обрезал бы такую серию до одной встречи, но следующая по правилу
+    // пришлась бы за краем календаря: правилом это не назовёшь.
+    expect(refusal(() => patch("RRULE:FREQ=WEEKLY;UNTIL=20261118T070000Z", { interval: 1_000_000 })).code).toBe("invalid-rule");
+  });
+
+  it("предел не по величине шага: у конечной и короткой серии огромный шаг проходит", () => {
+    // Опасен неограниченный разворот, а не сам шаг: у серии с COUNT встреч
+    // ровно столько, сколько названо, и разворот кончается на третьей.
+    expect(patch("RRULE:FREQ=WEEKLY;COUNT=3", { interval: 1001 }).rule).toBe("RRULE:FREQ=WEEKLY;COUNT=3;INTERVAL=1001");
     expect(patch("RRULE:FREQ=DAILY;COUNT=4", { interval: 1000 }).rule).toBe("RRULE:FREQ=DAILY;COUNT=4;INTERVAL=1000");
+    // Серия без конца, но с шагом, который разворот выдерживает.
+    expect(patch("RRULE:FREQ=YEARLY", { interval: 20 }).rule).toBe("RRULE:FREQ=YEARLY;INTERVAL=20");
+    // Правка, шага не трогающая, в предел не упирается: серию, которая и так
+    // лежала за краем, правка чинить не обязана.
+    expect(patch("RRULE:FREQ=YEARLY;INTERVAL=1000", { count: 3 }).rule).toBe("RRULE:FREQ=YEARLY;INTERVAL=1000;COUNT=3");
+  });
+
+  it("оценка разворота (ruleReachYear): годы целые, шагов не больше, чем даёт серия", () => {
+    const dict = (rule: string) => {
+      const o = load(series(rule));
+      return ruleDict(o.master!.getFirstProperty("rrule")!);
+    };
+    // Год целый: weekly-шаг — 0,019 года, и серия 9999 года остаётся в нём.
+    expect(ruleReachYear(dict("RRULE:FREQ=WEEKLY;COUNT=3"), 9999, 1)).toBe(9999);
+    expect(ruleReachYear(dict("RRULE:FREQ=WEEKLY"), 9999, 405)).toBeGreaterThan(MAX_YEAR);
+    // Шагов не больше, чем названо: COUNT прямо, UNTIL — своим годом.
+    expect(ruleReachYear(dict("RRULE:FREQ=YEARLY;COUNT=3"), 2026, 100)).toBe(2028);
+    expect(ruleReachYear(dict("RRULE:FREQ=YEARLY;UNTIL=20461019T070000Z"), 2026, 100)).toBe(2046);
+    // Но хотя бы один шаг считается всегда: UNTIL, обрезавший серию до одной
+    // встречи, огромного шага не оправдывает.
+    expect(ruleReachYear(dict("RRULE:FREQ=YEARLY;INTERVAL=1000000;UNTIL=20261118T070000Z"), 2026, 100)).toBe(1002026);
+    // Серия без конца считается на все шаги; незнакомая частота — сам год начала.
+    expect(ruleReachYear(dict("RRULE:FREQ=YEARLY;INTERVAL=20"), 2026, 100)).toBe(4026);
+    expect(ruleReachYear({ freq: "FORTNIGHTLY" }, 2026, 100)).toBe(2026);
+    expect(ruleReachYear({}, 2026, 100)).toBe(2026);
   });
 
   it("неизвестные модели части (BYMONTHDAY, BYMONTH, RSCALE, X-) целы", () => {

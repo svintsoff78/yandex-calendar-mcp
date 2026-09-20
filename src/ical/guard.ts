@@ -2,6 +2,7 @@ import type ICAL from "ical.js";
 import { occurrencesOf, unreadableReason } from "./expand.js";
 import { instanceAt, parseAddress, toCalendarEvent, type EventMeta, type Instance } from "./instances.js";
 import { isUnparsable, loadObject, serializeObject, type CalendarObject, type OverrideRef } from "./object.js";
+import { ruleReachYear } from "./patch.js";
 import type { EventPatch, Expectation, PatchField, RecurrencePatch, WritePlan } from "./plan.js";
 import { iterateSlots, seriesExtent } from "./slots.js";
 import { compareSlotKeys, instantOf, listKeys, parseModelTime, ruleDict, type IcalEnv, type SlotKey } from "./values.js";
@@ -199,6 +200,22 @@ export const EXTRA_SLOTS = 5;
 export const HORIZON_MAX_YEAR = 9999;
 /** Последний миг последнего года, который календарь ещё записывает. */
 const HORIZON_MAX_MS = Date.UTC(HORIZON_MAX_YEAR + 1, 0, 1) - 1;
+/**
+ * На столько лет вперёд от «сейчас» разворот сверки по карману.
+ *
+ * Предел не про календарь, а про цену одной позиции: смещение пояса на
+ * дальнюю дату ical.js считает, разворачивая YEARLY-правила самого
+ * VTIMEZONE от 1970-го до неё, и четыре сотни таких позиций у серии,
+ * растянутой на века, стоят секунд на пустом месте (ежедневная серия с
+ * шагом в тысячу дней уводит четырёхсотую позицию за 3100 год). Серию, чьи
+ * сверяемые позиции уходят дальше, предохранитель не разворачивает вовсе —
+ * сверяет по окну, как серию за краем календаря.
+ *
+ * Пятисот лет хватает всякой плотной серии: у годовой с шагом 1
+ * четырёхсотая встреча приходится на 2431 год. Серия реже годовой в окно
+ * сверки даёт одну-две встречи, и проход по ней ничего не добавляет.
+ */
+export const HORIZON_COST_YEARS = 500;
 
 const DAY_MS = 86_400_000;
 const YEAR_MS = 365 * DAY_MS;
@@ -610,22 +627,23 @@ function windowOf(ctx: Ctx, objects: readonly CalendarObject[]): Window {
       toMs = Math.max(toMs, ms + DAY_MS);
     }
     // Конец конечной серии — только пока она короче упора: длинную всё равно
-    // подрежет набор, а разворачивать её до конца незачем. Серию, чьи первые
-    // позиции уходят за абсолютный край горизонта, до конца не проходят
-    // вовсе (`withinHorizon`): проход по ней и есть та нехватка памяти.
-    if (!withinHorizon(o)) continue;
+    // подрежет набор, а разворачивать её до конца незачем. Серию, проход по
+    // которой не по карману, до конца не проходят вовсе (`affordableWalk`):
+    // этот проход и есть та нехватка памяти и те секунды сверки.
+    if (!affordableWalk(o, ctx.nowMs)) continue;
     const extent = seriesExtent(o, MEETINGS_CAP);
     if (extent.kind === "finite" && extent.last) toMs = Math.max(toMs, instantOf(extent.last.time, ctx.env) + DAY_MS);
   }
   if (!Number.isFinite(fromMs)) fromMs = ctx.nowMs;
   toMs = Math.max(toMs, Math.max(ctx.nowMs, fromMs) + HORIZON_YEARS * YEAR_MS);
   for (const o of objects) {
-    if (!withinHorizon(o)) continue;
+    if (!affordableWalk(o, ctx.nowMs)) continue;
     const dense = slotBeyondCap(o, ctx.env);
     if (dense !== undefined) toMs = Math.min(toMs, dense);
   }
   const horizon = toMs;
   for (const o of objects) {
+    // Позиций за горизонтом считаные штуки — этот проход по карману всегда.
     if (!withinHorizon(o)) continue;
     const sparse = slotsBeyondHorizon(o, horizon, ctx.env);
     if (sparse !== undefined) toMs = Math.max(toMs, sparse);
@@ -636,68 +654,77 @@ function windowOf(ctx: Ctx, objects: readonly CalendarObject[]): Window {
 }
 
 /**
- * Шаг повтора (в годах) уводит встречи за абсолютный край горизонта: такую
- * серию не развернуть — уже на второй позиции ical.js считает смещение пояса
- * на дату, до которой разворачивает VTIMEZONE миллионами переходов. Отказ,
- * а не молчаливая подрезка: набор встреч у такого объекта не сверить, и
+ * Следующая позиция серии уходит за абсолютный край горизонта: такую серию
+ * не развернуть — уже на второй позиции ical.js считает смещение пояса на
+ * дату, до которой разворачивает VTIMEZONE миллионами переходов. Отказ, а
+ * не молчаливая подрезка: набор встреч у такого объекта не сверить, и
  * выдать его за сверенный нельзя.
+ *
+ * Судится ПОЗИЦИЯ, а не величина шага: объект, который просто лежит у края
+ * календаря, разворачивается как всякий другой. Прежнее условие сравнивало
+ * целый год с годом плюс дробь, и weekly-серия 9999 года (шаг 0,019 года)
+ * упиралась в отказ, хотя вся укладывалась внутрь этого года — вместе с
+ * переименованием, правкой одной встречи и удалением одной встречи.
  */
 function checkHorizon(ctx: Ctx, objects: readonly CalendarObject[]): void {
   const labels = ["прочитанный объект", "записываемый объект", "второй записываемый объект"];
   objects.forEach((o, index) => {
-    const step = stepYears(o);
-    if (step <= 0 || startYear(o) + step <= HORIZON_MAX_YEAR) return;
+    const reach = reachYear(o, 1);
+    if (reach <= HORIZON_MAX_YEAR) return;
     ctx.findings.fail(
       "series-too-long",
-      `${capital(labels[index] ?? "записываемый объект")}: шаг повтора — около ${Math.round(step)} лет, и уже следующая ` +
-        `встреча серии уходит за ${HORIZON_MAX_YEAR} год. Такую серию не развернуть, и план не сверить.`,
+      `${capital(labels[index] ?? "записываемый объект")}: уже следующая встреча серии пришлась бы на ${reach} год, ` +
+        `а дальше ${HORIZON_MAX_YEAR}-го календарь встреч не записывает. Такую серию не развернуть, и план не сверить.`,
     );
   });
 }
 
 /** Первые сверяемые позиции серии укладываются в абсолютный край горизонта. */
 function withinHorizon(o: CalendarObject): boolean {
-  return startYear(o) + (MEETINGS_CAP + EXTRA_SLOTS) * stepYears(o) <= HORIZON_MAX_YEAR;
+  return reachYear(o, MEETINGS_CAP + EXTRA_SLOTS) <= HORIZON_MAX_YEAR;
 }
 
-/** Лет между соседними позициями — грубо, по FREQ и INTERVAL; без правил — 0. */
-const YEARS_PER_STEP: Readonly<Record<string, number>> = {
-  secondly: 1 / 31_557_600,
-  minutely: 1 / 525_960,
-  hourly: 1 / 8766,
-  daily: 1 / 365.25,
-  weekly: 7 / 365.25,
-  monthly: 1 / 12,
-  yearly: 1,
-};
+/**
+ * Проход по серии до упора по карману: сверяемые позиции укладываются и в
+ * календарь, и в предел стоимости ({@link HORIZON_COST_YEARS}).
+ *
+ * Дорог именно проход в сотни позиций у серии, растянутой на века.
+ * Пропущенный, он ничего не отнимает: конца в пределах упора у такой серии
+ * нет, густоты, которую надо подрезать, — тоже, а несколько позиций за
+ * горизонтом считаются отдельно и по-прежнему ({@link slotsBeyondHorizon}),
+ * и испорченный шаг редкой серии видно по ним.
+ */
+function affordableWalk(o: CalendarObject, nowMs: number): boolean {
+  const reach = reachYear(o, MEETINGS_CAP + EXTRA_SLOTS);
+  if (reach > HORIZON_MAX_YEAR) return false;
+  // Год — в момент: предел стоимости отсчитывается от «сейчас», а не от
+  // года, записанного в коде (Date.UTC на годах за 275760-м даёт NaN, и
+  // сравнение само отвечает «не по карману»).
+  return Date.UTC(reach, 0, 1) <= nowMs + HORIZON_COST_YEARS * YEAR_MS;
+}
 
-function stepYears(o: CalendarObject): number {
-  let step = 0;
+/**
+ * Год позднейшей позиции, до которой дотянулся бы разворот объекта за
+ * `steps` шагов: по каждому компоненту — его собственный DTSTART и его
+ * правила (оценка и её огрубление — patch.ts, {@link ruleReachYear}).
+ * Правил нет — разворачивать нечего, и это −∞.
+ */
+function reachYear(o: CalendarObject, steps: number): number {
+  let year = Number.NEGATIVE_INFINITY;
   for (const event of o.root.getAllSubcomponents("vevent")) {
+    const dtstart = event.getFirstPropertyValue("dtstart") as ICAL.Time | null;
     for (const property of event.getAllProperties("rrule")) {
       let dict: ReturnType<typeof ruleDict>;
       try {
         dict = ruleDict(property);
       } catch {
-        continue; // не правило — шагу неоткуда взяться
+        continue; // не правило — разворачивать нечего
       }
-      const per = YEARS_PER_STEP[String(dict.freq ?? "").toLowerCase()];
-      const interval = Number(dict.interval ?? 1);
-      if (per === undefined || !Number.isFinite(interval) || interval < 1) continue;
-      step = Math.max(step, per * interval);
+      // Без DTSTART начало серии неизвестно: считаем его у самого края.
+      year = Math.max(year, ruleReachYear(dict, dtstart ? dtstart.year : HORIZON_MAX_YEAR, steps));
     }
   }
-  return step;
-}
-
-/** Год начала объекта: меньший DTSTART его компонентов; без них — текущий по краю горизонта. */
-function startYear(o: CalendarObject): number {
-  let year = Infinity;
-  for (const event of o.root.getAllSubcomponents("vevent")) {
-    const dtstart = event.getFirstPropertyValue("dtstart") as ICAL.Time | null;
-    if (dtstart) year = Math.min(year, dtstart.year);
-  }
-  return Number.isFinite(year) ? year : HORIZON_MAX_YEAR;
+  return year;
 }
 
 /**

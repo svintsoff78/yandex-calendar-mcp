@@ -2376,7 +2376,29 @@ describe("края значений года и предел повтора", ()
   it("огромный шаг повтора — отказ invalid-rule: развернуть такую серию нельзя", () => {
     const error = refusal(() => update(timed(), { scope: "all_series", patch: { recurrence: { interval: 1_000_000 } } }));
     expect(error.code).toBe("invalid-rule");
-    expect(error.message).toContain("не больше 1000");
+    expect(error.message).toContain("за 9999 год");
+    // И у серии без конца — того же отказа, а не нехватки памяти на развороте.
+    const endless = () => load(calendar(MOSCOW, vevent(["DTSTART;TZID=Europe/Moscow:20261019T100000",
+      "DTEND;TZID=Europe/Moscow:20261019T110000", "RRULE:FREQ=DAILY", "SUMMARY:Планёрка"])));
+    expect(refusal(() => update(endless(), { scope: "all_series", patch: { recurrence: { interval: 1_000_000 } },
+      confirm: true, etag: ETAG, currentEtag: ETAG })).code).toBe("invalid-rule");
+  });
+
+  it("предел — по стоимости разворота: тот же шаг у короткой конечной серии записывается", () => {
+    // Прежний предел по величине шага (MAX_INTERVAL = 1000) отказывал глухо
+    // операции, которая проходила целиком и быстро: у серии с COUNT встреч
+    // ровно столько, сколько названо, и огромный шаг ничего не разворачивает.
+    const short = () => load(calendar(MOSCOW, vevent(["DTSTART;TZID=Europe/Moscow:20261019T100000",
+      "DTEND;TZID=Europe/Moscow:20261019T110000", "RRULE:FREQ=WEEKLY;COUNT=3", "SUMMARY:Планёрка"])));
+    const plan = update(short(), { scope: "all_series", patch: { recurrence: { interval: 1001 } },
+      confirm: true, etag: ETAG, currentEtag: ETAG });
+    expect(linesNamed(masterLines(icsOf(plan)), "RRULE")).toEqual(["RRULE:FREQ=WEEKLY;COUNT=3;INTERVAL=1001"]);
+    // Запись читается обратно тремя верными встречами — через 1001 неделю каждая.
+    const written = after(plan);
+    expect(instancesBetween(written, Date.parse("2026-10-01T00:00:00+03:00"), Date.parse("2066-01-01T00:00:00+03:00"))
+      .map((i) => iso(i.start, written.env))).toEqual([
+      "2026-10-19T10:00:00+03:00", "2045-12-25T10:00:00+03:00", "2065-03-02T10:00:00+03:00",
+    ]);
   });
 });
 

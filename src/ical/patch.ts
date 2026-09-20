@@ -22,6 +22,7 @@ import {
   timeInForm,
   wallDateOf,
   type IcalEnv,
+  type RuleDict,
   type RuleDictInput,
   type RuleValue,
   type TimeForm,
@@ -1355,18 +1356,80 @@ const DISTORTED_PARTS: Record<string, string> = {
 const RULE_PATCH_KEYS: ReadonlySet<string> = new Set(["frequency", "interval", "byWeekday", "until", "count", "replace"]);
 
 /**
- * Наибольший шаг повтора (INTERVAL), который правка записывает.
+ * Столько первых позиций серии разворачивает всякая сверка — и пробный
+ * проход правки, и окно предохранителя, и чтение записи обратно. По ним и
+ * судится стоимость разворота (см. {@link checkReach}).
  *
- * Предел не про вкус, а про то, что перебор серии упирается в календарь:
- * `FREQ=DAILY;INTERVAL=1000000` уводит вторую встречу в район 4764 года, а
- * четырёхсотую — за миллионный, и разворот такой серии (свой у планировщика,
- * свой у предохранителя) разворачивает заодно YEARLY-правила самого
- * VTIMEZONE от 1970-го до запрошенного года — миллионы переходов, на которых
- * процесс кончается нехваткой памяти. Тысячи шагов хватает на любой разумный
- * повтор (раз в тысячу дней, раз в тысячу месяцев), а предохранитель сверх
- * того держит свой предел по абсолютной дате (guard.ts, HORIZON_MAX_YEAR).
+ * Не упор сверки в сотни позиций (guard.ts, MEETINGS_CAP): по нему серия
+ * раз в двадцать лет тоже уходила бы за край календаря, а такую серию
+ * календарь держит и правка задавала прежде.
  */
-export const MAX_INTERVAL = 1000;
+const REACH_STEPS = 6;
+
+/**
+ * На столько лет вперёд от начала серии разворот по карману (тот же предел
+ * у предохранителя — guard.ts, HORIZON_COST_YEARS).
+ *
+ * Цена не в числе позиций, а в их удалённости: смещение пояса на дальнюю
+ * дату ical.js считает, разворачивая YEARLY-правила самого VTIMEZONE от
+ * 1970-го до неё, и каждая позиция в седьмом тысячелетии стоит сотен
+ * миллисекунд — в планировщике, в предохранителе и при чтении записи
+ * порознь.
+ */
+const REACH_YEARS = 500;
+
+/** Лет между соседними позициями правила — грубо, по FREQ и INTERVAL. */
+const YEARS_PER_STEP: Readonly<Record<string, number>> = {
+  secondly: 1 / 31_557_600,
+  minutely: 1 / 525_960,
+  hourly: 1 / 8766,
+  daily: 1 / 365.25,
+  weekly: 7 / 365.25,
+  monthly: 1 / 12,
+  yearly: 1,
+};
+
+/**
+ * Год позднейшей позиции, до которой дотянулся бы разворот правила `dict`,
+ * начатого в году `startYear`, за `steps` шагов. Оценка грубая — по FREQ и
+ * INTERVAL, без BYDAY и прочих частей, — и всегда в большую сторону: BYDAY
+ * позиции только уплотняет.
+ *
+ * Год целый: сравнивать год с годом плюс дробь нельзя — шаг weekly-серии
+ * это 0,019 года, и серия, целиком лежащая в 9999 году, «уходила» бы за
+ * край уже на первом шаге.
+ *
+ * Шагов берётся не больше, чем даёт сама серия: COUNT называет их прямо,
+ * UNTIL — своим годом. Но хотя бы один шаг считается всегда: правило, у
+ * которого следующая встреча пришлась бы на 21191 год, остаётся
+ * неразворачиваемым и тогда, когда UNTIL обрезает серию до одной встречи.
+ * Правило без знакомой частоты шага не даёт — тогда это сам `startYear`.
+ */
+export function ruleReachYear(dict: RuleDict, startYear: number, steps: number): number {
+  const per = YEARS_PER_STEP[String(dict.freq ?? "").toLowerCase()];
+  const interval = Number(dict.interval ?? 1);
+  if (per === undefined || !Number.isFinite(interval) || interval < 1) return startYear;
+  const step = per * interval;
+  return Math.floor(startYear + Math.min(steps, Math.max(1, availableSteps(dict, startYear, step))) * step);
+}
+
+/** Сколько шагов серия делает от начала: COUNT называет прямо, UNTIL — своим годом; без них — без счёта. */
+function availableSteps(dict: RuleDict, startYear: number, step: number): number {
+  let steps = Infinity;
+  const count = Number(dict.count);
+  if (Number.isInteger(count) && count >= 1) steps = count - 1;
+  const until = untilYearOf(dict);
+  if (until !== undefined) steps = Math.min(steps, Math.max(0, Math.floor((until - startYear) / step)));
+  return steps;
+}
+
+/** Год UNTIL правила (jCal-строка «9999-12-31T23:00:00Z» или «9999-12-31»); без UNTIL — undefined. */
+function untilYearOf(dict: RuleDict): number | undefined {
+  const until = dict.until;
+  if (typeof until !== "string") return undefined;
+  const year = Number(until.slice(0, 4));
+  return Number.isInteger(year) ? year : undefined;
+}
 
 /**
  * Части правила, которые Яндекс искажает (Ж6), в порядке правила: "BYSETPOS",
@@ -1431,12 +1494,6 @@ export function patchRule(p: ICAL.Property, rp: RecurrencePatch, ctx: RuleContex
   }
   if (rp.interval !== undefined && rp.interval !== null && (!Number.isInteger(rp.interval) || rp.interval < 1)) {
     throw invalidRule(`interval — целое число от 1, получено ${String(rp.interval)}.`);
-  }
-  if (typeof rp.interval === "number" && rp.interval > MAX_INTERVAL) {
-    throw invalidRule(
-      `шаг повтора interval не больше ${MAX_INTERVAL}, получено ${rp.interval}. При большем шаге встречи серии уходят ` +
-        "за пределы календаря, и ни расписание, ни конец серии не проверить.",
-    );
   }
   if (rp.count !== undefined && rp.count !== null && (!Number.isInteger(rp.count) || rp.count < 1)) {
     throw invalidRule(`count — целое число от 1, получено ${String(rp.count)}.`);
@@ -1515,7 +1572,10 @@ export function patchRule(p: ICAL.Property, rp: RecurrencePatch, ctx: RuleContex
   }
   checkRuleParts(next);
   const probeSeries = seriesTime();
-  if (probeSeries) probeRule(next, probeSeries, ctx.env);
+  if (probeSeries) {
+    checkReach(old, next, probeSeries.dtstart.year);
+    probeRule(next, probeSeries, ctx.env);
+  }
 
   setRuleDict(p, Object.fromEntries(next) as RuleDictInput);
   const parent = p.parent;
@@ -1566,6 +1626,48 @@ function checkRuleParts(next: ReadonlyArray<[string, RuleValue]>): void {
     const list = days === undefined ? [] : Array.isArray(days) ? days : [days];
     if (list.some((day) => /\d/.test(String(day)))) refuse("byweekno", "день недели с номером (например, 1MO) недопустим вместе с BYWEEKNO");
   }
+}
+
+/**
+ * Стоимость разворота новой серии: отказ, когда её первые встречи уходят
+ * за последний год календаря ({@link MAX_YEAR}) или на века вперёд от
+ * начала ({@link REACH_YEARS}).
+ *
+ * Предел — не величина шага повтора. Огромный шаг сам по себе безвреден: у
+ * конечной серии встреч ровно столько, сколько названо, и
+ * `FREQ=WEEKLY;COUNT=3` с шагом 1001 разворачивается тремя встречами за
+ * миллисекунды. Дорог разворот, уходящий далеко: `FREQ=DAILY;INTERVAL=1000000`
+ * уводит вторую встречу в 4764 год, а шестую — за 18-тысячный, и ical.js,
+ * считая смещение пояса на такую дату, разворачивает YEARLY-правила самого
+ * VTIMEZONE от 1970-го до неё. Одна такая позиция стоит сотен миллисекунд,
+ * а проход по серии до упора прежде кончался нехваткой памяти, не оставив
+ * ни отказа, ни сообщения.
+ *
+ * Счёт ведётся по первым {@link REACH_STEPS} позициям, и у короткой серии
+ * их меньше: одна встреча через четыреста лет — это позволенный разворот, а
+ * сотня подряд с тем же шагом — нет.
+ *
+ * Прежнее правило судится тем же счётом: серию, которая и так уходила за
+ * край, правка чинить не обязана, и правка, шага не трогающая (скажем,
+ * byWeekday у чужого правила с шагом в сто лет), в этот предел не
+ * упирается. Сверх того предохранитель держит свой предел по той же
+ * оценке (guard.ts, checkHorizon).
+ */
+function checkReach(old: ReadonlyArray<[string, RuleValue]>, next: ReadonlyArray<[string, RuleValue]>, startYear: number): void {
+  const dictOf = (parts: ReadonlyArray<[string, RuleValue]>) => Object.fromEntries(parts) as RuleDict;
+  const reach = ruleReachYear(dictOf(next), startYear, REACH_STEPS);
+  const limit = Math.min(startYear + REACH_YEARS, MAX_YEAR);
+  if (reach <= limit || ruleReachYear(dictOf(old), startYear, REACH_STEPS) >= reach) return;
+  const beyondCalendar = reach > MAX_YEAR;
+  throw new EditRefusal(
+    "invalid-rule",
+    beyondCalendar
+      ? `Правило повтора: встречи серии уходят за ${MAX_YEAR} год — развернуть её пришлось бы до ${reach}-го, ` +
+        "а дальше календарь встреч не записывает."
+      : `Правило повтора: ближайшие встречи серии уходят к ${reach} году. Разворачивать серию на века вперёд ` +
+        "не по карману: ни расписание, ни конец серии так не проверить.",
+    { hint: "Возьмите шаг повтора меньше или ограничьте серию: count с числом встреч либо until с датой конца." },
+  );
 }
 
 /**

@@ -680,6 +680,40 @@ describe("края горизонта", () => {
     expect(guardCodes(huge, plan, { patch: { summary: "Совещание" } })).toEqual(["series-too-long"]);
   });
 
+  it("серия у самого края календаря правится: вся она лежит внутри 9999 года", () => {
+    // Прежнее условие сравнивало целый год с годом плюс дробь: у weekly-шага
+    // это 0,019 года, и 9999,019 уходило «за 9999». Под отказ попадал всякий
+    // объект, чей DTSTART в 9999 году, с любым правилом — вместе с
+    // переименованием, правкой одной встречи и удалением одной.
+    const edge = calendar(vevent(["DTSTART;TZID=Europe/Moscow:99990105T100000",
+      "DTEND;TZID=Europe/Moscow:99990105T110000", "SUMMARY:Планёрка", "RRULE:FREQ=WEEKLY;COUNT=3"]));
+    const renamed = calendar(vevent(["DTSTART;TZID=Europe/Moscow:99990105T100000",
+      "DTEND;TZID=Europe/Moscow:99990105T110000", "SUMMARY:Совещание", "RRULE:FREQ=WEEKLY;COUNT=3"]));
+    const rename = putPlan(renamed, { op: "update", scope: "all_series", fields: ["summary"] });
+    expect(guardCodes(edge, rename, { patch: { summary: "Совещание" } })).toEqual([]);
+
+    // Та же серия без конца: встречи у края идут дальше края, но разворот
+    // сверки упирается в него сам — отказа это не требует.
+    const endless = calendar(vevent(["DTSTART;TZID=Europe/Moscow:99990105T100000",
+      "DTEND;TZID=Europe/Moscow:99990105T110000", "SUMMARY:Планёрка", "RRULE:FREQ=WEEKLY"]));
+    const endlessRenamed = calendar(vevent(["DTSTART;TZID=Europe/Moscow:99990105T100000",
+      "DTEND;TZID=Europe/Moscow:99990105T110000", "SUMMARY:Совещание", "RRULE:FREQ=WEEKLY"]));
+    expect(guardCodes(endless, putPlan(endlessRenamed, { op: "update", scope: "all_series", fields: ["summary"] }),
+      { patch: { summary: "Совещание" } })).toEqual([]);
+  });
+
+  it("удаление одной встречи серии у края календаря принимается", () => {
+    const edge = calendar(vevent(["DTSTART;TZID=Europe/Moscow:99990105T100000",
+      "DTEND;TZID=Europe/Moscow:99990105T110000", "SUMMARY:Планёрка", "RRULE:FREQ=WEEKLY;COUNT=3"]));
+    const after = calendar(vevent(["DTSTART;TZID=Europe/Moscow:99990105T100000",
+      "DTEND;TZID=Europe/Moscow:99990105T110000", "SUMMARY:Планёрка", "RRULE:FREQ=WEEKLY;COUNT=3",
+      "EXDATE;TZID=Europe/Moscow:99990112T100000"]));
+    const target = timeKey("9999-01-12T10:00:00+03:00");
+    const plan = putPlan(after, { op: "delete", scope: "this", target, removed: [target] },
+      [lossOf("9999-01-12T10:00:00+03:00")]);
+    expect(guardCodes(edge, plan)).toEqual([]);
+  });
+
   it("встреча, перенесённая за горизонт, пропажей не считается: её читают по её компоненту", () => {
     // Перенос одной встречи бесконечной серии на 9999 год законен, а окно
     // разворота до того года не дотянуть — густую серию до него не перебрать.
