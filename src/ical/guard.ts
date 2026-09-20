@@ -232,13 +232,13 @@ const LIST_LIMIT = 8;
 const META: EventMeta = { calendarId: "" };
 const TIME_FIELDS: readonly PatchField[] = ["start", "end", "timeZone", "allDay"];
 
-/** Видимые поля встречи и поле патча, которое вправе их менять (у STATUS такого поля нет). */
+/** Видимые поля встречи и поле патча, которое вправе их менять. */
 const SNAPSHOT: readonly { name: string; label: string; field?: PatchField }[] = [
   { name: "summary", label: "название", field: "summary" },
   { name: "description", label: "описание", field: "description" },
   { name: "location", label: "место", field: "location" },
   { name: "attendees", label: "участники", field: "attendees" },
-  { name: "status", label: "состояние (STATUS)" },
+  { name: "status", label: "состояние (STATUS)", field: "status" },
 ];
 
 // ─────────────────────────────── вход ───────────────────────────────

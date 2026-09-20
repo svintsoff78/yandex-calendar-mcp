@@ -28,7 +28,7 @@ import {
   type TimeForm,
   type ZoneRef,
 } from "./values.js";
-import type { RecurrenceFrequency, Reminder } from "../types.js";
+import type { EventStatus, RecurrenceFrequency, Reminder } from "../types.js";
 
 /**
  * Точечная правка компонента на месте (О5–О10, Р4 плана переделки,
@@ -137,7 +137,15 @@ const FIELD_KEYS: ReadonlySet<string> = new Set([
   "allDay",
   "reminders",
   "attendees",
+  "status",
 ]);
+
+/** Значения STATUS, которые пишет правка (RFC 5545 §3.8.1.11). */
+const STATUS_VALUES: Record<EventStatus, string> = {
+  tentative: "TENTATIVE",
+  confirmed: "CONFIRMED",
+  cancelled: "CANCELLED",
+};
 
 /**
  * Применяет поля патча к одному компоненту (VEVENT: основному, переопределению
@@ -168,7 +176,7 @@ export function applyFieldPatch(c: ICAL.Component, p: FieldPatch, ctx: PatchCont
     .map(([key]) => key);
   if (unknown.length > 0) {
     throw new EditRefusal("invalid-field", `Поля ${unknown.join(", ")} правка события не знает.`, {
-      hint: "Изменяемые поля: summary, description, location, start, end, timeZone, allDay, reminders, attendees, recurrence.",
+      hint: "Изменяемые поля: summary, description, location, start, end, timeZone, allDay, status, reminders, attendees, recurrence.",
     });
   }
 
@@ -183,6 +191,21 @@ export function applyFieldPatch(c: ICAL.Component, p: FieldPatch, ctx: PatchCont
     }
     texts.push({ field, value });
   }
+  // Статус проверяется здесь же, до первой правки дерева: `null` снимает
+  // свойство, значение пишется словом RFC 5545, чужое слово — отказ.
+  let statusText: string | undefined;
+  if (p.status !== undefined) {
+    if (p.status === null) statusText = "";
+    else {
+      const known = STATUS_VALUES[p.status];
+      if (!known) {
+        throw new EditRefusal("invalid-field", `Статус «${String(p.status)}» неизвестен.`, {
+          hint: "Статус встречи: confirmed, tentative или cancelled; null снимает статус.",
+        });
+      }
+      statusText = known;
+    }
+  }
   const times = resolveTimes(c, p, ctx);
   const attendees = p.attendees === undefined ? undefined : checkedAttendees(p.attendees);
   const reminders = p.reminders === undefined ? undefined : checkedReminders(p.reminders);
@@ -195,6 +218,7 @@ export function applyFieldPatch(c: ICAL.Component, p: FieldPatch, ctx: PatchCont
   for (const { field, value } of texts) {
     if (setText(c, field, value, ctx.touched)) changed.add(field);
   }
+  if (statusText !== undefined && setText(c, "status", statusText, ctx.touched)) changed.add("status");
   let significant = false;
   if (times) {
     const fields = writeTimes(c, times, ctx);

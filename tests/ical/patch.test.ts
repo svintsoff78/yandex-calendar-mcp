@@ -175,6 +175,7 @@ describe("applyFieldPatch: каждое поле трогает только с�
     },
     { name: "start без end", patch: { start: "2026-10-19T12:00:00" }, allowed: ["dtstart", "dtend"] },
     { name: "timeZone", patch: { timeZone: "Europe/Berlin" }, allowed: ["dtstart", "dtend"], rootAllowed: ["vtimezone"] },
+    { name: "status", patch: { status: "cancelled" }, allowed: ["status"] },
   ];
 
   it.each(cases)("$name", ({ patch, allowed, rootAllowed }) => {
@@ -202,6 +203,37 @@ describe("applyFieldPatch: каждое поле трогает только с�
     expect(lines(master, "location")).toEqual(["LOCATION:Зал 2"]);
     expect(lines(master, "description")).toEqual([]);
     expect(result.changed).toEqual(["location"]);
+  });
+
+  it("status: слово RFC 5545 пишется, null снимает свойство, прежнее значение правкой не считается", () => {
+    const bare = calendar(MOSCOW, vevent([
+      "DTSTART;TZID=Europe/Moscow:20261021T100000", "DTEND;TZID=Europe/Moscow:20261021T110000", "SUMMARY:Встреча",
+    ]));
+    const added = patchMaster(bare, { status: "cancelled" });
+    expect(lines(added.master, "status")).toEqual(["STATUS:CANCELLED"]);
+    expect(added.result.changed).toEqual(["status"]);
+
+    const withStatus = calendar(MOSCOW, vevent([
+      "DTSTART;TZID=Europe/Moscow:20261021T100000", "SUMMARY:Встреча", "STATUS:TENTATIVE",
+    ]));
+    const same = patchMaster(withStatus, { status: "tentative" });
+    expect(same.result.changed, "то же значение — правки нет (О13)").toEqual([]);
+
+    const cleared = patchMaster(withStatus, { status: null });
+    expect(lines(cleared.master, "status")).toEqual([]);
+    expect(cleared.result.changed).toEqual(["status"]);
+  });
+
+  it("status: чужое слово — отказ, объект не тронут", () => {
+    const bare = calendar(MOSCOW, vevent(["DTSTART;TZID=Europe/Moscow:20261021T100000", "SUMMARY:Встреча"]));
+    const o = load(bare);
+    const before = jcalOf(o);
+    const refused = refusal(() =>
+      applyFieldPatch(o.master!, { status: "postponed" } as never, { env: ENV, touched: newTouched() }),
+    );
+    expect(refused.code).toBe("invalid-field");
+    expect(refused.message).toContain("postponed");
+    expect(jcalOf(o), "отказ не оставляет объект наполовину исправленным").toEqual(before);
   });
 
   it("новый текст снимает ALTREP прежнего текста, прочие параметры целы", () => {

@@ -1,5 +1,5 @@
 import type ICAL from "ical.js";
-import type { Attendee, EditScope, Recurrence, RecurrenceFrequency, Reminder } from "../types.js";
+import type { Attendee, EditScope, EventStatus, Recurrence, RecurrenceFrequency, Reminder } from "../types.js";
 import type { AnomalyCode, EditOp } from "./object.js";
 import type { SlotKey } from "./values.js";
 
@@ -60,7 +60,11 @@ export interface AttendeePatch {
  *   сохраняет длительность; `timeZone` без `start` сохраняет моменты;
  * - `reminders` — полный список напоминаний DISPLAY и EMAIL со сдвигом от
  *   начала; прочие VALARM (AUDIO, от конца, абсолютные) не трогаются;
- * - `attendees` — полный список участников по адресу.
+ * - `attendees` — полный список участников по адресу;
+ * - `status` — STATUS встречи; `null` снимает свойство, и встреча остаётся
+ *   без статуса, как её и создают. Умолчания у поля нет: не переданный
+ *   статус не трогается. "cancelled" времени не занимает (Р7) — отменённая
+ *   встреча пропадает из занятости, но остаётся видимой в списке.
  */
 export interface FieldPatch {
   summary?: string;
@@ -72,6 +76,7 @@ export interface FieldPatch {
   allDay?: boolean;
   reminders?: readonly Reminder[];
   attendees?: readonly AttendeePatch[];
+  status?: EventStatus | null;
 }
 
 /** Патч update_event: поля и повтор. Повтор правит только planUpdate через patchRule. */
@@ -90,6 +95,7 @@ export const PATCH_FIELDS: readonly PatchField[] = [
   "end",
   "timeZone",
   "allDay",
+  "status",
   "attendees",
   "reminders",
   "recurrence",

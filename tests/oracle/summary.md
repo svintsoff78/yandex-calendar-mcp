@@ -37,7 +37,7 @@ update и delete. Файл создаёт сам прогон (`npm run test:ora
 - зерно генератора случайных чисел: **20260920** (выбор адресов сверх предела; повтор обхода даёт тот же список);
 - затравок: 35, патчей: 28, областей правки: 3;
 - случаев: 13369 (update 12908, delete 461);
-- из них: планов построено 4312, пустых планов 621, отказов 8436;
+- из них: планов построено 4677, пустых планов 621, отказов 8071;
 - горизонт разворота: 2026-01-01 … 2029-01-01, упор 400 встреч, проба «за концом» — 2028-06-01;
 - у объекта, который весь стоит за этим окном (затравка у края года — 9999-й), окно своё: его собственный
   год целиком. Выбирается оно по началу СЕРИИ, чтобы не меняться между «до» и «после», когда правка уводит
@@ -47,39 +47,17 @@ update и delete. Файл создаёт сам прогон (`npm run test:ora
 
 | вид | сколько | что значит |
 | --- | ---: | --- |
-| disagreement | 139 | планировщик построил план, предохранитель его отверг |
+| disagreement | 0 | планировщик построил план, предохранитель его отверг |
 | semantics | 0 | записанный результат разошёлся со смыслом scope или сервер не принял запись |
 | bare-error | 0 | планировщик бросил голую ошибку вместо типизированного отказа |
 | bare-guard | 0 | предохранитель бросил голую ошибку библиотеки вместо GuardError |
-| over-strict | 138 | отказ с кодом, который корпус объявил здесь незаконным: правка обязана была пройти |
+| over-strict | 0 | отказ с кодом, который корпус объявил здесь незаконным: правка обязана была пройти |
 | timeout | 0 | случай не уложился в сторожевое время или исчерпал кучу |
-| **всего** | **277** | |
+| **всего** | **0** | |
 
 ## Первопричины
 
-Различных первопричин: 2 (предел задания — 12).
-
-### П11. Серия, начинающаяся в 9999 году, не проходит предел горизонта, хотя вся внутри него — 139 нарушений
-
-Затравка year-edge-9999 — конечная серия из трёх встреч, со 02.03 по 16.03.9999: разворачивается она тремя шагами, и за край календаря (RFC 5545 §3.3.5) не уходит ни одна из них. Предохранитель всё равно отвергает ЛЮБОЙ план на ней — правку любого поля, смену времени, пояса, повтора, удаление — одним и тем же `series-too-long`: «шаг повтора — около 0 лет, и уже следующая встреча серии уходит за 9999 год».
-Предел считается грубо, в годах (guard.ts, checkHorizon: `startYear(o) + stepYears(o) > HORIZON_MAX_YEAR`). Год начала у такой серии целый — 9999, а шаг дробный — 7/365 года у недельной, 1/365 у ежедневной; сумма больше 9999 при любой частоте чаще годовой. То есть предел срабатывает не на серии, которая УХОДИТ за край, а на всякой серии, которая в последнем году НАЧИНАЕТСЯ. Само сообщение это и показывает: «около 0 лет» — шаг меньше года, а вывод сделан о встрече за краем.
-Планировщик при этом план строит и ничего дурного в серии не видит: расходятся двое, и наружу уходит не «так нельзя», а внутренний сбой.
-
-- затравки: year-edge-9999;
-- патчи: —, summary, description, location, participants, reminders, start, start+end, timeZone, allDay:false+start+end, summary+start, start+end:через полночь, end, allDay:true, allDay:true+start+end, recurrence:frequency, recurrence:count=null, recurrence:replace +confirm, start:9999-12-31, recurrence:frequency+start+end, recurrence:frequency+timeZone, recurrence:count;
-- области: this, this_and_following, all_series;
-- где чинить: src/ical/guard.ts, checkHorizon и withinHorizon: сравнивать с краем горизонта надо МОМЕНТ следующей встречи (он уже считается — iterateSlots, seriesExtent), а не сумму целого года начала и дробного шага. У конечной серии предел не нужен вовсе: число встреч задано COUNT или UNTIL, и разворот кончается сам.
-
-### П12. Предел шага повтора одинаков для конечной серии и бесконечной — 138 нарушений
-
-Патч recurrence:{interval: 1001} отказывает `invalid-rule` на всём корпусе: предел MAX_INTERVAL = 1000 (src/ical/patch.ts, patchRule) поставлен на само значение и о серии, к которой его применяют, не знает ничего. Между тем исхода здесь два, и они разные.
-У БЕСКОНЕЧНОЙ серии шаг решает, куда уйдёт вторая встреча, и при 1001 неделе отказ законен: разворот такой серии останавливать не на чем. У КОНЕЧНОЙ (COUNT или UNTIL) число встреч от шага не зависит вовсе: сколько их было, столько и останется, а последняя при шаге в 1001 неделю приходится на XXII век — до края календаря почти восемь тысяч лет. Разворачивать её не дольше и не дальше, чем прежнюю.
-Так правка отказывает там, где записать нечего, кроме одного числа в RRULE: «раз в 1001 неделю, шесть раз» — законное правило RFC 5545 §3.3.10, и объект с ним короче и проще прежнего.
-
-- затравки: weekly-count-moscow, weekly-newyork, until-berlin, rdate-period-moscow, slot-override-moscow, moved-override-berlin, moved-before-start-moscow, hidden-under-exdate-moscow, hidden-past-end-moscow, detached-on-slot-date, detached-at-moved-start, all-day-weekly, exdate-middle-berlin, rich-moscow, duration-master, dtend-with-duration-moscow, zero-length-moscow, end-before-start-moscow, date-start-time-end-moscow, exdate-off-slot-moscow, email-alarm-moscow, until-date-form-moscow, until-floating-berlin, hidden-exdate-tail-moscow;
-- патчи: recurrence:interval=1001;
-- области: this_and_following, all_series;
-- где чинить: src/ical/patch.ts, patchRule: предел шага обязан смотреть на конец серии, а не на само число. У правила с COUNT или UNTIL проверять надо последнюю встречу — её и так считают (edit.ts, lastSlotUpTo); предел на шаг сам по себе остаётся там, где конца у серии нет.
+Различных первопричин: 0 (предел задания — 12).
 
 ## Учёт отказов (пункт 5)
 
@@ -105,9 +83,9 @@ update и delete. Файл создаёт сам прогон (`npm run test:ora
 | location | this | 167 | 80 | 68 | 12% | 0 | invalid-time: 12 |
 | location | this_and_following | 167 | 86 | 68 | 18% | 5 | invalid-time: 8, confirm-required: 5, unsupported-rule: 4, invalid-field: 1 |
 | location | all_series | 99 | 12 | 12 | 0% | 0 | — |
-| status | this | 167 | 167 | 68 | 100% ⚠ | 0 | invalid-field: 99 |
-| status | this_and_following | 167 | 167 | 68 | 100% ⚠ | 0 | invalid-field: 99 |
-| status | all_series | 99 | 99 | 12 | 100% ⚠ | 0 | invalid-field: 87 |
+| status | this | 167 | 80 | 68 | 12% | 0 | invalid-time: 12 |
+| status | this_and_following | 167 | 86 | 68 | 18% | 5 | invalid-time: 8, confirm-required: 5, unsupported-rule: 4, invalid-field: 1 |
+| status | all_series | 99 | 12 | 12 | 0% | 0 | — |
 | participants | this | 167 | 80 | 68 | 12% | 0 | invalid-time: 12 |
 | participants | this_and_following | 167 | 86 | 68 | 18% | 5 | invalid-time: 8, confirm-required: 5, unsupported-rule: 4, invalid-field: 1 |
 | participants | all_series | 99 | 12 | 12 | 0% | 0 | — |
@@ -166,11 +144,11 @@ update и delete. Файл создаёт сам прогон (`npm run test:ora
 | start:9999-12-31 | this_and_following | 167 | 99 | 68 | 31% | 5 | invalid-time: 19, confirm-required: 5, unsupported-rule: 4, unsynced-rule: 2, invalid-field: 1 |
 | start:9999-12-31 | all_series | 99 | 35 | 12 | 26% | 0 | invalid-time: 18, unsynced-rule: 5 |
 | recurrence:interval=1000000 | this | 167 | 167 | 68 | 100% ⚠ | 0 | invalid-scope: 95, invalid-rule: 4 |
-| recurrence:interval=1000000 | this_and_following | 167 | 167 | 68 | 100% ⚠ | 0 | invalid-rule: 98, invalid-field: 1 |
-| recurrence:interval=1000000 | all_series | 99 | 99 | 12 | 100% ⚠ | 0 | invalid-rule: 87 |
+| recurrence:interval=1000000 | this_and_following | 167 | 167 | 68 | 100% ⚠ | 0 | invalid-rule: 92, unsupported-rule: 6, invalid-field: 1 |
+| recurrence:interval=1000000 | all_series | 99 | 99 | 12 | 100% ⚠ | 0 | invalid-rule: 82, unsupported-rule: 5 |
 | recurrence:interval=1001 | this | 167 | 167 | 68 | 100% ⚠ | 0 | invalid-scope: 95, invalid-rule: 4 |
-| recurrence:interval=1001 | this_and_following | 167 | 167 | 68 | 100% ⚠ | 0 | invalid-rule: 98, invalid-field: 1 |
-| recurrence:interval=1001 | all_series | 99 | 99 | 12 | 100% ⚠ | 0 | invalid-rule: 87 |
+| recurrence:interval=1001 | this_and_following | 167 | 106 | 68 | 38% | 9 | invalid-time: 12, invalid-rule: 10, confirm-required: 9, unsupported-rule: 6, invalid-field: 1 |
+| recurrence:interval=1001 | all_series | 99 | 50 | 12 | 44% | 13 | confirm-required: 13, invalid-time: 11, invalid-rule: 9, unsupported-rule: 5 |
 | recurrence:frequency+start+end | this | 167 | 163 | 68 | 96% ⚠ | 0 | invalid-scope: 95 |
 | recurrence:frequency+start+end | this_and_following | 167 | 107 | 68 | 39% | 13 | invalid-time: 18, confirm-required: 13, unsupported-rule: 6, invalid-field: 1, unsynced-rule: 1 |
 | recurrence:frequency+start+end | all_series | 99 | 43 | 12 | 36% | 19 | confirm-required: 19, invalid-time: 5, unsupported-rule: 5, unsynced-rule: 2 |
@@ -193,9 +171,7 @@ update и delete. Файл создаёт сам прогон (`npm run test:ora
 - recurrence:interval=1000000 × all_series — 100%
 - recurrence:interval=1000000 × this — 100%
 - recurrence:interval=1000000 × this_and_following — 100%
-- recurrence:interval=1001 × all_series — 100%
 - recurrence:interval=1001 × this — 100%
-- recurrence:interval=1001 × this_and_following — 100%
 - recurrence:replace × all_series — 89%
 - recurrence:replace × this — 96%
 - recurrence:replace × this_and_following — 91%
@@ -205,9 +181,6 @@ update и delete. Файл создаёт сам прогон (`npm run test:ora
 - start:0001-01-01 × this — 100%
 - start:0001-01-01 × this_and_following — 100%
 - start:9999-12-31 × this — 89%
-- status × all_series — 100%
-- status × this — 100%
-- status × this_and_following — 100%
 
 Разбор подозрительных пар (отказы разобраны поимённо; ложная строгость среди них одна — предел шага
 повтора, П12, и она названа нарушениями `over-strict`):
