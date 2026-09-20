@@ -149,8 +149,10 @@ const FIELD_KEYS: ReadonlySet<string> = new Set([
  * - attendees — по адресу (О9): PARTSTAT меняется только при `status`,
  *   прочие параметры целы, новые — NEEDS-ACTION, не названные снимаются;
  * - reminders — только VALARM DISPLAY и EMAIL с TRIGGER-длительностью от
- *   начала (О9): совпавшие остаются дословно, лишние снимаются, недостающие
- *   добавляются; AUDIO, TRIGGER от конца и абсолютные TRIGGER не трогаются.
+ *   начала (О9): совпавшие остаются дословно, у совпавших по одному ACTION
+ *   правится TRIGGER на месте (прочие свойства — ATTENDEE письма, ATTACH,
+ *   свои SUMMARY и DESCRIPTION — целы), лишние снимаются, недостающие
+ *   собираются заново; AUDIO, TRIGGER от конца и абсолютные не трогаются.
  * Значение, равное прежнему, компонент не трогает (О13: пустой план ничего
  * не пишет). Повтор здесь не правится — правило правит `patchRule`.
  */
@@ -198,7 +200,8 @@ export function applyFieldPatch(c: ICAL.Component, p: FieldPatch, ctx: PatchCont
   if (reminders) {
     const description = textValue(c, "summary") ?? "Напоминание";
     const pending = reminders.map(({ action, seconds }) => ({
-      key: alarmKey(action, seconds),
+      action,
+      seconds,
       make: () => newAlarm(action, seconds, description),
     }));
     if (syncAlarms(c, pending, ctx.touched)) changed.add("reminders");
@@ -353,11 +356,11 @@ function alarmKey(action: string, seconds: number): string {
 }
 
 /**
- * Ключ напоминания, которым управляет модель: ACTION DISPLAY или EMAIL и
+ * Напоминание, которым управляет модель: ACTION DISPLAY или EMAIL и
  * TRIGGER-длительность от начала (RELATED нет или START). Остальные VALARM
  * (AUDIO, PROCEDURE, от конца, абсолютные) модель не выражает — undefined.
  */
-function managedAlarmKey(alarm: ICAL.Component): string | undefined {
+function managedAlarm(alarm: ICAL.Component): { action: AlarmAction; seconds: number } | undefined {
   const action = String(alarm.getFirstPropertyValue("action") ?? "").toUpperCase();
   if (action !== "DISPLAY" && action !== "EMAIL") return undefined;
   const trigger = alarm.getFirstProperty("trigger");
@@ -365,7 +368,12 @@ function managedAlarmKey(alarm: ICAL.Component): string | undefined {
   if (String(trigger.getParameter("related") ?? "START").toUpperCase() !== "START") return undefined;
   const value = trigger.getFirstValue();
   if (!(value instanceof ICAL.Duration)) return undefined;
-  return alarmKey(action, value.toSeconds());
+  return { action, seconds: value.toSeconds() };
+}
+
+function managedAlarmKey(alarm: ICAL.Component): string | undefined {
+  const managed = managedAlarm(alarm);
+  return managed === undefined ? undefined : alarmKey(managed.action, managed.seconds);
 }
 
 function newAlarm(action: AlarmAction, seconds: number, description: string): ICAL.Component {
@@ -377,32 +385,59 @@ function newAlarm(action: AlarmAction, seconds: number, description: string): IC
   return alarm;
 }
 
+/** Напоминание, которое должно получиться: чем оно задано и чем его собрать, если собирать придётся. */
+interface PendingAlarm {
+  action: AlarmAction;
+  seconds: number;
+  make: () => ICAL.Component;
+}
+
 /**
  * Приводит управляемые напоминания компонента к списку `pending` (с
- * повторами): совпавшие по ключу остаются дословно, лишние снимаются,
- * недостающие добавляются в конец в порядке списка. Неуправляемые VALARM не
+ * повторами): совпавшие по ACTION и сдвигу остаются дословно, у совпавших по
+ * одному ACTION правится TRIGGER на месте, лишние снимаются, недостающие
+ * собираются и добавляются в конец в порядке списка. Неуправляемые VALARM не
  * трогаются.
+ *
+ * Сдвиг правится на месте не ради экономии: у VALARM есть свойства, которых
+ * модель не знает и которые пересборка потеряла бы, — у ACTION:EMAIL это
+ * ATTENDEE (адресат письма, RFC 5545 §3.6.6 требует его обязательно), ATTACH,
+ * собственные SUMMARY и DESCRIPTION, X-свойства.
  */
-function syncAlarms(
-  c: ICAL.Component,
-  pending: Array<{ key: string; make: () => ICAL.Component }>,
-  touched: Touched | undefined,
-): boolean {
+function syncAlarms(c: ICAL.Component, pending: readonly PendingAlarm[], touched: Touched | undefined): boolean {
   const rest = [...pending];
+  const spare: ICAL.Component[] = [];
   let changed = false;
   for (const alarm of c.getAllSubcomponents("valarm")) {
     const key = managedAlarmKey(alarm);
     if (key === undefined) continue;
-    const index = rest.findIndex((entry) => entry.key === key);
+    const index = rest.findIndex((entry) => alarmKey(entry.action, entry.seconds) === key);
     if (index >= 0) {
       rest.splice(index, 1);
       continue;
     }
+    spare.push(alarm);
+  }
+  const missing: PendingAlarm[] = [];
+  for (const entry of rest) {
+    const index = spare.findIndex((alarm) => managedAlarm(alarm)!.action === entry.action);
+    if (index < 0) {
+      missing.push(entry);
+      continue;
+    }
+    const [alarm] = spare.splice(index, 1);
+    const trigger = alarm.getFirstProperty("trigger")!;
+    trigger.setValue(ICAL.Duration.fromSeconds(entry.seconds));
+    markProperty(touched, alarm, trigger);
+    markName(touched, c, "valarm");
+    changed = true;
+  }
+  for (const alarm of spare) {
     c.removeSubcomponent(alarm);
     markComponent(touched, c, alarm);
     changed = true;
   }
-  for (const entry of rest) {
+  for (const entry of missing) {
     const alarm = entry.make();
     c.addSubcomponent(alarm);
     markComponent(touched, c, alarm);
@@ -1070,8 +1105,8 @@ export function inheritFields(
     const pending = newMaster
       .getAllSubcomponents("valarm")
       .flatMap((alarm) => {
-        const key = managedAlarmKey(alarm);
-        return key === undefined ? [] : [{ key, make: () => cloneComponent(alarm) }];
+        const managed = managedAlarm(alarm);
+        return managed === undefined ? [] : [{ ...managed, make: () => cloneComponent(alarm) }];
       });
     if (syncAlarms(ovr, pending, touched)) changed.add("reminders");
   }

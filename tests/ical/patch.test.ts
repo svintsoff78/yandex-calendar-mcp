@@ -341,13 +341,37 @@ describe("напоминания (О9): трогаются только DISPLAY 
     expect(touched.components.size).toBe(1);
   });
 
-  it("C45: DISPLAY за 30 минут вместо 15, затем пустой список — чужие VALARM целы", () => {
+  it("C45: DISPLAY за 30 минут вместо 15 — правится TRIGGER на месте; затем пустой список — чужие VALARM целы", () => {
     const o = load(RICH);
     const touched = newTouched();
     applyFieldPatch(o.master!, { reminders: [{ minutesBefore: 30, method: "display" }] }, { env: ENV, touched });
-    expect(alarmsOf(o.master!)).toEqual([AUDIO, AFTER_END, ABSOLUTE, "ACTION:DISPLAY | TRIGGER:-PT30M | DESCRIPTION:Планёрка"]);
+    // Напоминание то же самое: меняется только сдвиг, своё DESCRIPTION цело.
+    expect(alarmsOf(o.master!)).toEqual([AUDIO, "ACTION:DISPLAY | DESCRIPTION:Напоминание | TRIGGER:-PT30M", AFTER_END, ABSOLUTE]);
     applyFieldPatch(o.master!, { reminders: [] }, { env: ENV, touched });
     expect(alarmsOf(o.master!)).toEqual([AUDIO, AFTER_END, ABSOLUTE]);
+  });
+
+  it("смена одного сдвига у ACTION:EMAIL не теряет ATTENDEE, ATTACH и свои тексты (RFC 5545 §3.6.6)", () => {
+    const ics = calendar(MOSCOW, vevent([
+      "DTSTART;TZID=Europe/Moscow:20261019T100000", "DTEND;TZID=Europe/Moscow:20261019T110000", "SUMMARY:Планёрка",
+      ...alarm("ACTION:EMAIL", "TRIGGER:-PT1H", "ATTENDEE;CN=Пётр:mailto:petrov@example.com", "SUMMARY:Письмо",
+        "DESCRIPTION:Текст письма", "ATTACH;FMTTYPE=text/plain:https://example.com/a.txt", "X-MINE:1"),
+    ]));
+    const { master, result } = patchMaster(ics, { reminders: [{ minutesBefore: 30, method: "email" }] });
+    expect(alarmsOf(master)).toEqual([
+      "ACTION:EMAIL | TRIGGER:-PT30M | ATTENDEE;CN=Пётр:mailto:petrov@example.com | SUMMARY:Письмо | " +
+        "DESCRIPTION:Текст письма | ATTACH;FMTTYPE=text/plain:https://example.com/a.txt | X-MINE:1",
+    ]);
+    expect(result.changed).toEqual(["reminders"]);
+  });
+
+  it("подходящего напоминания нет: ACTION другой — собирается новое, чужое снимается", () => {
+    const ics = calendar(MOSCOW, vevent([
+      "DTSTART;TZID=Europe/Moscow:20261019T100000", "DTEND;TZID=Europe/Moscow:20261019T110000", "SUMMARY:Планёрка",
+      ...alarm("ACTION:EMAIL", "TRIGGER:-PT1H", "ATTENDEE:mailto:petrov@example.com", "DESCRIPTION:Письмо"),
+    ]));
+    const { master } = patchMaster(ics, { reminders: [{ minutesBefore: 30, method: "display" }] });
+    expect(alarmsOf(master)).toEqual(["ACTION:DISPLAY | TRIGGER:-PT30M | DESCRIPTION:Планёрка"]);
   });
 
   it("отрицательное minutesBefore — напоминание после начала (TRIGGER без минуса)", () => {
@@ -1280,9 +1304,11 @@ describe("inheritFields (О7): поле переопределения меня�
       "ATTENDEE;CN=Пётр Петров;PARTSTAT=ACCEPTED:mailto:petrov@example.com",
       "ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:sidorov@example.com",
     ]);
+    // Сдвиг правится у имеющегося напоминания на месте: оно остаётся на своём
+    // месте в списке со своими свойствами, чужое AUDIO цело.
     expect(moved.getAllSubcomponents("valarm").map((a) => a.getFirstPropertyValue("action") + " " + String(a.getFirstPropertyValue("trigger")))).toEqual([
-      "AUDIO -PT1M",
       "DISPLAY -PT30M",
+      "AUDIO -PT1M",
     ]);
     // Время переопределения inheritFields не трогает.
     expect(lines(moved, "dtstart")).toEqual(["DTSTART;TZID=Europe/Moscow:20261026T120000"]);

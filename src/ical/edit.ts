@@ -35,6 +35,7 @@ import {
   newTouched,
   overrideFromMaster,
   patchRule,
+  resolveTimes,
   setRuleEnd,
   touchMetadata,
   type FieldPatchResult,
@@ -120,9 +121,11 @@ import {
  *   src/domain/writes.ts), а не планировщик.
  *
  * - Объект, уже испорченный другим клиентом (дубль RECURRENCE-ID, несколько
- *   RRULE у основного компонента), не правится вовсе: `refuseCorrupted` (О14
- *   с поправкой З10). Писать в него — угадывать, какое из двух противоречащих
- *   описаний встречи или серии настоящее; целиком удалить его можно.
+ *   RRULE у основного компонента, время против RFC 5545: DTEND вместе с
+ *   DURATION, конец не позже начала, начало датой при конце со временем), не
+ *   правится вовсе: `refuseCorrupted` (О14 с поправкой З10). Писать в него —
+ *   угадывать, какое из двух противоречащих описаний встречи или серии
+ *   настоящее; целиком удалить его можно.
  *
  * Порядок решения: порча другим клиентом → блокирующие аномалии объекта →
  * адрес (`resolveTarget`: неоднозначный адрес без подтверждения — отказ
@@ -352,14 +355,64 @@ const CORRUPTED_HINT =
 function refuseCorrupted(o: CalendarObject, op: EditOp, scope: EditScope): void {
   if (op === "delete" && scope === "all_series") return;
   const found = o.anomalies.filter((anomaly) => CORRUPTED.has(anomaly.code));
-  if (found.length === 0) return;
-  const list = found.map((anomaly) => `${formatAnomaly(anomaly)} — ${CORRUPTED.get(anomaly.code)!}`).join("; ");
+  const list = [
+    ...found.map((anomaly) => `${formatAnomaly(anomaly)} — ${CORRUPTED.get(anomaly.code)!}`),
+    ...brokenTimes(o),
+  ];
+  if (list.length === 0) return;
   throw new EditRefusal(
-    found[0].code,
-    `Объект испорчен другим клиентом: ${list}. Писать в него — угадывать, какая из записей верна, поэтому ` +
+    found[0]?.code ?? "invalid-time",
+    `Объект испорчен другим клиентом: ${list.join("; ")}. Писать в него — угадывать, какая из записей верна, поэтому ` +
       `${op === "update" ? "правка отклонена" : "удаление отклонено"}.`,
     { hint: CORRUPTED_HINT },
   );
+}
+
+/**
+ * Время компонента, записанное против RFC 5545 так, что верное значение из
+ * объекта не выводится. Это та же порча другого клиента, что и `CORRUPTED`:
+ * правка не угадывает, какая из двух записей настоящая, а отказывает.
+ * - DTEND вместе с DURATION (§3.6.1 — «either ... or»): чтение считает конец
+ *   по DTEND, а клон для переопределения (О6) оставляет DURATION, и встреча
+ *   молча меняет длину;
+ * - конец не позже начала (§3.6.1: DTEND «MUST be later»), в том числе
+ *   равный ему;
+ * - начало датой при конце со временем (§3.8.2.2: формы DTSTART и DTEND
+ *   совпадают).
+ * Последние два переезжают из основного компонента в переопределение
+ * (update this) и в продолжение (update t&f), и сервер отвечает 400.
+ * Проверяются все VEVENT объекта: в продолжение разреза переопределения
+ * уходят своими копиями.
+ */
+function brokenTime(c: ICAL.Component, env: IcalEnv): string | undefined {
+  const start = c.getFirstProperty("dtstart");
+  const dtend = c.getFirstProperty("dtend");
+  if (!start) return undefined;
+  if (dtend && c.hasProperty("duration")) {
+    return "записаны сразу DTEND и DURATION (RFC 5545 §3.6.1 разрешает только одно), и длительности у них разные по смыслу";
+  }
+  if (!dtend) return undefined;
+  if ((formOf(start) === "date") !== (formOf(dtend) === "date")) {
+    return "начало записано датой, а конец — временем (RFC 5545 §3.8.2.2: формы DTSTART и DTEND совпадают)";
+  }
+  const from = start.getFirstValue() as ICAL.Time;
+  const to = dtend.getFirstValue() as ICAL.Time;
+  if (instantOf(to, env) > instantOf(from, env)) return undefined;
+  return `конец ${formatForModel(to, env, "time")} не позже начала ${formatForModel(from, env, "time")} (RFC 5545 §3.6.1 требует конец позже начала)`;
+}
+
+function brokenTimes(o: CalendarObject): string[] {
+  const found: string[] = [];
+  for (const c of o.root.getAllSubcomponents("vevent")) {
+    const reason = brokenTime(c, o.env);
+    if (reason === undefined) continue;
+    const rid = c.getFirstProperty("recurrence-id");
+    const where = rid
+      ? `у встречи ${formatForModel(rid.getFirstValue() as ICAL.Time, o.env, "instance")}`
+      : "у основного компонента";
+    found.push(`${where} ${reason}`);
+  }
+  return found;
 }
 
 function needConfirm(losses: readonly Loss[], message: string): EditRefusal {
@@ -1442,12 +1495,17 @@ function updateAll(run: Run, patch: EventPatch, scope: EditScope, boundary?: Slo
   const applied = applyRebased(run, master, fields, touched, { place, literalLater: recurrence !== undefined, shownDate: boundaryDate });
   const newLength = lengthOf(master, env);
   const startMoved = !sameTimeProperty(source.getFirstProperty("dtstart")!, master.getFirstProperty("dtstart")!);
-  // Р1: начало вне первой позиции правила (другой клиент, BYHOUR) — отдельная встреча вне правила;
-  // позиционный сдвиг слил бы её с позицией или потерял бы.
-  if (startMoved && recurrence === undefined && source.hasProperty("rrule") && !isDtstartSynced(o)) {
+  // Р1: начало вне первой позиции правила (другой клиент, BYHOUR) — отдельная
+  // встреча вне правила. Опасение оправдано там, где сдвиг меняет ДАТУ начала
+  // (смена пояса через полночь): позиции считаются от нового начала, и
+  // отдельная встреча слилась бы с позицией или потерялась. Сдвиг в пределах
+  // суток дат позиций не меняет, встречи не сливаются и не теряются — он
+  // разрешён.
+  if (startMoved && recurrence === undefined && source.hasProperty("rrule") && !isDtstartSynced(o) && movedDate(source, master)) {
     throw unsynced(
       `Начало серии ${formatForModel(source.getFirstPropertyValue("dtstart") as ICAL.Time, env, "instance")} стоит вне правила ` +
-        "(RFC 5545 §3.8.5.3: это отдельная встреча): сдвинуть время серии, сопоставив встречи по позициям правила, нельзя.",
+        "(RFC 5545 §3.8.5.3: это отдельная встреча), а правка переносит его на другие сутки: " +
+        "сопоставить встречи по позициям правила нельзя.",
     );
   }
   const mode = fields.start !== undefined || toggle ? "wall" : "moment";
@@ -1519,6 +1577,7 @@ function updateAll(run: Run, patch: EventPatch, scope: EditScope, boundary?: Slo
   const next = copyOf(work);
   // Начало на первой позиции правила (RFC 5545 §3.8.5.3): иначе оно — лишняя встреча вне правила (Р1, unsynced-rule).
   if (ruleChanged && isDtstartSynced(o)) requireSynced(next, "у всей серии");
+  if (startMoved && recurrence === undefined) refuseMergedStart(o, next);
   expect.keyMap = retimed ? retimed.mapper.mapKey : undefined;
   expect.removed = step?.keys ?? [];
   expect.ruleChanged = ruleChanged;
@@ -1572,6 +1631,42 @@ function refuseToggle(o: CalendarObject, withOverrides: boolean): void {
   if (o.master!.getAllProperties("rdate").some((property) => property.type === "period")) {
     throw new EditRefusal("invalid-time", "У серии есть встречи RDATE с длительностью (PERIOD): переключить «весь день» у всей серии нельзя.");
   }
+}
+
+/**
+ * Начало, стоявшее вне правила (отдельная встреча, RFC 5545 §3.8.5.3), после
+ * сдвига встало на позицию правила: две встречи слились бы в одну, и одна
+ * пропала бы из выдачи. Сдвиг в пределах суток дат позиций не меняет, но у
+ * BYHOUR и HOURLY время суток позиции от даты не зависит — слиться может и он.
+ *
+ * Перебор оборвался (серия длиннее предела) — слияния не видно: отказывать не
+ * по чему, дальше решает предохранитель.
+ */
+function refuseMergedStart(o: CalendarObject, next: CalendarObject): void {
+  if (isDtstartSynced(o)) return; // начало и было на правиле: отдельной встречи нет
+  const master = next.master;
+  if (!master || !master.hasProperty("rrule")) return;
+  const start = master.getFirstPropertyValue("dtstart") as ICAL.Time;
+  let slot: Slot | undefined;
+  try {
+    slot = findSlot(next, slotKeyOf(start, next.form, next.env));
+  } catch (error) {
+    if (error instanceof SlotScanError) return;
+    throw error;
+  }
+  if (!slot || !slot.sources.includes("rrule")) return;
+  throw unsynced(
+    `Начало серии ${formatForModel(o.master!.getFirstPropertyValue("dtstart") as ICAL.Time, o.env, "instance")} стоит вне правила ` +
+      `(RFC 5545 §3.8.5.3: это отдельная встреча), а после сдвига встало бы на позицию правила ` +
+      `${formatForModel(slot.time, o.env, "instance")}: две встречи слились бы в одну.`,
+  );
+}
+
+/** Правка перенесла записанное начало на другие сутки (стенная дата DTSTART другая). */
+function movedDate(source: ICAL.Component, master: ICAL.Component): boolean {
+  const was = source.getFirstPropertyValue("dtstart") as ICAL.Time;
+  const now = master.getFirstPropertyValue("dtstart") as ICAL.Time;
+  return dateString(was) !== dateString(now);
 }
 
 function unsynced(message: string): EditRefusal {
@@ -1747,6 +1842,10 @@ type SlotTarget = Extract<Target, { kind: "single" | "slot" }>;
  * получает патч безусловно; расписание сверяется с хвостом исходной серии
  * (`sameTail`). Исходный объект усекается перед B.
  *
+ * Безусловный патч встречи B — про поля, а не про её собственное время: B,
+ * перенесённая со своего места, остаётся на своём времени (О7,
+ * `applyToMovedBoundary`), и об этом сказано в ответе.
+ *
  * Переопределения без слота (скрытый след, оторванная встреча) в продолжение
  * не переходят: своего места в правиле у них нет, в новом объекте их адрес
  * был бы новой сиротой (О12а) и сервер отверг бы запись, а двигать адрес не
@@ -1754,7 +1853,9 @@ type SlotTarget = Extract<Target, { kind: "single" | "slot" }>;
  * прибавляется, они там и были, — и о них сказано в ответе. Оторванная
  * встреча при этом оказывается за концом усечённой серии и перестаёт быть
  * видимой: это потеря сверх цели, она названа в перечне и требует confirm,
- * компонент остаётся на месте скрытым.
+ * компонент остаётся на месте скрытым. Если по адресу такого переопределения
+ * в продолжении оказалась бы встреча серии, решает роль (`sharedAddresses`):
+ * настоящая встреча — отказ, скрытый след — снимается с confirm.
  *
  * Пустой патч (О13) ничего не пишет и серию не делит. Все потери разреза —
  * письма чужим участникам (новое событие может разослать приглашения),
@@ -1843,13 +1944,16 @@ function updateSplit(run: Run, target: SlotTarget, patch: EventPatch): WritePlan
   }
   if (mode === "wall" && !toggle && recurrence === undefined) refuseShiftedDates(retimed);
 
-  // О7; встреча самой границы получает патч безусловно.
+  // О7; встреча самой границы получает патч безусловно — но перенесённая
+  // граница своё время не теряет (`applyToMovedBoundary`).
   const inheritable = requested.filter((field) => INHERITED.has(field));
+  let movedBoundaryKept = false;
   for (const info of infos) {
     if (info.role === "hidden") continue;
     if (info.oldKey === boundary) {
       const was = JSON.stringify(info.component.jCal);
-      applyRebased(run, info.component, fields, contTouched, { place, literalLater: true, quiet: true });
+      if (info.moved) movedBoundaryKept = applyToMovedBoundary(run, info.component, fields, contTouched);
+      else applyRebased(run, info.component, fields, contTouched, { place, literalLater: true, quiet: true });
       if (JSON.stringify(info.component.jCal) !== was) changed = true;
     } else if (inheritable.length > 0) {
       inheritFields(info.component, oldMaster, master, inheritable, contTouched);
@@ -1885,7 +1989,12 @@ function updateSplit(run: Run, target: SlotTarget, patch: EventPatch): WritePlan
   const continuationText = textOf(root);
   const continuation = reparse(continuationText, env);
   if (target.slot.sources.includes("rrule")) requireSynced(continuation, "первая встреча продолжения");
-  refuseSharedAddress(o, continuation, staying);
+  // Скрытые следы, чьи адреса заняли бы встречи продолжения, снимаются вместе
+  // с усечением (`kept` без их ключей); настоящая встреча по такому адресу —
+  // отказ, он внутри `sharedAddresses`.
+  const shared = sharedAddresses(o, continuation, staying);
+  const sharedKeys = new Set(shared.map((entry) => entry.key));
+  const kept = new Set([...stayingKeys].filter((key) => !sharedKeys.has(key)));
   if (recurrence === undefined) {
     const tail = sameTail(o, boundary, continuation, retimed.mapper.mapKey);
     if (!tail.same) {
@@ -1904,20 +2013,31 @@ function updateSplit(run: Run, target: SlotTarget, patch: EventPatch): WritePlan
   // Исходный объект: усечение перед границей.
   const work = copyOf(o);
   const touched = newTouched();
-  truncate(run, work, boundary, boundaryTime, touched, stayingKeys);
-  const hidden = hiddenAfterCut(o, copyOf(work), boundary, "update", stayingKeys);
+  truncate(run, work, boundary, boundaryTime, touched, kept);
+  const hidden = hiddenAfterCut(o, copyOf(work), boundary, "update", kept);
 
   // Подтверждение (О11): все потери разреза — одним отказом с полным перечнем.
   const guests = foreignAttendees([o.master!, ...moving.map((ref) => ref.component)], env);
   const guestMessage = guests.length > 0
     ? `Разрез серии создаст новое событие с участниками ${guests.join(", ")}: Яндекс может разослать им приглашение на новую серию и отмену части прежней.`
     : "";
-  const losses = [...(step ? ruleLosses(step) : []), ...hidden.map((entry) => entry.loss)];
+  const losses = [...(step ? ruleLosses(step) : []), ...shared.map((entry) => entry.loss), ...hidden.map((entry) => entry.loss)];
   if ((guests.length > 0 || losses.length > 0 || (step !== undefined && ruleNeedsConfirm(step))) && !run.confirmed) {
-    throw needConfirm(losses, [guestMessage, step ? ruleConfirmMessage(step) : "", hidden.length > 0 ? HIDDEN_MESSAGE : ""].filter(Boolean).join(" "));
+    throw needConfirm(
+      losses,
+      [guestMessage, step ? ruleConfirmMessage(step) : "", shared.length > 0 ? SHARED_MESSAGE : "", hidden.length > 0 ? HIDDEN_MESSAGE : ""]
+        .filter(Boolean)
+        .join(" "),
+    );
   }
   if (guestMessage) run.notices.push(guestMessage);
-  run.notices.push(...stayedBehindNotices(o, staying));
+  if (movedBoundaryKept) {
+    run.notices.push(
+      `Встреча ${label} перенесена со своего места в серии: правка времени серии её не двигает — её начало и конец прежние.`,
+    );
+  }
+  run.notices.push(...stayedBehindNotices(o, staying.filter((ref) => !sharedKeys.has(ref.key))));
+  run.notices.push(...sharedNotice(shared));
   run.notices.push(...hiddenNotice(hidden));
   run.notices.push(...movedPastBoundary(o, boundary, instantOf(boundaryTime, env), "остаются в прежней серии: их адрес раньше границы, изменения к ним не применены"));
   for (const info of infos) {
@@ -1948,6 +2068,18 @@ function updateSplit(run: Run, target: SlotTarget, patch: EventPatch): WritePlan
   };
 }
 
+const SHARED_MESSAGE =
+  "Скрытые следы прежних правок, по адресам которых в продолжении оказались бы встречи серии, будут сняты " +
+  "(иначе один адрес называл бы две разные встречи).";
+
+function sharedNotice(shared: ReadonlyArray<{ loss: Loss }>): string[] {
+  if (shared.length === 0) return [];
+  return [
+    `Скрытые следы встреч ${shared.map((entry) => entry.loss.instanceStart).join(", ")} сняты: ` +
+      "в продолжении по их адресам стоят встречи серии, и один адрес называл бы две разные встречи.",
+  ];
+}
+
 /**
  * Переопределение, оставшееся в прежней серии (`staying` разреза), не должно
  * оказаться по одному адресу со встречей продолжения: один адрес называл бы
@@ -1955,10 +2087,22 @@ function updateSplit(run: Run, target: SlotTarget, patch: EventPatch): WritePlan
  * наугад. Так бывает при смене пояса: оторванная встреча стоит на моменте,
  * который в новом поясе приходится на встречу серии.
  *
+ * Роли расходятся, и цена у них разная. По адресу стоит настоящая встреча
+ * (оторванная) — её не потерять никаким подтверждением: отказ. По адресу
+ * стоит скрытый след прошлых правок — встречи там нет, терять нечего, кроме
+ * самого следа: он снимается вместе с усечением, назван в перечне потерь и
+ * требует confirm (О11). Возвращаются именно такие следы; глухим отказом
+ * подтверждаемая правка не подменяется.
+ *
  * Перебор продолжения оборвался (серия длиннее предела) — совпадения не
  * видно: отказывать не по чему, и разрез идёт как обычно.
  */
-function refuseSharedAddress(o: CalendarObject, continuation: CalendarObject, staying: readonly OverrideRef[]): void {
+function sharedAddresses(
+  o: CalendarObject,
+  continuation: CalendarObject,
+  staying: readonly OverrideRef[],
+): Array<{ key: SlotKey; loss: Loss }> {
+  const traces: Array<{ key: SlotKey; loss: Loss }> = [];
   for (const ref of staying) {
     const key = slotKeyOf(ref.recurrenceId, continuation.form, continuation.env);
     let taken: boolean;
@@ -1970,11 +2114,24 @@ function refuseSharedAddress(o: CalendarObject, continuation: CalendarObject, st
       taken = false;
     }
     if (!taken) continue;
-    throw splitMismatch(
-      `Встреча ${keyLabel(o, ref.key, "instance")} стоит вне правила повтора и остаётся в прежней серии, ` +
-        "а в продолжении по её адресу оказалась бы встреча серии: один адрес называл бы две разные встречи",
-    );
+    const label = meetingLabel(o, ref.key);
+    if (o.roles.get(ref.component)?.role !== "hidden") {
+      throw splitMismatch(
+        `Встреча ${label} стоит вне правила повтора и остаётся в прежней серии, ` +
+          "а в продолжении по её адресу оказалась бы встреча серии: один адрес называл бы две разные встречи.",
+      );
+    }
+    traces.push({
+      key: ref.key,
+      loss: {
+        instanceStart: keyLabel(o, ref.key, "instance"),
+        start: formatForModel(ref.component.getFirstPropertyValue("dtstart") as ICAL.Time, o.env, "time"),
+        summary: summaryOf(ref.component),
+        reason: "скрытый след встречи снят: в продолжении по его адресу оказалась бы встреча серии",
+      },
+    });
   }
+  return traces;
 }
 
 /**
@@ -2746,6 +2903,40 @@ function applyRebased(
   if (end.date !== shown && !options.quiet) run.notices.push(dateIgnored("end", end.date, shown, options.place));
   applyFieldPatch(c, { end: compose(date, end, frame) }, ctx);
   return result;
+}
+
+/**
+ * Патч времени на перенесённую границу разреза (Р9, О7). Время переноса
+ * выбрал пользователь, и правка времени серии его не отменяет — ни начала,
+ * ни конца: ровно так же перенесённая встреча стоит при all_series и при
+ * разрезе с более ранней границей. Прочие поля патча ложатся как обычно; на
+ * `timeZone` без `start` моменты сохраняются (О8), то есть и он её не двигает.
+ *
+ * `end` без `start` называет этой встрече конец временем суток. Если он не
+ * позже её начала, правка отвергается тем же отказом invalid-time, что и при
+ * scope this (patch.ts, О8), — прежде конец молча переезжал на следующие
+ * сутки, и встреча на 75 минут становилась двадцатичасовой.
+ *
+ * Возвращает true, если патч называл время: о нетронутом времени границы
+ * говорится в notices, молча перенос пользователя не пропадает.
+ */
+function applyToMovedBoundary(run: Run, c: ICAL.Component, fields: FieldPatch, touched: Touched): boolean {
+  const ctx = patchContext(run, touched);
+  const { start: startIso, end: endIso, ...rest } = fields;
+  if (startIso === undefined && endIso === undefined) {
+    applyFieldPatch(c, fields, ctx);
+    return false;
+  }
+  const frame = targetFrame(run, c, fields);
+  applyFieldPatch(c, rest, ctx);
+  if (endIso !== undefined && startIso === undefined) {
+    // Проверка, а не запись: конец считается на собственной дате встречи и
+    // сверяется с её собственным началом — `resolveTimes` дерево не трогает.
+    const end = wallIn(run, endIso, frame, "end");
+    const own = c.getFirstPropertyValue("dtstart") as ICAL.Time;
+    resolveTimes(c, { end: end ? compose(dateString(own), end, frame) : endIso }, ctx);
+  }
+  return true;
 }
 
 function dateIgnored(field: string, date: string, anchor: string, place: string): string {
