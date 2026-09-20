@@ -10,6 +10,11 @@
 // всесуточная, с EXDATE в середине, с WKST, с BYSETPOS, испорченные чужими
 // клиентами (два RRULE, два переопределения на один RECURRENCE-ID).
 //
+// Добавлено после ручного разбора: объекты с испорченным временем (DTEND
+// вместе с DURATION, нулевая и отрицательная длительность, DTSTART в форме
+// DATE при DTEND со временем), скрытое переопределение на EXDATE мимо слотов
+// правила и серия с богатым напоминанием письмом.
+//
 // Пояса: Europe/Moscow (без перевода часов), Europe/Berlin (переход
 // 25.10.2026), America/New_York (переход 01.11.2026), даты и плавающее
 // время. У каждой затравки с TZID — свой VTIMEZONE внутри объекта.
@@ -410,6 +415,163 @@ export const duplicateOverrideMoscow: Seed = {
 };
 
 // ---------------------------------------------------------------------------
+// Испорченное время, записанное чужими клиентами
+// ---------------------------------------------------------------------------
+//
+// Эти четыре объекта нарушают RFC 5545 в самом времени основного компонента.
+// Правка обязана поступить с ними одним из двух законных способов: либо
+// отказать внятно, либо записать нечто, что сервер примет. Молчаливое
+// тиражирование порчи (перенос DTEND вместе с DURATION в новое
+// переопределение, нулевая или отрицательная длительность у новой встречи) —
+// дефект, и строгий режим подставного сервера отвечает на такую запись 400.
+//
+// Поэтому в перечне они идут БЕЗ пометки corrupted: их отказы считаются
+// наравне с прочими, а записи проверяются по общим правилам.
+
+/** У основного компонента разом DTEND и DURATION (RFC 5545 §3.6.1 такого не допускает). */
+export const dtendWithDurationMoscow: Seed = {
+  uid: "or-dtend-duration@example.com",
+  about: "Испорчено чужим клиентом: Пн и Ср с 19.10.2026 МСК, COUNT=6, у основного компонента и DTEND 11:00, и DURATION PT30M",
+  ics: object(
+    OTHER_HEAD,
+    MOSCOW,
+    vevent(
+      "or-dtend-duration@example.com",
+      "DTSTART;TZID=Europe/Moscow:20261019T100000",
+      "DTEND;TZID=Europe/Moscow:20261019T110000",
+      "DURATION:PT30M",
+      "RRULE:FREQ=WEEKLY;BYDAY=MO,WE;COUNT=6",
+      "SUMMARY:Конец задан дважды",
+    ),
+  ),
+};
+
+/** DTEND равен DTSTART: встречи нулевой длительности. */
+export const zeroLengthMoscow: Seed = {
+  uid: "or-zero-length@example.com",
+  about: "Испорчено чужим клиентом: Пн и Ср 10:00 МСК с 19.10.2026, COUNT=6, DTEND равен DTSTART (нулевая длительность)",
+  ics: object(
+    OTHER_HEAD,
+    MOSCOW,
+    vevent(
+      "or-zero-length@example.com",
+      "DTSTART;TZID=Europe/Moscow:20261019T100000",
+      "DTEND;TZID=Europe/Moscow:20261019T100000",
+      "RRULE:FREQ=WEEKLY;BYDAY=MO,WE;COUNT=6",
+      "SUMMARY:Нулевая длительность",
+    ),
+  ),
+};
+
+/** DTEND раньше DTSTART: встречи отрицательной длительности. */
+export const endBeforeStartMoscow: Seed = {
+  uid: "or-end-before-start@example.com",
+  about: "Испорчено чужим клиентом: Пн и Ср 10:00 МСК с 19.10.2026, COUNT=6, DTEND 09:30 — раньше DTSTART",
+  ics: object(
+    OTHER_HEAD,
+    MOSCOW,
+    vevent(
+      "or-end-before-start@example.com",
+      "DTSTART;TZID=Europe/Moscow:20261019T100000",
+      "DTEND;TZID=Europe/Moscow:20261019T093000",
+      "RRULE:FREQ=WEEKLY;BYDAY=MO,WE;COUNT=6",
+      "SUMMARY:Конец раньше начала",
+    ),
+  ),
+};
+
+/** DTSTART в форме DATE, DTEND со временем: формы концов не совпадают (О4). */
+export const dateStartTimeEndMoscow: Seed = {
+  uid: "or-date-start-time-end@example.com",
+  about: "Испорчено чужим клиентом: Пн и Ср с 19.10.2026, COUNT=6, DTSTART в форме DATE, а DTEND со временем 11:00 МСК",
+  ics: object(
+    OTHER_HEAD,
+    MOSCOW,
+    vevent(
+      "or-date-start-time-end@example.com",
+      "DTSTART;VALUE=DATE:20261019",
+      "DTEND;TZID=Europe/Moscow:20261019T110000",
+      "RRULE:FREQ=WEEKLY;BYDAY=MO,WE;COUNT=6",
+      "SUMMARY:Дата и время вперемешку",
+    ),
+  ),
+};
+
+/**
+ * Скрытое переопределение на EXDATE, который не попал ни на одну позицию
+ * правила. У серии по средам EXDATE стоит на четверг: слота он не закрывает,
+ * а переопределение с тем же RECURRENCE-ID оказывается и мимо слотов, и под
+ * EXDATE разом. В корпусе такого случая не было: `hidden-under-exdate-moscow`
+ * прячет настоящий слот, а не позицию мимо правила.
+ */
+export const exdateOffSlotMoscow: Seed = {
+  uid: "or-exdate-off-slot@example.com",
+  about: "Ср 12:00–13:00 МСК с 21.10.2026, COUNT=4; EXDATE 29.10 (четверг, мимо слотов) и переопределение по тому же адресу",
+  ics: object(
+    OTHER_HEAD,
+    MOSCOW,
+    vevent(
+      "or-exdate-off-slot@example.com",
+      "DTSTART;TZID=Europe/Moscow:20261021T120000",
+      "DTEND;TZID=Europe/Moscow:20261021T130000",
+      "RRULE:FREQ=WEEKLY;BYDAY=WE;COUNT=4",
+      "EXDATE;TZID=Europe/Moscow:20261029T120000",
+      "SUMMARY:Созвон",
+    ),
+    vevent(
+      "or-exdate-off-slot@example.com",
+      "RECURRENCE-ID;TZID=Europe/Moscow:20261029T120000",
+      "DTSTART;TZID=Europe/Moscow:20261029T160000",
+      "DTEND;TZID=Europe/Moscow:20261029T170000",
+      "SUMMARY:Созвон (EXDATE мимо слотов)",
+    ),
+  ),
+};
+
+// ---------------------------------------------------------------------------
+// Богатое напоминание
+// ---------------------------------------------------------------------------
+
+/**
+ * Серия с напоминанием письмом, у которого есть всё своё: адресат
+ * (ATTENDEE), вложение (ATTACH), заголовок и текст письма, X-свойство
+ * клиента. Второе напоминание — показом, на том же сдвиге, что и в патче
+ * напоминаний: оно обязано остаться дословно, а письмо — не потерять
+ * адресата при смене сдвига.
+ */
+export const emailAlarmMoscow: Seed = {
+  uid: "or-email-alarm@example.com",
+  about: "Ср 12:00–13:00 Europe/Moscow с 21.10.2026, COUNT=4; напоминание показом за 10 минут и письмом за 30 с ATTENDEE, ATTACH, SUMMARY и X-свойством",
+  ics: object(
+    OTHER_HEAD,
+    MOSCOW,
+    vevent(
+      "or-email-alarm@example.com",
+      "DTSTART;TZID=Europe/Moscow:20261021T120000",
+      "DTEND;TZID=Europe/Moscow:20261021T130000",
+      "RRULE:FREQ=WEEKLY;BYDAY=WE;COUNT=4",
+      "SUMMARY:Совет директоров",
+      "DESCRIPTION:Повестка в приложении.",
+      'ORGANIZER;CN="Анна Смирнова":mailto:anna@example.com',
+      "BEGIN:VALARM",
+      "ACTION:DISPLAY",
+      "DESCRIPTION:Напоминание",
+      "TRIGGER:-PT10M",
+      "END:VALARM",
+      "BEGIN:VALARM",
+      "ACTION:EMAIL",
+      "TRIGGER:-PT30M",
+      "ATTENDEE;CN=Пётр Петров:mailto:petrov@example.com",
+      "ATTACH;FMTTYPE=application/pdf:https://files.example.com/agenda.pdf",
+      "SUMMARY:Напоминание о совете директоров",
+      "DESCRIPTION:Через полчаса начинается совет директоров. Повестка во вложении.",
+      "X-EXAMPLE-ALARM-ID:a1b2c3",
+      "END:VALARM",
+    ),
+  ),
+};
+
+// ---------------------------------------------------------------------------
 // Перечень затравок
 // ---------------------------------------------------------------------------
 
@@ -453,6 +615,15 @@ export const ORACLE_SEEDS: readonly OracleSeed[] = [
   named("duration-master", c62DurationMaster),
   named("two-rrules-moscow", twoRrulesMoscow, true),
   named("duplicate-override-moscow", duplicateOverrideMoscow, true),
+  // Добавлены после ручного разбора; ставятся в конец, чтобы у прежних
+  // затравок не сменился порядковый номер, а с ним и выбор адресов по зерну.
+  // Пометки corrupted у них нет нарочно: см. заголовок раздела выше.
+  named("dtend-with-duration-moscow", dtendWithDurationMoscow),
+  named("zero-length-moscow", zeroLengthMoscow),
+  named("end-before-start-moscow", endBeforeStartMoscow),
+  named("date-start-time-end-moscow", dateStartTimeEndMoscow),
+  named("exdate-off-slot-moscow", exdateOffSlotMoscow),
+  named("email-alarm-moscow", emailAlarmMoscow),
 ];
 
 // ---------------------------------------------------------------------------
@@ -504,6 +675,20 @@ export const ORACLE_PATCHES: readonly OraclePatch[] = [
     patch: { attendees: [{ email: "oracle@example.com", status: "needs-action" }] },
     kind: "field",
     field: "attendees",
+  },
+  {
+    name: "reminders",
+    patch: {
+      reminders: [
+        { method: "display", minutesBefore: 10 },
+        { method: "email", minutesBefore: 20 },
+      ],
+    },
+    kind: "invariant",
+    note:
+      "Напоминания в выдачу встречи не попадают, поэтому точного ожидания по ним нет: сверяются инварианты " +
+      "области (встречи не сдвинулись, их не прибавилось и не убавилось) и отдельное требование — " +
+      "напоминание письмом не остаётся без адресата.",
   },
   { name: "start", patch: { start: "2026-11-05T14:30:00" }, kind: "time" },
   { name: "end", patch: { end: "2026-11-05T16:45:00" }, kind: "time" },

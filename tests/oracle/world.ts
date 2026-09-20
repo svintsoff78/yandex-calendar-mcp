@@ -51,6 +51,16 @@ export interface Snap {
   /** Копии начала и конца в форме и поясе объекта — для расчёта ожидаемого времени. */
   startTime: ICAL.Time;
   endTime: ICAL.Time;
+  /** Напоминания того компонента, который показан пользователю. */
+  alarms: Alarms;
+}
+
+/** Напоминания одного компонента: в выдачу встречи они не попадают, но записью правятся. */
+export interface Alarms {
+  /** Устойчивая подпись всех VALARM: действие, триггер и адресаты, по одному на строку. */
+  signature: string;
+  /** Напоминаний письмом без единого ATTENDEE: RFC 5545 §3.6.6 требует адресата. */
+  emailWithoutRecipient: number;
 }
 
 /** Развёрнутый календарь: встречи всех объектов и признак «серия кончилась». */
@@ -81,6 +91,27 @@ function attendeesOf(component: ICAL.Component): string {
     .join(",");
 }
 
+/** Напоминания компонента: подпись для сравнения и счёт писем без адресата. */
+function alarmsOf(component: ICAL.Component): Alarms {
+  const lines: string[] = [];
+  let emailWithoutRecipient = 0;
+  for (const alarm of component.getAllSubcomponents("valarm")) {
+    const action = String(alarm.getFirstPropertyValue("action") ?? "").toUpperCase();
+    const trigger = alarm.getFirstProperty("trigger");
+    const related = trigger ? String(trigger.getParameter("related") ?? "START").toUpperCase() : "";
+    const when = trigger ? String(trigger.getFirstValue() ?? "") : "";
+    const to = alarm
+      .getAllProperties("attendee")
+      .map((p) => String(p.getFirstValue() ?? "").toLowerCase())
+      .sort()
+      .join(",");
+    if (action === "EMAIL" && to === "") emailWithoutRecipient += 1;
+    lines.push(`${action}|${when}|${related}|${to}`);
+  }
+  lines.sort();
+  return { signature: lines.join(";"), emailWithoutRecipient };
+}
+
 function snapOf(instance: Instance): Snap {
   return {
     address: instance.instanceStart,
@@ -98,6 +129,7 @@ function snapOf(instance: Instance): Snap {
     kind: instance.kind,
     startTime: instance.start.clone(),
     endTime: instance.end.clone(),
+    alarms: alarmsOf(instance.shown),
   };
 }
 

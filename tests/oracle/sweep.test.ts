@@ -20,14 +20,26 @@ const TIMEOUT = 180_000;
 
 describe("оракул правки", () => {
   it("корпус покрывает всё, что перечислено в задании", () => {
-    expect(ORACLE_SEEDS.length).toBeGreaterThanOrEqual(24);
-    expect(ORACLE_PATCHES.length).toBeGreaterThanOrEqual(18);
+    expect(ORACLE_SEEDS.length).toBeGreaterThanOrEqual(31);
+    expect(ORACLE_PATCHES.length).toBeGreaterThanOrEqual(21);
     expect(ORACLE_SCOPES).toEqual(["this", "this_and_following", "all_series"]);
     // Пояса с переводом часов и без него — оба в корпусе.
     expect(ORACLE_SEEDS.some((seed) => seed.ics.includes("TZID:Europe/Moscow"))).toBe(true);
     expect(ORACLE_SEEDS.some((seed) => seed.ics.includes("TZID:Europe/Berlin"))).toBe(true);
     // Испорченные чужими клиентами — отдельной группой, в учёте отказов их нет.
     expect(ORACLE_SEEDS.filter((seed) => seed.corrupted).length).toBeGreaterThanOrEqual(2);
+    // Объекты с испорченным временем: правка обязана либо отказать внятно, либо
+    // записать годное время, поэтому пометки corrupted у них нет — их отказы
+    // считаются наравне с прочими.
+    const brokenTime = ["dtend-with-duration-moscow", "zero-length-moscow", "end-before-start-moscow", "date-start-time-end-moscow"];
+    for (const name of brokenTime) {
+      const seed = ORACLE_SEEDS.find((s) => s.name === name);
+      expect(seed, name).toBeDefined();
+      expect(seed!.corrupted, name).toBe(false);
+    }
+    // Напоминания: патч в корпусе есть, и есть затравка с богатым письмом.
+    expect(ORACLE_PATCHES.some((entry) => entry.name === "reminders")).toBe(true);
+    expect(ORACLE_SEEDS.some((seed) => seed.ics.includes("ACTION:EMAIL") && seed.ics.includes("ATTACH"))).toBe(true);
   });
 
   it("горизонт разворота накрывает весь корпус и уходит дальше двух лет", () => {

@@ -10,9 +10,11 @@ import { ORACLE_PATCHES, ORACLE_SEEDS } from "./corpus.js";
 import { checkSemantics } from "./semantics.js";
 import { load, worldOf } from "./world.js";
 
-const seed = ORACLE_SEEDS.find((s) => s.name === "weekly-count-moscow")!;
+const named = (name: string) => ORACLE_SEEDS.find((s) => s.name === name)!;
+const seed = named("weekly-count-moscow");
 const summaryPatch = ORACLE_PATCHES.find((p) => p.name === "summary")!;
 const startPatch = ORACLE_PATCHES.find((p) => p.name === "start")!;
+const remindersPatch = ORACLE_PATCHES.find((p) => p.name === "reminders")!;
 
 const FIRST = "2026-10-19T10:00:00+03:00";
 const NEW_TITLE = String(summaryPatch.patch.summary);
@@ -26,6 +28,31 @@ function check(afterIcs: string, options: { scope: "this" | "this_and_following"
     scope: options.scope,
     address: options.address,
     entry: options.entry ?? summaryPatch,
+  });
+}
+
+/** То же, но по любой затравке корпуса: для инвариантов, общих на все правки. */
+function checkOn(
+  name: string,
+  afterIcs: string,
+  options: {
+    scope: "this" | "this_and_following" | "all_series";
+    address?: string;
+    entry?: typeof summaryPatch;
+    op?: "update" | "delete";
+    notices?: readonly string[];
+  },
+) {
+  const source = named(name);
+  return checkSemantics({
+    o: load(source.ics),
+    before: worldOf([source.ics]),
+    after: worldOf([afterIcs]),
+    op: options.op ?? "update",
+    scope: options.scope,
+    address: options.address,
+    entry: options.entry ?? summaryPatch,
+    notices: options.notices,
   });
 }
 
@@ -74,5 +101,63 @@ describe("оракул ловит подделку", () => {
     // Время сдвинуто только у первой встречи (отдельным переопределением),
     // а патч start со scope all_series обязан задеть все слоты.
     expect(check(seed.ics, { scope: "all_series", entry: startPatch }).join(" ")).toContain("ожидалось");
+  });
+
+  it("встреча с концом не позже начала — нарушение", () => {
+    const zero = titleEverywhere.replace("DTEND;TZID=Europe/Moscow:20261019T110000", "DTEND;TZID=Europe/Moscow:20261019T100000");
+    expect(check(zero, { scope: "all_series" }).join(" ")).toContain("конец встречи не позже её начала");
+  });
+
+  it("длительность, не названная патчем, — нарушение", () => {
+    // Ровно та находка, ради которой инвариант заведён: встреча на час
+    // растянулась на 20 часов 30 минут, а патч времени не называл.
+    const stretched = titleEverywhere.replace("DTEND;TZID=Europe/Moscow:20261019T110000", "DTEND;TZID=Europe/Moscow:20261020T063000");
+    const problems = check(stretched, { scope: "all_series" }).join(" ");
+    expect(problems).toContain("длительность встречи не прежняя");
+    expect(problems).toContain("20 ч 30 мин");
+  });
+
+  it("перенесённая встреча, сдвинутая патчем времени серии, — нарушение", () => {
+    const moved = named("moved-override-berlin");
+    const shifted = moved.ics
+      .replace("DTSTART;TZID=Europe/Berlin:20261028T150000", "DTSTART;TZID=Europe/Berlin:20261028T143000")
+      .replace("DTEND;TZID=Europe/Berlin:20261028T161500", "DTEND;TZID=Europe/Berlin:20261028T154500");
+    const problems = checkOn("moved-override-berlin", shifted, {
+      scope: "this_and_following",
+      address: "2026-10-28T10:00:00+01:00",
+      entry: startPatch,
+    }).join(" ");
+    expect(problems).toContain("не осталась на своём времени");
+  });
+
+  it("перенесённая встреча, названная в пояснениях плана, нарушением не считается", () => {
+    const moved = named("moved-override-berlin");
+    const shifted = moved.ics
+      .replace("DTSTART;TZID=Europe/Berlin:20261028T150000", "DTSTART;TZID=Europe/Berlin:20261028T143000")
+      .replace("DTEND;TZID=Europe/Berlin:20261028T161500", "DTEND;TZID=Europe/Berlin:20261028T154500");
+    // Названа встреча, а не граница области: адрес в пояснении другой.
+    const problems = checkOn("moved-override-berlin", shifted, {
+      scope: "this_and_following",
+      address: "2026-10-19T10:00:00+02:00",
+      entry: startPatch,
+      notices: ["Встреча 2026-10-28T10:00:00+01:00 перенесена вместе с серией."],
+    }).join(" ");
+    expect(problems).not.toContain("не осталась на своём времени");
+  });
+
+  it("верная правка напоминаний проходит молча", () => {
+    const alarms = named("email-alarm-moscow");
+    const moved = alarms.ics.replace("TRIGGER:-PT30M", "TRIGGER:-PT20M");
+    expect(checkOn("email-alarm-moscow", moved, { scope: "all_series", entry: remindersPatch })).toEqual([]);
+  });
+
+  it("напоминание письмом, потерявшее адресата, — нарушение", () => {
+    const alarms = named("email-alarm-moscow");
+    const lost = alarms.ics
+      .replace("TRIGGER:-PT30M", "TRIGGER:-PT20M")
+      .replace("ATTENDEE;CN=Пётр Петров:mailto:petrov@example.com\r\n", "");
+    expect(checkOn("email-alarm-moscow", lost, { scope: "all_series", entry: remindersPatch }).join(" ")).toContain(
+      "напоминание письмом осталось без адресата",
+    );
   });
 });

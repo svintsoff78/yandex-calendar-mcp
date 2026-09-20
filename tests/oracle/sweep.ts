@@ -131,11 +131,17 @@ function repro(
   address: string | undefined,
   entry: OraclePatch | undefined,
   tail: string,
+  confirmed: boolean,
 ): string {
+  // Обход зовёт планировщик с etag и currentEtag всегда, а confirm ставит
+  // только при повторе подтверждённого отказа. Без этих трёх полей
+  // воспроизведение расходится с описанным исходом: неподтверждённый вызов
+  // упирается в confirm-required там, где обход шёл дальше.
+  const consent = `confirm: ${confirmed}, etag: ${confirmed ? "stand.etag" : "undefined"}, currentEtag: stand.etag`;
   const call =
     op === "update"
-      ? `const plan = planUpdate(o, { now: NOW, scope: ${JSON.stringify(scope)}, instanceStart: ${JSON.stringify(address)}, patch });`
-      : `const plan = planDelete(o, { now: NOW, scope: ${JSON.stringify(scope)}, instanceStart: ${JSON.stringify(address)} });`;
+      ? `const plan = planUpdate(o, { now: NOW, scope: ${JSON.stringify(scope)}, instanceStart: ${JSON.stringify(address)}, patch, ${consent} });`
+      : `const plan = planDelete(o, { now: NOW, scope: ${JSON.stringify(scope)}, instanceStart: ${JSON.stringify(address)}, ${consent} });`;
   const guard =
     op === "update"
       ? `verifyPlan(ics, plan, ENV, { now: NOW, patch }); // как зовёт оркестрация: с патчем`
@@ -223,7 +229,7 @@ async function runCase(input: CaseInput): Promise<CaseOutcome> {
       ...common,
       kind: "bare-error",
       detail: `планировщик бросил ${bare.name ?? "ошибку"} вместо типизированного отказа: ${bare.message}`,
-      minimalRepro: repro(seed, op, scope, address.value, entry, `здесь ${bare.name}: ${bare.message.slice(0, 120)}`),
+      minimalRepro: repro(seed, op, scope, address.value, entry, `здесь ${bare.name}: ${bare.message.slice(0, 120)}`, confirmed === true),
     });
     return { findings, refused: false, needsConfirm: false, noop: false };
   }
@@ -239,7 +245,15 @@ async function runCase(input: CaseInput): Promise<CaseOutcome> {
       ...common,
       kind: "disagreement",
       detail: `планировщик построил ${planSummary(plan)}, предохранитель его отверг: ${said}\nПЛАН:\n${icsOfPlan(plan)}`,
-      minimalRepro: repro(seed, op, scope, address.value, entry, `здесь ${guard instanceof GuardError ? `GuardError ${guard.code}` : guard.name}`),
+      minimalRepro: repro(
+        seed,
+        op,
+        scope,
+        address.value,
+        entry,
+        `здесь ${guard instanceof GuardError ? `GuardError ${guard.code}` : guard.name}`,
+        confirmed === true,
+      ),
     });
     return { findings, refused: false, needsConfirm: false, noop: plan.kind === "noop" };
   }
@@ -256,7 +270,7 @@ async function runCase(input: CaseInput): Promise<CaseOutcome> {
         `подставной сервер не принял запись (${planSummary(plan)}): ${applied.error.message}` +
         (applied.rejections.length > 0 ? ` Причины строгого режима: ${applied.rejections.join("; ")}.` : "") +
         `\nПЛАН:\n${icsOfPlan(plan)}`,
-      minimalRepro: repro(seed, op, scope, address.value, entry, `здесь запись отклонена стендом: ${applied.error.message.slice(0, 120)}`),
+      minimalRepro: repro(seed, op, scope, address.value, entry, `здесь запись отклонена стендом: ${applied.error.message.slice(0, 120)}`, confirmed === true),
     });
     return { findings, refused: false, needsConfirm: false, noop: false };
   }
@@ -269,7 +283,7 @@ async function runCase(input: CaseInput): Promise<CaseOutcome> {
       ...common,
       kind: "semantics",
       detail: `после записи объект не читается: ${(error as Error).message}\nПЛАН:\n${icsOfPlan(plan)}`,
-      minimalRepro: repro(seed, op, scope, address.value, entry, `здесь объект после записи не читается`),
+      minimalRepro: repro(seed, op, scope, address.value, entry, `здесь объект после записи не читается`, confirmed === true),
     });
     return { findings, refused: false, needsConfirm: false, noop: false };
   }
@@ -283,13 +297,14 @@ async function runCase(input: CaseInput): Promise<CaseOutcome> {
     address: address.value,
     entry,
     declaredLosses: plan.removed.map((loss) => loss.instanceStart),
+    notices: plan.notices,
   });
   for (const problem of problems) {
     findings.push({
       ...common,
       kind: "semantics",
       detail: `${problem}\nПЛАН:\n${icsOfPlan(plan)}`,
-      minimalRepro: repro(seed, op, scope, address.value, entry, `здесь расходится со смыслом scope: ${problem.slice(0, 120)}`),
+      minimalRepro: repro(seed, op, scope, address.value, entry, `здесь расходится со смыслом scope: ${problem.slice(0, 120)}`, confirmed === true),
     });
   }
   return { findings, refused: false, needsConfirm: false, noop: false };

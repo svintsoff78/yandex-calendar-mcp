@@ -9,7 +9,14 @@
 // - встреч не прибавилось и не убавилось (кроме правки повтора и удаления);
 // - удалённые действительно исчезли, и только они;
 // - конец серии («проба за концом») изменился только там, где это оправдано
-//   патчем.
+//   патчем;
+// - у каждой встречи, кроме названной при scope "this", конец строго позже
+//   начала, а длительность — либо прежняя, либо ровно та, которую назвал
+//   патч;
+// - перенесённая встреча (своё DTSTART мимо слота) под патчем времени серии
+//   остаётся на своём времени, если план не назвал её в потерях или
+//   пояснениях;
+// - напоминание письмом не остаётся без адресата.
 //
 // Что проверяется, когда ожидание считается точно:
 // - патч поля (summary, description, location, участники) не двигает ни одну
@@ -43,6 +50,13 @@ export interface SemanticsCase {
    * вне области правки обязано остаться тождественным.
    */
   declaredLosses?: readonly string[];
+  /**
+   * Пояснения плана (plan.notices): ими план называет встречи, с которыми
+   * обошёлся не как обычно. Названную в пояснении встречу оракул от
+   * требования «перенесённая остаётся на своём времени» освобождает: про неё
+   * пользователю сказали.
+   */
+  notices?: readonly string[];
 }
 
 /** Множество строк с подсчётом: сравнение наборов встреч без порядка. */
@@ -220,7 +234,159 @@ export function checkSemantics(c: SemanticsCase): string[] {
       );
     }
   }
+
+  // 5. Длительность встреч.
+  problems.push(...checkDurations(c, before, after));
+
+  // 6. Время перенесённых встреч под патчем времени серии.
+  if (op === "update" && known && missing.length === 0) {
+    problems.push(...checkMovedKeepsTime(c, affected, after, losses));
+  }
+
+  // 7. Напоминание письмом без адресата.
+  problems.push(...checkEmailRecipients(before, after));
+
   return problems;
+}
+
+// ---------------------------------------------------------------------------
+// Инварианты, которые обязаны выполняться после любой правки
+// ---------------------------------------------------------------------------
+
+/** Длительность по-русски: «75 мин», «20 ч 30 мин». */
+function lengthOf(ms: number): string {
+  const minutes = Math.round(ms / 60_000);
+  if (Math.abs(minutes) < 90) return `${minutes} мин`;
+  const hours = Math.trunc(minutes / 60);
+  const rest = Math.abs(minutes % 60);
+  return rest === 0 ? `${hours} ч` : `${hours} ч ${rest} мин`;
+}
+
+/**
+ * Длительности, которые встреча вправе иметь после правки: своя прежняя —
+ * либо ровно та, которую назвал патч. Названная считается так же, как
+ * ожидаемое время слотов (Р1): у одиночного события и у scope "this" патч
+ * называет момент целиком, у серии из него берутся время суток и
+ * длительность. Набор общий на всю область: точное соответствие «встреча ↔
+ * длительность» считает checkTime, здесь проверяется только то, что
+ * длительность вообще взялась откуда-то.
+ *
+ * Названная патчем длительность считается по слотам без своего компонента:
+ * им патч времени и адресован. У встреч со своим компонентом время своё
+ * (О7), и патч серии новых длительностей им не назначает — прежняя у них уже
+ * учтена.
+ */
+function allowedDurations(c: SemanticsCase, before: World): Set<number> {
+  const patch = (c.entry?.patch ?? {}) as { start?: string; end?: string };
+  const out = new Set<number>();
+  for (const snap of before.snaps) out.add(snap.endMs - snap.startMs);
+  const start = wallOf(patch.start);
+  const end = wallOf(patch.end);
+  if (!start && !end) return out;
+  const whole = c.scope === "this" || c.o.kind !== "series";
+  const plain = before.snaps.filter((s) => s.plain);
+  const shift = start && !whole && plain.length > 0 ? secondsOfDay(start) - secondsOfDay(plain[0].startTime) : 0;
+  for (const snap of plain) {
+    const startTime = start ? (whole ? wholeMoment(snap.startTime, start) : shifted(snap.startTime, shift)) : snap.startTime;
+    const startMs = start ? msOf(startTime, ENV) : snap.startMs;
+    let endMs: number;
+    if (end) endMs = msOf(whole ? wholeMoment(startTime, end) : timeOfDayOn(startTime, end), ENV);
+    else if (start) endMs = whole ? startMs + (snap.endMs - snap.startMs) : msOf(shifted(snap.endTime, shift), ENV);
+    else continue;
+    if (endMs > startMs) out.add(endMs - startMs);
+  }
+  return out;
+}
+
+/**
+ * Инвариант длительности. После любой правки у каждой встречи — кроме той,
+ * которую операция назвала при scope "this", — конец строго позже начала, а
+ * длительность либо прежняя, либо ровно та, которую назвал патч.
+ *
+ * Вырожденные встречи бывают уже в затравке (испорченное чужим клиентом
+ * время): нарушением считается только новая такая встреча, а не та, что была
+ * до записи. Патч, меняющий всесуточность, длительность меняет по замыслу —
+ * у него сверяется только «конец позже начала».
+ */
+function checkDurations(c: SemanticsCase, before: World, after: World): string[] {
+  const patch = (c.entry?.patch ?? {}) as Record<string, unknown>;
+  const problems: string[] = [];
+  const named = c.scope === "this" ? c.address : undefined;
+  const skip = (s: Snap) => named !== undefined && s.address === named;
+
+  const wasDegenerate = before.snaps.filter((s) => !skip(s) && s.endMs <= s.startMs).length;
+  const degenerate = after.snaps.filter((s) => !skip(s) && s.endMs <= s.startMs);
+  if (degenerate.length > wasDegenerate) {
+    problems.push(
+      `после записи конец встречи не позже её начала (таких ${degenerate.length}, до записи было ${wasDegenerate}): ` +
+        degenerate.slice(0, 4).map(showSnap).join("; "),
+    );
+  }
+
+  if (patch.allDay !== undefined) return problems;
+  const allowed = allowedDurations(c, before);
+  const wrong = after.snaps.filter((s) => !skip(s) && s.endMs > s.startMs && !allowed.has(s.endMs - s.startMs));
+  if (wrong.length > 0) {
+    const sample = wrong.slice(0, 4).map((s) => `${showSnap(s)} — ${lengthOf(s.endMs - s.startMs)}`);
+    const could = [...allowed]
+      .filter((ms) => ms > 0)
+      .sort((a, b) => a - b)
+      .slice(0, 8)
+      .map(lengthOf);
+    problems.push(
+      `после записи длительность встречи не прежняя и не названная патчем (таких ${wrong.length}): ${sample.join("; ")}; ` +
+        `допустимы были ${could.join(", ")}`,
+    );
+  }
+  return problems;
+}
+
+/**
+ * Время перенесённой встречи. У переопределения со своим DTSTART, не
+ * совпадающим со слотом, время своё (О7), и патч времени серии его не
+ * двигает: сдвигаются слоты, а не перенесённые встречи. Освобождается от
+ * требования только та встреча, которую план сам назвал — в removed или в
+ * пояснениях (О11): про неё пользователю сказано.
+ */
+function checkMovedKeepsTime(c: SemanticsCase, affected: Snap[], after: World, losses: Set<string>): string[] {
+  const patch = (c.entry?.patch ?? {}) as { start?: string; end?: string };
+  if (c.scope === "this") return [];
+  if (patch.start === undefined && patch.end === undefined) return [];
+  const spoken = (c.notices ?? []).join(" ");
+  // Пояснение, в котором назван только адрес самого вызова, про встречу
+  // ничего не говорит: это пересказ запроса (граница области), а не «с этой
+  // встречей обошлись иначе». Названной считается встреча с другим адресом.
+  const named = (snap: Snap) => snap.address !== c.address && spoken.includes(snap.address);
+  const moments = new Bag(after.snaps.map((s) => `${s.startMs}${SEP}${s.endMs}`));
+  const problems: string[] = [];
+  for (const snap of affected) {
+    if (!snap.moved) continue;
+    if (losses.has(snap.address) || named(snap)) continue;
+    if (moments.take(`${snap.startMs}${SEP}${snap.endMs}`)) continue;
+    problems.push(
+      `перенесённая встреча ${snap.address} под патчем времени серии не осталась на своём времени: было ` +
+        `${new Date(snap.startMs).toISOString()}–${new Date(snap.endMs).toISOString()}, ` +
+        `таких моментов после записи нет; план её ни в потерях, ни в пояснениях не назвал. ` +
+        `После записи: ${after.snaps.slice(0, 8).map(showSnap).join("; ")}`,
+    );
+    break;
+  }
+  return problems;
+}
+
+/**
+ * Напоминание письмом без адресата. RFC 5545 §3.6.6 требует у VALARM
+ * ACTION:EMAIL хотя бы один ATTENDEE: письму нужен получатель. Сверяются
+ * подписи напоминаний, а не их число: у серии один и тот же компонент виден
+ * столько раз, сколько у неё встреч.
+ */
+function checkEmailRecipients(before: World, after: World): string[] {
+  const without = (world: World) =>
+    new Set(world.snaps.filter((s) => s.alarms.emailWithoutRecipient > 0).map((s) => s.alarms.signature));
+  const was = without(before);
+  const fresh = [...without(after)].filter((signature) => !was.has(signature));
+  if (fresh.length === 0) return [];
+  return [`после записи напоминание письмом осталось без адресата (ATTENDEE): ${fresh.slice(0, 2).join(" | ")}`];
 }
 
 function checkUpdate(c: SemanticsCase, affected: Snap[], leftovers: string[], entry: OraclePatch): string[] {
