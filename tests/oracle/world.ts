@@ -3,7 +3,7 @@
 // src/ical/values.ts): планировщик и предохранитель тут не участвуют, чтобы
 // ожидание считалось независимо от них.
 import ICAL from "ical.js";
-import { hiddenOverrides, instancesBetween, parseAddress, type Instance } from "../../src/ical/instances.js";
+import { hiddenOverrides, instanceAt, instancesBetween, parseAddress, type Instance } from "../../src/ical/instances.js";
 import { isUnparsable, loadObject, type CalendarObject } from "../../src/ical/object.js";
 import { compareSlotKeys, formOf, formatForModel, instantOf, listKeys, type IcalEnv, type SlotKey } from "../../src/ical/values.js";
 
@@ -66,6 +66,15 @@ export interface Alarms {
 /** Развёрнутый календарь: встречи всех объектов и признак «серия кончилась». */
 export interface World {
   snaps: Snap[];
+  /**
+   * Встречи со своим компонентом, стоящие ВНЕ горизонта разворота: у них
+   * собственное DTSTART, и горизонт до них не достаёт. Отдельно от `snaps`,
+   * потому что признаки горизонта («серия кончилась», «упор сработал») и
+   * сравнение хвостов у края упора считаются по окну, а такая встреча к окну
+   * отношения не имеет. Смысл областей правки её, наоборот, касается: она
+   * существует и адресуется, и checkSemantics берёт её наравне с прочими.
+   */
+  beyond: Snap[];
   /** Ни одной встречи после пробы и упор не сработал. */
   ends: boolean;
   /** Упор в 400 встреч сработал. */
@@ -138,19 +147,48 @@ function order(a: Snap, b: Snap): number {
   return a.startMs - b.startMs || (a.address < b.address ? -1 : a.address > b.address ? 1 : 0);
 }
 
+/**
+ * Встречи, которых горизонт не накрывает, но которые всё равно есть: у
+ * переопределения своё DTSTART, и правка вправе увести его куда угодно —
+ * `scope: this` с патчем `start: 9999-12-31` ставит встречу у края календаря
+ * (RFC 5545 §3.3.5 разрешает годы по 9999-й включительно).
+ *
+ * Берутся они по перечню переопределений объекта (`o.overrides`), а не
+ * расширением горизонта: развернуть бесконечное правило до 9999 года — сотни
+ * тысяч шагов, и обход не уложился бы в сторожевое время. `instanceAt` по
+ * ключу переопределения правило не перебирает: компонент у встречи свой.
+ * Скрытые (роль hidden) пропускаются: встречи у них нет вовсе, а `instanceAt`
+ * на них как раз ушёл бы искать слот в правиле.
+ */
+function beyondHorizon(o: CalendarObject, inside: readonly Instance[]): Instance[] {
+  if (o.overrides.size === 0) return [];
+  const seen = new Set(inside.map((instance) => instance.key));
+  const hidden = new Set(hiddenOverrides(o).map((entry) => entry.key));
+  const out: Instance[] = [];
+  for (const key of o.overrides.keys()) {
+    if (seen.has(key) || hidden.has(key)) continue;
+    const instance = instanceAt(o, key);
+    if (instance) out.push(instance);
+  }
+  return out;
+}
+
 /** Развернуть несколько объектов (после разреза их два) в один мир. */
 export function worldOf(icsList: readonly string[]): World {
   const snaps: Snap[] = [];
+  const beyond: Snap[] = [];
   let capped = false;
   for (const ics of icsList) {
     const o = load(ics);
     const instances = instancesBetween(o, HORIZON_FROM, HORIZON_TO);
     if (instances.length >= HORIZON_CAP) capped = true;
     for (const instance of instances.slice(0, HORIZON_CAP)) snaps.push(snapOf(instance));
+    for (const instance of beyondHorizon(o, instances)) beyond.push(snapOf(instance));
   }
   snaps.sort(order);
+  beyond.sort(order);
   const last = snaps.length === 0 ? undefined : snaps[snaps.length - 1];
-  return { snaps, capped, ends: !capped && (last === undefined || last.startMs < PROBE), objects: icsList.length };
+  return { snaps, beyond, capped, ends: !capped && (last === undefined || last.startMs < PROBE), objects: icsList.length };
 }
 
 /** Строка снимка целиком — для сравнения множеств. */

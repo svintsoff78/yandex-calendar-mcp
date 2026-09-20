@@ -210,8 +210,13 @@ export function checkSemantics(c: SemanticsCase): string[] {
   // одном и том же месте, иначе счёт разойдётся на единицу.
   const edge = Math.min(lastStart(c.before.snaps), lastStart(c.after.snaps)) - 2 * 86_400_000;
   const limit = c.before.capped || c.after.capped ? Math.floor(edge / 86_400_000) * 86_400_000 : Number.POSITIVE_INFINITY;
-  const before = { ...c.before, snaps: c.before.snaps.filter((s) => s.startMs < limit) };
-  const after = { ...c.after, snaps: c.after.snaps.filter((s) => s.startMs < limit) };
+  // Встречи со своим компонентом вне горизонта (World.beyond) прибавляются
+  // после реза по упору: рез — про хвост окна, а они не в окне вовсе.
+  // Без них встреча, которую scope "this" увёл к краю календаря (патч
+  // start: 9999-12-31), считалась бы пропавшей — хотя она записана, годна и
+  // адресуется.
+  const before = { ...c.before, snaps: [...c.before.snaps.filter((s) => s.startMs < limit), ...c.before.beyond] };
+  const after = { ...c.after, snaps: [...c.after.snaps.filter((s) => s.startMs < limit), ...c.after.beyond] };
   const { affected, known } = affectedOf({ ...c, before });
   const losses = new Set(c.declaredLosses ?? []);
   const affectedSet = new Set(affected);

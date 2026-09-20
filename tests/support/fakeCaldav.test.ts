@@ -938,6 +938,21 @@ describe("инварианты: каждый ловит свой образец 
       base.replace(/(RRULE:[^\r\n]*)/, "$1\r\nEXDATE;TZID=Europe/Moscow:20261021T100000\r\nEXDATE;TZID=Europe/Moscow:20261021T100000"),
     ],
     ["missing-vtimezone", "TZID без VTIMEZONE", base.replace(/BEGIN:VTIMEZONE[\s\S]*?END:VTIMEZONE\r\n/, "")],
+    // Грамматика значения времени (RFC 5545 §3.3.4–3.3.5). Все три строки
+    // ical.js разбирает молча, поэтому от `unparsable` они не ловятся: такое
+    // значение уезжает на сервер и обратно уже не читается.
+    [
+      "bad-time-value",
+      "год не из четырёх цифр и разделители из ISO",
+      base.replace("DTSTART;TZID=Europe/Moscow:20261019T100000", "DTSTART;TZID=Europe/Moscow:1-01-01T00:00:00"),
+    ],
+    [
+      "bad-time-value",
+      "год за верхним краем: месяц ноль, разряды не заполнены",
+      base.replace("DTEND;TZID=Europe/Moscow:20261019T110000", "DTEND;TZID=Europe/Moscow:1000-0-01T0:0:0"),
+    ],
+    ["bad-time-value", "UNTIL с разделителями из ISO", base.replace("COUNT=6", "UNTIL=2026-11-04T07:00:00Z")],
+    ["bad-time-value", "месяц 13", base.replace("DTSTART;TZID=Europe/Moscow:20261019T100000", "DTSTART;TZID=Europe/Moscow:20261319T100000")],
     ["tzid-on-utc", "TZID у значения в UTC", base.replace("DTEND;TZID=Europe/Moscow:20261019T110000", "DTEND;TZID=Europe/Moscow:20261019T080000Z")],
     [
       "form-mismatch",

@@ -5,6 +5,7 @@
 // - не больше одного основного компонента (VEVENT без RECURRENCE-ID), один UID;
 // - нет дублей RECURRENCE-ID и EXDATE;
 // - у каждого TZID есть VTIMEZONE, у значения в UTC нет TZID;
+// - значение времени записано по грамматике RFC 5545 §3.3.4–3.3.5;
 // - RECURRENCE-ID, EXDATE, RDATE и UNTIL — в форме DTSTART (О4);
 // - UNTIL не раньше DTSTART, DTEND позже DTSTART, DURATION положительна;
 // - DTEND и DURATION не вместе (RFC 5545 §3.6.1);
@@ -40,6 +41,7 @@ export const VIOLATION_KINDS = [
   "duplicate-exdate",
   "missing-vtimezone",
   "tzid-on-utc",
+  "bad-time-value",
   "form-mismatch",
   "until-before-dtstart",
   "end-not-after-start",
@@ -122,6 +124,150 @@ export function parseRawComponents(ics: string): RawComponent[] {
 export function lineName(line: string): string {
   const match = /^[^;:]*/.exec(line);
   return (match?.[0] ?? "").toUpperCase();
+}
+
+// ---------------------------------------------------------------------------
+// Грамматика значения времени (RFC 5545 §3.3.4 DATE, §3.3.5 DATE-TIME,
+// §3.3.9 PERIOD, §3.3.10 UNTIL)
+// ---------------------------------------------------------------------------
+//
+// Проверка нарочно идёт по СЫРОМУ тексту, а не по jCal: разбор ical.js часть
+// негодных значений чинит на лету (а часть роняет уже при чтении свойства), и
+// через него не видно, что именно ушло на сервер. Строка `1-01-01T00:00:00`
+// или `1000-0-01T0:0:0` — это не «другая форма времени» (её ловит
+// form-mismatch), а значение, которого в календаре не бывает вовсе: год не из
+// четырёх цифр, разряды не заполнены, разделители из ISO 8601.
+
+/** Свойства, значение которых — время: DATE, DATE-TIME или PERIOD. */
+const TIME_PROPERTIES = new Set([
+  "DTSTART",
+  "DTEND",
+  "DUE",
+  "RECURRENCE-ID",
+  "EXDATE",
+  "RDATE",
+  "DTSTAMP",
+  "CREATED",
+  "LAST-MODIFIED",
+  "COMPLETED",
+  "TRIGGER",
+]);
+
+/** `YYYYMMDD` (§3.3.4). */
+const DATE_VALUE = /^(\d{4})(\d{2})(\d{2})$/;
+/** `YYYYMMDDTHHMMSS` с необязательной «Z» (§3.3.5). */
+const DATE_TIME_VALUE = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z?$/;
+/** Длительность (§3.3.6): нужна только как вторая половина PERIOD. */
+const DURATION_VALUE = /^[+-]?P(?:\d+W|(?:\d+D)?(?:T(?:\d+H)?(?:\d+M)?(?:\d+S)?)?)$/;
+
+/** Части строки свойства: имя, параметры (имена в верхнем регистре), значение. */
+function splitLine(line: string): { name: string; params: Map<string, string>; value: string } | undefined {
+  // Значение отделяется первым двоеточием вне кавычек: параметр вида
+  // TZID="America/New_York" двоеточий не содержит, но кавычки RFC 5545 §3.2
+  // допускает, и разбор их учитывает.
+  let quoted = false;
+  let colon = -1;
+  for (let i = 0; i < line.length; i += 1) {
+    if (line[i] === '"') quoted = !quoted;
+    else if (line[i] === ":" && !quoted) {
+      colon = i;
+      break;
+    }
+  }
+  if (colon < 0) return undefined;
+  const head = line.slice(0, colon);
+  const parts = head.split(";");
+  const params = new Map<string, string>();
+  for (const part of parts.slice(1)) {
+    const eq = part.indexOf("=");
+    if (eq < 0) continue;
+    params.set(part.slice(0, eq).toUpperCase(), part.slice(eq + 1).replace(/^"|"$/g, "").toUpperCase());
+  }
+  return { name: parts[0].toUpperCase(), params, value: line.slice(colon + 1) };
+}
+
+/** Что не так с календарной датой; undefined — всё в порядке. */
+function dateProblem(y: string, mo: string, d: string): string | undefined {
+  if (+y < 1) return `год ${y}`;
+  if (+mo < 1 || +mo > 12) return `месяц ${mo}`;
+  if (+d < 1 || +d > 31) return `день ${d}`;
+  return undefined;
+}
+
+/** Что не так со временем суток; undefined — всё в порядке. */
+function clockProblem(h: string, mi: string, s: string): string | undefined {
+  if (+h > 23) return `часы ${h}`;
+  if (+mi > 59) return `минуты ${mi}`;
+  if (+s > 60) return `секунды ${s}`; // 60 — високосная секунда (§3.3.5)
+  return undefined;
+}
+
+/**
+ * Что не так с одним значением времени: грамматика, а затем разряды.
+ * `expect` — какой формы значение ждут параметры свойства.
+ */
+function timeValueProblem(value: string, expect: "date" | "date-time" | "any"): string | undefined {
+  const date = DATE_VALUE.exec(value);
+  if (date && expect !== "date-time") return dateProblem(date[1], date[2], date[3]);
+  const stamp = DATE_TIME_VALUE.exec(value);
+  if (stamp && expect !== "date") {
+    return dateProblem(stamp[1], stamp[2], stamp[3]) ?? clockProblem(stamp[4], stamp[5], stamp[6]);
+  }
+  const wanted =
+    expect === "date" ? "YYYYMMDD" : expect === "date-time" ? "YYYYMMDDTHHMMSS[Z]" : "YYYYMMDD или YYYYMMDDTHHMMSS[Z]";
+  return `не по грамматике RFC 5545 (нужно ${wanted})`;
+}
+
+/** Значение PERIOD (§3.3.9): начало и либо конец, либо длительность. */
+function periodProblem(value: string): string | undefined {
+  const slash = value.indexOf("/");
+  if (slash < 0) return "не по грамматике RFC 5545 (PERIOD — «начало/конец» или «начало/длительность»)";
+  const start = value.slice(0, slash);
+  const rest = value.slice(slash + 1);
+  const startProblem = timeValueProblem(start, "date-time");
+  if (startProblem) return `начало ${start}: ${startProblem}`;
+  if (DURATION_VALUE.test(rest)) return undefined;
+  const endProblem = timeValueProblem(rest, "date-time");
+  return endProblem === undefined ? undefined : `конец ${rest}: ${endProblem}`;
+}
+
+/**
+ * Негодные по грамматике значения времени во всём тексте объекта, включая
+ * VTIMEZONE и VALARM: такое значение не прочтёт ни сервер, ни следующее
+ * чтение объекта, и форма тут ни при чём.
+ */
+function badTimeValues(ics: string): string[] {
+  const problems: string[] = [];
+  const walk = (component: RawComponent) => {
+    for (const line of component.lines) {
+      const parsed = splitLine(line);
+      if (!parsed) continue;
+      const { name, params, value } = parsed;
+      if (name === "RRULE") {
+        const until = /(?:^|;)UNTIL=([^;]*)/i.exec(value)?.[1];
+        if (until !== undefined) {
+          const problem = timeValueProblem(until, "any");
+          if (problem) problems.push(`${component.name} RRULE UNTIL=${until}: ${problem}`);
+        }
+        continue;
+      }
+      if (!TIME_PROPERTIES.has(name)) continue;
+      const kind = params.get("VALUE");
+      // TRIGGER по умолчанию — длительность (§3.8.6.3), временем он бывает
+      // только при VALUE=DATE-TIME.
+      if (name === "TRIGGER" && kind !== "DATE-TIME") continue;
+      for (const single of value.split(",")) {
+        const problem =
+          kind === "PERIOD"
+            ? periodProblem(single)
+            : timeValueProblem(single, kind === "DATE" ? "date" : kind === "DATE-TIME" ? "date-time" : "any");
+        if (problem) problems.push(`${component.name} ${name}:${single}: ${problem}`);
+      }
+    }
+    component.children.forEach(walk);
+  };
+  parseRawComponents(ics).forEach(walk);
+  return problems;
 }
 
 // ---------------------------------------------------------------------------
@@ -430,6 +576,11 @@ function analyze(ics: string): Finding[] {
   const events = jcal[2].filter((component) => component[0] === "vevent");
   if (events.length === 0) return [{ kind: "no-vevent", detail: "в объекте нет ни одного VEVENT" }];
   const hydrated = root.getAllSubcomponents("vevent");
+
+  // Грамматика значений времени — по сырому тексту: негодную строку ical.js
+  // либо чинит на лету, либо роняет чтение свойства, и дальше по jCal её уже
+  // не видно.
+  for (const problem of badTimeValues(ics)) add("bad-time-value", problem);
 
   // UID
   const uids = new Set<string>();

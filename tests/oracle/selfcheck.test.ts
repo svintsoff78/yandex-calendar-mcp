@@ -184,6 +184,51 @@ describe("оракул ловит подделку", () => {
     expect(check(stretched, { scope: "all_series", entry })).toEqual([]);
   });
 
+  // Горизонт разворота — окно измерителя, а не край календаря. Встреча со
+  // своим компонентом вправе стоять вне окна: RFC 5545 §3.3.5 разрешает годы
+  // по 9999-й, и scope "this" с патчем start: 9999-12-31 — законная правка.
+  // Затравка бесконечная: у неё работает ещё и рез по упору в 400 встреч, и
+  // встреча у края календаря обязана пережить его тоже.
+  const FAR_SEED = "infinite-weekly-moscow";
+  const FAR_FIRST = "2026-10-20T09:00:00+03:00";
+  const farPatch = ORACLE_PATCHES.find((p) => p.name === "start:9999-12-31")!;
+  const farOverride = (start: string) =>
+    [
+      "BEGIN:VEVENT",
+      "UID:or-infinite-weekly@example.com",
+      "DTSTAMP:20261001T090000Z",
+      `DTSTART;TZID=Europe/Moscow:${start}`,
+      `DTEND;TZID=Europe/Moscow:${start.replace("T230000", "T233000")}`,
+      "SUMMARY:Бесконечная планёрка",
+      "SEQUENCE:1",
+      "RECURRENCE-ID;TZID=Europe/Moscow:20261020T090000",
+      "END:VEVENT",
+      "END:VCALENDAR",
+    ].join("\r\n");
+
+  it("встреча, уведённая к краю календаря, пропавшей не считается", () => {
+    const moved = named(FAR_SEED).ics.replace("END:VCALENDAR", farOverride("99991231T230000"));
+    expect(checkOn(FAR_SEED, moved, { scope: "this", address: FAR_FIRST, entry: farPatch })).toEqual([]);
+  });
+
+  it("встреча, которая к краю календаря не уехала, а просто исчезла, — нарушение", () => {
+    // Тот же патч, но переопределения нет вовсе: слот закрыт EXDATE.
+    const lost = named(FAR_SEED).ics.replace(
+      "RRULE:FREQ=WEEKLY;BYDAY=TU",
+      "RRULE:FREQ=WEEKLY;BYDAY=TU\r\nEXDATE;TZID=Europe/Moscow:20261020T090000",
+    );
+    expect(checkOn(FAR_SEED, lost, { scope: "this", address: FAR_FIRST, entry: farPatch }).join(" ")).toContain(
+      "должно было остаться",
+    );
+  });
+
+  it("встреча у края календаря, уехавшая не туда, куда назвал патч, — нарушение", () => {
+    const wrong = named(FAR_SEED).ics.replace("END:VCALENDAR", farOverride("99991230T230000"));
+    expect(checkOn(FAR_SEED, wrong, { scope: "this", address: FAR_FIRST, entry: farPatch }).join(" ")).toContain(
+      "в выдаче таких нет",
+    );
+  });
+
   it("напоминание письмом, потерявшее адресата, — нарушение", () => {
     const alarms = named("email-alarm-moscow");
     const lost = alarms.ics
